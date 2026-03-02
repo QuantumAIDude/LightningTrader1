@@ -1,0 +1,2519 @@
+# model_utils.py
+import os
+import joblib
+import math
+import json
+import threading
+import numpy as np
+import pandas as pd
+import logging
+import warnings
+from config import MODEL_DIR, BASE_MODEL_FILE, FOREST_MODEL_FILE, BOOST_MODEL_FILE, EXTRA_TREES_MODEL_FILE, REGIME_MODEL_FILE, META_MODEL_FILE, INSTRUMENTS, INTERVAL, SYMBOL, DATA_DIR, LIVE_CALIBRATION, EXTRA_TREES_N_ESTIMATORS, EXTRA_TREES_MAX_DEPTH, EXTRA_TREES_MIN_SAMPLES_LEAF, ALLOW_REMOTE_DAILY, DEFAULT_INSTRUMENT, MAX_ENSEMBLE_MEMBERS_PREDICT
+try:
+    from config import LOG_PREDICTIONS
+except Exception:
+    LOG_PREDICTIONS = False
+from features import make_feature_matrix, build_feature_frame, build_features_for_training, DEFAULT_FEATURES, LIVE_MAX_BARS
+from sklearn.ensemble import ExtraTreesRegressor
+from regime_model import predict_regime_probs
+from datetime import datetime, timedelta, timezone, time
+import yfinance as yf
+
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
+warnings.filterwarnings("ignore", message="X does not have valid feature names", category=UserWarning)
+
+# Safety caps for live prediction (4min)
+MAX_ABS_RET = 0.01  # fallback cap if vol is missing
+STALE_MULTIPLIER = 3.5
+MIN_STALE_SECONDS = 120
+NO_SIGNAL_CONF = 0.40
+NO_SIGNAL_DISP = 3.0
+
+_LIVE_CAL_CACHE = {"ts": None, "data": None}
+_LAST_CAL_UPDATE = None
+_EXTRA_TREES_AUTO_ATTEMPTED = False
+_MODEL_CACHE = {}
+_CAL_UPDATE_LOCK = threading.Lock()
+_CAL_UPDATE_IN_FLIGHT = False
+
+def _interval_minutes(interval: str) -> int:
+    interval = str(interval).strip().lower()
+    if interval.endswith("m"):
+        return int(interval[:-1])
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 60
+    try:
+        return int(interval)
+    except Exception:
+        return 1
+
+BAR_MINUTES = _interval_minutes(INTERVAL)
+
+def _live_feature_frame(df_latest: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
+    """Build a base feature frame for live inference using a capped history window."""
+    if df_latest is None or df_latest.empty:
+        return pd.DataFrame()
+    df_use = df_latest
+    try:
+        if len(df_use) > LIVE_MAX_BARS:
+            df_use = df_use.iloc[-LIVE_MAX_BARS:].copy()
+    except Exception:
+        pass
+    try:
+        frame = build_feature_frame(df_use, instrument_key=instrument_key)
+    except Exception:
+        return pd.DataFrame()
+    try:
+        frame = frame.replace([np.inf, -np.inf], np.nan)
+    except Exception:
+        pass
+    return frame
+
+def _feature_row_from_frame(frame: pd.DataFrame, feature_list) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    feats = feature_list or DEFAULT_FEATURES
+    try:
+        feats = list(feats)
+    except Exception:
+        feats = DEFAULT_FEATURES
+    # Ensure all requested features exist
+    try:
+        missing = [f for f in feats if f not in frame.columns]
+        if missing:
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+    try:
+        sub = frame.dropna(subset=feats)
+    except Exception:
+        sub = frame
+    if sub is None or sub.empty:
+        return pd.DataFrame()
+    try:
+        return sub[feats].iloc[-1:].copy()
+    except Exception:
+        return pd.DataFrame()
+
+def _get_feature_row_cached(df_latest: pd.DataFrame, feature_list, instrument_key: str = None,
+                            feature_frame: pd.DataFrame | None = None, cache: dict | None = None) -> pd.DataFrame:
+    feats = feature_list or DEFAULT_FEATURES
+    try:
+        key = tuple(feats)
+    except Exception:
+        key = None
+    if cache is not None and key in cache:
+        return cache[key]
+    X = pd.DataFrame()
+    if feature_frame is not None and not feature_frame.empty:
+        X = _feature_row_from_frame(feature_frame, feats)
+    if X is None or X.empty:
+        try:
+            X = make_feature_matrix(df_latest, feature_list=feats, instrument_key=instrument_key)
+        except Exception:
+            X = pd.DataFrame()
+    if cache is not None:
+        cache[key] = X
+    return X
+
+def _instrument_meta(instrument_key: str = None) -> dict:
+    key = instrument_key or SYMBOL
+    return INSTRUMENTS.get(key, {})
+
+def _vol_floor_from_meta(instr_meta: dict) -> float:
+    try:
+        v = float(instr_meta.get("vol_floor", 0.0))
+    except Exception:
+        v = 0.0
+    if v > 0:
+        return v
+    instr_type = instr_meta.get("type", "equity")
+    return 0.00045 if instr_type == "futures" else 0.00025
+
+def _infer_target_norm(meta: dict) -> bool:
+    """
+    Infer whether a model's outputs are volatility-normalized.
+    Defaults to True for modern models; legacy models are inferred by resid_std scale.
+    """
+    if not isinstance(meta, dict):
+        return True
+    if "target_norm" in meta:
+        try:
+            return bool(meta.get("target_norm"))
+        except Exception:
+            return True
+    try:
+        resid = float(meta.get("resid_std", float("nan")))
+        if np.isfinite(resid):
+            # raw 4-min returns are ~1e-4..1e-2; normalized targets are ~1e-1..10
+            return resid > 0.05
+    except Exception:
+        pass
+    return True
+
+def _round_to_tick(price: float, instr_meta: dict) -> float:
+    try:
+        tick = float(instr_meta.get("tick_size", 0.0))
+    except Exception:
+        tick = 0.0
+    if tick and tick > 0:
+        return float(round(price / tick) * tick)
+    return float(price)
+
+def _auto_train_extra_trees(instrument_key: str = None):
+    """Lightweight fallback: train ExtraTrees from cached price history if missing on disk."""
+    global _EXTRA_TREES_AUTO_ATTEMPTED
+    if _EXTRA_TREES_AUTO_ATTEMPTED:
+        return None
+    _EXTRA_TREES_AUTO_ATTEMPTED = True
+    try:
+        instr = instrument_key or SYMBOL
+        datafile = os.path.join(DATA_DIR, f"prices_{instr}.csv")
+        if not os.path.exists(datafile):
+            return None
+        df = pd.read_csv(datafile, index_col=0, parse_dates=True)
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+        df = df.sort_index()
+        df_full = build_features_for_training(df, predict_minutes=4, instrument_key=instr)
+        if df_full is None or len(df_full) < 300:
+            return None
+        extra_feats = DEFAULT_FEATURES + ["ret_2", "ret_4", "mom_3", "ema_5", "ema_20", "trend_strength", "vol_rolling_skew", "vol_rolling_kurt"]
+        X = df_full[extra_feats]
+        y = df_full["target_ret_norm"]
+        n_estimators = min(200, int(EXTRA_TREES_N_ESTIMATORS))
+        model = ExtraTreesRegressor(
+            n_estimators=n_estimators,
+            max_depth=EXTRA_TREES_MAX_DEPTH,
+            min_samples_leaf=EXTRA_TREES_MIN_SAMPLES_LEAF,
+            random_state=42
+        )
+        model.fit(X, y)
+        preds = model.predict(X)
+        resid = float(np.std(y - preds))
+        bias = float(np.mean(preds - y))
+        try:
+            target_mean = float(np.mean(y))
+        except Exception:
+            target_mean = 0.0
+        payload = {
+            "model": model,
+            "fallback_model": model,
+            "features": extra_feats,
+            "ensemble_models": {},
+            "regime_models": {},
+            "performance_mae": {},
+            "calibration": {},
+            "calibration_sig": {"Weak": 0.5, "Medium": 0.5, "Strong": 0.5},
+            "meta": {
+                "resid_std": max(resid, 1e-6),
+                "pred_bias": bias,
+                "version": "auto",
+                "target_norm": True,
+                "demeaned": False,
+                "target_mean": float(target_mean)
+            }
+        }
+        try:
+            joblib.dump(payload, os.path.join(MODEL_DIR, EXTRA_TREES_MODEL_FILE))
+        except Exception:
+            pass
+        return payload
+    except Exception:
+        logger.debug("Auto-train ExtraTrees failed", exc_info=True)
+        return None
+
+def _session_dates_from_index(local_index, session_open_minute: int, session_close_minute: int):
+    local_dates = pd.to_datetime(local_index.date)
+    minutes = local_index.hour * 60 + local_index.minute
+    if session_open_minute > session_close_minute:
+        return pd.to_datetime(np.where(minutes >= session_open_minute, local_dates, local_dates - pd.Timedelta(days=1)))
+    return local_dates
+
+def _session_date_for_time(ts_local, session_open_minute: int, session_close_minute: int):
+    try:
+        minutes = int(ts_local.hour) * 60 + int(ts_local.minute)
+        local_date = pd.to_datetime(ts_local.date())
+        if session_open_minute > session_close_minute:
+            return local_date if minutes >= session_open_minute else (local_date - pd.Timedelta(days=1))
+        return local_date
+    except Exception:
+        return pd.to_datetime(ts_local.date())
+
+def _session_close_datetime(session_date, session_open_minute: int, session_close_minute: int, tz: str):
+    try:
+        close_hour = int(session_close_minute // 60)
+        close_min = int(session_close_minute % 60)
+        close_date = session_date
+        if session_open_minute > session_close_minute:
+            close_date = session_date + pd.Timedelta(days=1)
+        close_dt = pd.Timestamp(year=close_date.year, month=close_date.month, day=close_date.day,
+                                hour=close_hour, minute=close_min, tz=tz)
+        return close_dt
+    except Exception:
+        return None
+
+def _target_session_date(instr_meta: dict):
+    tz = instr_meta.get("tz", "America/New_York")
+    session_open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
+    session_close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
+    now_local = pd.Timestamp.now(tz=tz)
+    session_date = _session_date_for_time(now_local, session_open_minute, session_close_minute)
+    close_dt = _session_close_datetime(session_date, session_open_minute, session_close_minute, tz)
+    if close_dt is not None and now_local >= close_dt:
+        return session_date + pd.Timedelta(days=1)
+    return session_date
+
+def _target_week_key(instr_meta: dict):
+    tz = instr_meta.get("tz", "America/New_York")
+    week_end_day = int(instr_meta.get("week_end_day", 4))
+    session_open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
+    session_close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
+    now_local = pd.Timestamp.now(tz=tz)
+    session_date = _session_date_for_time(now_local, session_open_minute, session_close_minute)
+    close_dt = _session_close_datetime(session_date, session_open_minute, session_close_minute, tz)
+    iso = now_local.isocalendar()
+    year = int(iso.year)
+    week = int(iso.week)
+    if int(now_local.weekday()) > week_end_day or (int(now_local.weekday()) == week_end_day and close_dt is not None and now_local >= close_dt):
+        week += 1
+    return year, week
+
+def _ensure_utc_index(df: pd.DataFrame, tz: str = "America/New_York") -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    try:
+        idx = pd.to_datetime(df.index)
+        if idx.tz is None:
+            try:
+                idx = idx.tz_localize(tz, ambiguous="infer", nonexistent="shift_forward")
+            except Exception:
+                idx = idx.tz_localize(tz)
+        idx = idx.tz_convert("UTC")
+        df.index = idx
+    except Exception:
+        logger.exception("Failed to localize index in model_utils")
+    return df
+
+def _is_point_in_weekly_interval(weekday: int, minute_of_day: int,
+                                 start_day: int, start_minute: int,
+                                 end_day: int, end_minute: int) -> bool:
+    point = int(weekday) * 1440 + int(minute_of_day)
+    start = int(start_day) * 1440 + int(start_minute)
+    end = int(end_day) * 1440 + int(end_minute)
+    if start <= end:
+        return start <= point < end
+    return point >= start or point < end
+
+def _market_open_now(instr_meta: dict, now_utc: pd.Timestamp) -> bool:
+    tz = instr_meta.get("tz", "America/New_York")
+    try:
+        now_local = pd.Timestamp(now_utc).tz_convert(tz)
+    except Exception:
+        now_local = pd.Timestamp.now(tz=tz)
+    minute = int(now_local.hour) * 60 + int(now_local.minute)
+    weekday = int(now_local.weekday())
+    open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
+    close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
+    instr_type = str(instr_meta.get("type", "equity")).lower()
+
+    # Day session (typical equities): open and close on the same local day.
+    if open_minute <= close_minute:
+        if weekday >= 5:
+            return False
+        return (minute >= open_minute) and (minute < close_minute)
+
+    # Overnight session (typical futures): open in evening, close next day, with weekly closure.
+    in_daily_session = (minute >= open_minute) or (minute < close_minute)
+    if not in_daily_session:
+        return False
+    week_start_day = int(instr_meta.get("week_start_day", 6 if instr_type == "futures" else 0))
+    week_end_day = int(instr_meta.get("week_end_day", 4))
+    in_weekly_closure = _is_point_in_weekly_interval(
+        weekday,
+        minute,
+        week_end_day,
+        close_minute,
+        week_start_day,
+        open_minute
+    )
+    return not in_weekly_closure
+
+def _staleness_info(df_latest: pd.DataFrame, instrument_key: str = None):
+    if df_latest is None or df_latest.empty:
+        return {"is_stale": True, "age_sec": None, "threshold_sec": None, "market_open": None, "market_state": "unknown"}
+    try:
+        last_ts = pd.to_datetime(df_latest.index[-1], utc=True, errors="coerce")
+    except Exception:
+        last_ts = pd.NaT
+    now = pd.Timestamp.now(tz="UTC")
+    try:
+        age_sec = max(0.0, float((now - last_ts).total_seconds())) if pd.notna(last_ts) else None
+    except Exception:
+        age_sec = None
+    instr_meta = INSTRUMENTS.get(instrument_key or SYMBOL, {})
+    stale_mult = float(instr_meta.get("stale_multiplier", STALE_MULTIPLIER))
+    min_stale = float(instr_meta.get("stale_min_seconds", MIN_STALE_SECONDS))
+    market_open = _market_open_now(instr_meta, now)
+    if market_open:
+        threshold_sec = max(min_stale, BAR_MINUTES * 60.0 * stale_mult)
+        market_state = "open"
+    else:
+        instr_type = str(instr_meta.get("type", "equity")).lower()
+        default_closed_max_h = 72.0 if instr_type == "equity" else 56.0
+        try:
+            closed_max_h = float(instr_meta.get("closed_max_stale_hours", default_closed_max_h))
+        except Exception:
+            closed_max_h = default_closed_max_h
+        threshold_sec = max(min_stale, closed_max_h * 3600.0)
+        market_state = "closed"
+    is_stale = (age_sec is None) or (age_sec > threshold_sec)
+    return {
+        "is_stale": is_stale,
+        "age_sec": age_sec,
+        "threshold_sec": threshold_sec,
+        "market_open": bool(market_open),
+        "market_state": market_state
+    }
+
+def _stale_conf_factor(stale: dict | None) -> float:
+    """Confidence multiplier based on staleness severity."""
+    if not stale or not stale.get("is_stale"):
+        return 1.0
+    try:
+        age = float(stale.get("age_sec") or 0.0)
+        threshold = float(stale.get("threshold_sec") or MIN_STALE_SECONDS)
+    except Exception:
+        return 0.7
+    if threshold <= 0:
+        return 0.7
+    if age <= threshold:
+        return 1.0
+    ratio = max(1.0, age / max(1.0, threshold))
+    # sqrt decay: mild penalty near threshold, strong penalty when very stale
+    factor = 1.0 / (ratio ** 0.5)
+    return max(0.02, min(1.0, factor))
+
+def _is_critical_stale(stale: dict | None) -> bool:
+    """Critical stale state should block trading decisions entirely."""
+    if not stale or not stale.get("is_stale"):
+        return False
+    try:
+        age = stale.get("age_sec")
+        threshold = float(stale.get("threshold_sec") or MIN_STALE_SECONDS)
+        market_open = bool(stale.get("market_open", False))
+        severe_mult = 10.0 if market_open else 2.0
+        if age is None:
+            return True
+        return float(age) > (threshold * severe_mult)
+    except Exception:
+        return True
+
+def _prediction_diversity(results_out: dict, model_keys=("base", "forest", "boost", "extra_trees", "meta")) -> dict:
+    """
+    Compute simple spread diagnostics for model outputs.
+    Flags degenerate snapshots where models are near-identical in both price and confidence.
+    """
+    rows = []
+    for k in model_keys:
+        v = results_out.get(k, {})
+        if not isinstance(v, dict):
+            continue
+        p = v.get("pred_price")
+        c = v.get("confidence")
+        r = v.get("pred_ret")
+        d = v.get("direction")
+        if isinstance(p, (int, float)) and isinstance(c, (int, float)):
+            rows.append((k, float(p), float(c), float(r) if isinstance(r, (int, float)) else np.nan, str(d or "-")))
+    if len(rows) < 2:
+        return {
+            "n_valid": int(len(rows)),
+            "price_span_bps": None,
+            "conf_span_pct": None,
+            "degenerate": False
+        }
+    prices = np.array([r[1] for r in rows], dtype=float)
+    confs = np.array([r[2] for r in rows], dtype=float)
+    pred_rets = np.array([r[3] for r in rows], dtype=float)
+    ref = max(1.0, float(np.nanmean(np.abs(prices))))
+    price_span_bps = float((np.nanmax(prices) - np.nanmin(prices)) / ref * 10000.0)
+    if np.any(np.isfinite(pred_rets)):
+        ret_span_bps = float((np.nanmax(pred_rets) - np.nanmin(pred_rets)) * 10000.0)
+    else:
+        ret_span_bps = None
+    conf_span = float(np.nanmax(confs) - np.nanmin(confs))
+    dirs = [r[4] for r in rows]
+    unique_dirs = int(len(set(dirs)))
+
+    def _max_bucket(vals):
+        buckets = {}
+        for v in vals:
+            buckets[v] = buckets.get(v, 0) + 1
+        return max(buckets.values()) if buckets else 0
+
+    top_price_bucket = _max_bucket([round(r[1], 4) for r in rows])
+    top_conf_bucket = _max_bucket([round(r[2], 2) for r in rows])
+    valid_ret_rounded = [round(r[3], 7) for r in rows if isinstance(r[3], (int, float)) and np.isfinite(r[3])]
+    top_ret_bucket = _max_bucket(valid_ret_rounded) if valid_ret_rounded else 0
+    n = len(rows)
+    degenerate = False
+    if n >= 3:
+        ret_near_identical = (ret_span_bps is None) or (ret_span_bps <= 0.5)
+        near_identical = (price_span_bps <= 0.5 and conf_span <= 1.0 and ret_near_identical)
+        bucket_identical = (top_price_bucket >= (n - 1) and top_conf_bucket >= (n - 1))
+        if top_ret_bucket:
+            bucket_identical = bucket_identical and (top_ret_bucket >= (n - 1))
+        degenerate = bool(near_identical or bucket_identical)
+
+    return {
+        "n_valid": int(n),
+        "price_span_bps": round(price_span_bps, 4),
+        "pred_ret_span_bps": None if ret_span_bps is None else round(ret_span_bps, 4),
+        "conf_span_pct": round(conf_span, 4),
+        "unique_directions": unique_dirs,
+        "top_price_bucket": int(top_price_bucket),
+        "top_conf_bucket": int(top_conf_bucket),
+        "top_pred_ret_bucket": int(top_ret_bucket),
+        "degenerate": bool(degenerate)
+    }
+
+def _window_weights(perf: dict):
+    wins = ["short", "mid", "long"]
+    weights = {}
+    total = 0.0
+    for w in wins:
+        mae = perf.get(w, None) if isinstance(perf, dict) else None
+        try:
+            mae = float(mae)
+            if np.isnan(mae) or mae <= 0:
+                mae = 1.0
+        except Exception:
+            mae = 1.0
+        weight = 1.0 / (mae + 1e-6)
+        weights[w] = weight
+        total += weight
+    if total <= 0:
+        return {w: 1.0 / len(wins) for w in wins}
+    return {w: weights[w] / total for w in wins}
+
+def _summarize_preds(preds: np.ndarray):
+    if preds is None or preds.size == 0:
+        return None
+    mean = float(np.mean(preds))
+    std = float(np.std(preds))
+    q10 = float(np.quantile(preds, 0.1))
+    q50 = float(np.quantile(preds, 0.5))
+    q90 = float(np.quantile(preds, 0.9))
+    p_up = float(np.mean(preds > 0))
+    return {"mean": mean, "std": max(std, 1e-6), "q10": q10, "q50": q50, "q90": q90, "p_up": p_up}
+
+def _blend_summaries(a: dict, b: dict, w_a: float):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    w_b = max(0.0, min(1.0, 1.0 - w_a))
+    w_a = max(0.0, min(1.0, w_a))
+    mean = w_a * a["mean"] + w_b * b["mean"]
+    var = w_a * (a["std"] ** 2 + a["mean"] ** 2) + w_b * (b["std"] ** 2 + b["mean"] ** 2) - mean ** 2
+    std = math.sqrt(max(var, 1e-12))
+    q10 = w_a * a["q10"] + w_b * b["q10"]
+    q50 = w_a * a["q50"] + w_b * b["q50"]
+    q90 = w_a * a["q90"] + w_b * b["q90"]
+    p_up = w_a * a["p_up"] + w_b * b["p_up"]
+    return {"mean": mean, "std": std, "q10": q10, "q50": q50, "q90": q90, "p_up": p_up}
+
+def _regime_prob_for_key(regime_key, comp_probs):
+    try:
+        if comp_probs is None:
+            return None
+        if isinstance(comp_probs, (list, tuple)) and str(regime_key).isdigit():
+            idx = int(regime_key)
+            if 0 <= idx < len(comp_probs):
+                return float(comp_probs[idx])
+    except Exception:
+        return None
+    return None
+
+def _select_regime_members(regime_map: dict, win: str, dominant_regime=None, comp_probs=None):
+    """Pick the best available regime-specific members for a given window."""
+    if not regime_map:
+        return [], None, None
+
+    def _members_for(key):
+        return regime_map.get(str(key), {}).get(win, []) or []
+
+    # 1) Dominant regime if available
+    if dominant_regime is not None:
+        members = _members_for(dominant_regime)
+        if members:
+            return members, str(dominant_regime), _regime_prob_for_key(dominant_regime, comp_probs)
+
+    # 2) Highest-prob available regime
+    if isinstance(comp_probs, (list, tuple)):
+        scored = []
+        for key in regime_map.keys():
+            prob = _regime_prob_for_key(key, comp_probs)
+            scored.append((prob if prob is not None else -1.0, str(key)))
+        scored.sort(reverse=True, key=lambda x: x[0])
+        for prob, key in scored:
+            members = _members_for(key)
+            if members:
+                return members, key, prob if prob is not None and prob >= 0 else None
+
+    # 3) Any non-empty regime
+    for key in regime_map.keys():
+        members = _members_for(key)
+        if members:
+            return members, str(key), _regime_prob_for_key(key, comp_probs)
+
+    return [], None, None
+
+def _max_abs_ret_from_vol(vol: float, instr_meta: dict = None) -> float:
+    try:
+        v = float(vol)
+    except Exception:
+        v = 0.0
+    if not np.isfinite(v) or v <= 0:
+        return MAX_ABS_RET
+    mult = 6.0
+    if instr_meta:
+        try:
+            mult = float(instr_meta.get("max_abs_ret_mult", mult))
+        except Exception:
+            mult = mult
+    return float(max(0.003, min(0.05, mult * v)))
+
+def _predict_horizon_norm(models_dict, df_latest, horizon_minutes: int, instrument_key: str = None,
+                          feature_frame: pd.DataFrame | None = None, feat_cache: dict | None = None):
+    try:
+        h_key = str(int(horizon_minutes))
+    except Exception:
+        h_key = str(horizon_minutes)
+    preds = []
+    for key in ["base", "forest", "boost", "extra_trees"]:
+        payload = models_dict.get(key)
+        if payload is None:
+            continue
+        h_payload = payload.get("horizon_models", {}).get(h_key)
+        if not h_payload:
+            continue
+        feats = h_payload.get("features", payload.get("features"))
+        try:
+            X = _get_feature_row_cached(
+                df_latest,
+                feats,
+                instrument_key=instrument_key,
+                feature_frame=feature_frame,
+                cache=feat_cache
+            )
+        except Exception:
+            X = pd.DataFrame()
+        if X is None or X.empty:
+            continue
+        ensemble_map = h_payload.get("ensemble_models", {}) if h_payload else {}
+        perf = h_payload.get("performance_mae", {}) if h_payload else {}
+        win_weights = _window_weights(perf)
+        combined = None
+        combined_weight = 0.0
+        for win in ["short", "mid", "long"]:
+            members = ensemble_map.get(win, []) or []
+            if not members:
+                continue
+            preds_norm = _ensemble_predict_members(members, X)
+            if preds_norm.size == 0:
+                continue
+            mean_norm, std_norm, _, _, _ = _aggregate_preds(preds_norm)
+            win_sum = {"mean": mean_norm, "std": std_norm, "q10": 0.0, "q50": mean_norm, "q90": 0.0, "p_up": float(np.mean(preds_norm > 0))}
+            w = win_weights.get(win, 0.0)
+            if combined is None:
+                combined = win_sum
+                combined_weight = w
+            else:
+                total = combined_weight + w
+                w_a = combined_weight / total if total > 0 else 0.5
+                combined = _blend_summaries(combined, win_sum, w_a)
+                combined_weight = total
+        if combined is None:
+            continue
+        preds.append(float(combined["mean"]))
+    if not preds:
+        return None
+    return float(np.mean(preds))
+
+def _load_live_calibration(instrument_key: str):
+    if not LIVE_CALIBRATION:
+        return None
+    try:
+        now = datetime.now(timezone.utc)
+        if _LIVE_CAL_CACHE["ts"] is not None:
+            age = (now - _LIVE_CAL_CACHE["ts"]).total_seconds()
+            if age < 60:
+                return _LIVE_CAL_CACHE["data"]
+        path = os.path.join(DATA_DIR, f"calibration_live_{instrument_key or SYMBOL}.json")
+        if not os.path.exists(path):
+            return None
+        with open(path, "r") as f:
+            data = json.load(f)
+        # Mark stale calibration so we can avoid trusting old stats
+        try:
+            last_update = pd.to_datetime(data.get("last_update"), utc=True, errors="coerce")
+            if pd.isna(last_update):
+                data["_stale"] = True
+            else:
+                from config import CALIBRATION_MAX_AGE_DAYS
+                age_days = (now - last_update).total_seconds() / 86400.0
+                data["_stale"] = age_days > float(CALIBRATION_MAX_AGE_DAYS)
+        except Exception:
+            data["_stale"] = True
+        _LIVE_CAL_CACHE["ts"] = now
+        _LIVE_CAL_CACHE["data"] = data
+        return data
+    except Exception:
+        logger.exception("Failed to load live calibration")
+        return None
+
+def _live_calibration_prob(instrument_key: str, model_key: str, sig_bucket: str):
+    data = _load_live_calibration(instrument_key)
+    if not data or data.get("_stale"):
+        return None, 0
+    try:
+        bucket = data.get("by_model", {}).get(model_key, {}).get(sig_bucket, None)
+        if bucket is None:
+            return None, 0
+        wins = float(bucket.get("wins", 0))
+        total = float(bucket.get("total", 0))
+        if total <= 0:
+            return None, 0
+        return wins / total, int(total)
+    except Exception:
+        return None, 0
+
+def _live_calibration_bias(instrument_key: str, model_key: str):
+    data = _load_live_calibration(instrument_key)
+    if not data or data.get("_stale"):
+        return 0.0
+    try:
+        stats = data.get("by_model_stats", {}).get(model_key, None)
+        if stats is None:
+            return 0.0
+        total = float(stats.get("total", 0.0))
+        if total <= 0:
+            return 0.0
+        return float(stats.get("sum_error", 0.0)) / total
+    except Exception:
+        return 0.0
+
+def _schedule_live_calibration_update(instrument_key: str):
+    """Schedule calibration refresh in the background to keep prediction latency stable."""
+    if not LIVE_CALIBRATION:
+        return
+    global _LAST_CAL_UPDATE, _CAL_UPDATE_IN_FLIGHT
+    now = datetime.now(timezone.utc)
+    try:
+        if _LAST_CAL_UPDATE is not None and (now - _LAST_CAL_UPDATE).total_seconds() < 300:
+            return
+    except Exception:
+        pass
+    with _CAL_UPDATE_LOCK:
+        if _CAL_UPDATE_IN_FLIGHT:
+            return
+        _CAL_UPDATE_IN_FLIGHT = True
+        _LAST_CAL_UPDATE = now
+
+    def _job():
+        global _CAL_UPDATE_IN_FLIGHT
+        try:
+            from calibration_tracker import update_live_calibration
+            update_live_calibration(instrument_key or SYMBOL, horizon_minutes=4)
+        except Exception:
+            logger.debug("Live calibration update failed", exc_info=True)
+        finally:
+            with _CAL_UPDATE_LOCK:
+                _CAL_UPDATE_IN_FLIGHT = False
+
+    try:
+        th = threading.Thread(target=_job, daemon=True)
+        th.start()
+    except Exception:
+        with _CAL_UPDATE_LOCK:
+            _CAL_UPDATE_IN_FLIGHT = False
+
+def _log_prediction(instrument_key, last_price, results_out):
+    if not LOG_PREDICTIONS and not LIVE_CALIBRATION:
+        return
+    try:
+        import csv
+        ts = datetime.now(timezone.utc).isoformat()
+        instr = instrument_key or SYMBOL
+        row = {
+            "timestamp": ts,
+            "instrument": instr,
+            "last_price": last_price
+        }
+        for k in ["base", "forest", "boost", "extra_trees", "meta", "consensus"]:
+            v = results_out.get(k, {})
+            row[f"{k}_dir"] = v.get("direction")
+            row[f"{k}_price"] = v.get("pred_price")
+            row[f"{k}_conf"] = v.get("confidence")
+            row[f"{k}_pred_ret"] = v.get("pred_ret")
+            row[f"{k}_sig_bucket"] = v.get("sig_bucket")
+        reg = results_out.get("regime", {})
+        row["regime_bullish"] = reg.get("Bullish")
+        row["regime_neutral"] = reg.get("Neutral")
+        row["regime_bearish"] = reg.get("Bearish")
+        row["regime_conf"] = reg.get("regime_conf")
+        meta = results_out.get("_meta", {})
+        row["data_ts"] = meta.get("data_ts")
+        try:
+            row["model_versions"] = json.dumps(meta.get("model_versions", {}), sort_keys=True)
+        except Exception:
+            row["model_versions"] = None
+
+        path = os.path.join(DATA_DIR, f"predictions_{instr}.csv")
+        fieldnames = list(row.keys())
+        if os.path.exists(path):
+            try:
+                with open(path, "r", newline="") as f:
+                    reader = csv.reader(f)
+                    existing_header = next(reader, None)
+                if existing_header:
+                    # Keep a stable schema per file to avoid malformed rows when fields change.
+                    fieldnames = existing_header
+            except Exception:
+                pass
+        write_header = (not os.path.exists(path)) or (os.path.getsize(path) == 0)
+        row_to_write = {k: row.get(k) for k in fieldnames}
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row_to_write)
+    except Exception:
+        logger.exception("Failed to log prediction")
+
+def _safe_instrument_tag(instr_key: str) -> str:
+    return str(instr_key or DEFAULT_INSTRUMENT).replace("/", "_").replace("\\", "_")
+
+def _model_path(prefix: str, mode: str, instr_key: str) -> str:
+    tag = _safe_instrument_tag(instr_key)
+    return os.path.join(MODEL_DIR, f"{prefix}_{mode}_{tag}.pkl")
+
+def _models_dir_signature() -> tuple:
+    try:
+        entries = []
+        for name in sorted(os.listdir(MODEL_DIR)):
+            if not str(name).endswith(".pkl"):
+                continue
+            p = os.path.join(MODEL_DIR, name)
+            try:
+                st = os.stat(p)
+                entries.append((name, int(st.st_mtime_ns), int(st.st_size)))
+            except Exception:
+                entries.append((name, None, None))
+        return tuple(entries)
+    except Exception:
+        return tuple()
+
+def _load_mode_models(mode: str, instrument_key: str = None):
+    mode_res = {}
+    instr_key = instrument_key or DEFAULT_INSTRUMENT
+    mapping = {
+        "base": "base",
+        "forest": "forest",
+        "boost": "boost",
+        "extra_trees": "extra_trees"
+    }
+    for key, prefix in mapping.items():
+        path = _model_path(prefix, mode, instr_key)
+        payload = None
+        if os.path.exists(path):
+            try:
+                payload = joblib.load(path)
+            except Exception:
+                logger.exception(f"Failed to load model file {path}")
+                payload = None
+        # fallback to legacy non-instrument file if not found (default instrument only)
+        if payload is None and instr_key == DEFAULT_INSTRUMENT:
+            legacy = os.path.join(MODEL_DIR, f"{prefix}_{mode}.pkl")
+            if os.path.exists(legacy):
+                try:
+                    payload = joblib.load(legacy)
+                except Exception:
+                    logger.exception(f"Failed to load legacy model file {legacy}")
+                    payload = None
+        if payload is None:
+            continue
+        payload.setdefault("features", payload.get("features", None))
+        payload.setdefault("ensemble_models", payload.get("ensemble_models", {}))
+        payload.setdefault("regime_models", payload.get("regime_models", {}))
+        payload.setdefault("horizon_models", payload.get("horizon_models", {}))
+        payload.setdefault("meta", payload.get("meta", {}))
+        payload.setdefault("performance_mae", payload.get("performance_mae", {}))
+        payload.setdefault("calibration", payload.get("calibration", {}))
+        payload.setdefault("calibration_sig", payload.get("calibration_sig", {"Weak":0.5,"Medium":0.5,"Strong":0.5}))
+        mode_res[key] = payload
+    return mode_res
+
+def load_models(include_modes: bool = True, instrument_key: str = None):
+    res = {}
+    instr_key = instrument_key or DEFAULT_INSTRUMENT
+    cache_key = (bool(include_modes), str(instr_key))
+    signature = _models_dir_signature()
+    cached = _MODEL_CACHE.get(cache_key)
+    if cached and cached.get("signature") == signature and isinstance(cached.get("models"), dict):
+        return cached["models"]
+    mapping = {
+        "base": BASE_MODEL_FILE,
+        "forest": FOREST_MODEL_FILE,
+        "boost": BOOST_MODEL_FILE,
+        "extra_trees": EXTRA_TREES_MODEL_FILE
+    }
+    for key, fname in mapping.items():
+        # prefer instrument-scoped 4min models
+        path = _model_path(key, "4min", instr_key)
+        payload = None
+        if os.path.exists(path):
+            try:
+                payload = joblib.load(path)
+            except Exception:
+                logger.exception(f"Failed to load model file {path}")
+                payload = None
+        # fallback to legacy paths if not found (default instrument only)
+        if payload is None and instr_key == DEFAULT_INSTRUMENT:
+            legacy = os.path.join(MODEL_DIR, fname)
+            if os.path.exists(legacy):
+                try:
+                    payload = joblib.load(legacy)
+                except Exception:
+                    logger.exception(f"Failed to load legacy model file {legacy}")
+                    payload = None
+        if payload is None and key == "extra_trees" and instr_key == DEFAULT_INSTRUMENT:
+            # backward-compatible fallback for older filename
+            legacy = os.path.join(MODEL_DIR, "extra_model.pkl")
+            if os.path.exists(legacy):
+                try:
+                    payload = joblib.load(legacy)
+                except Exception:
+                    logger.exception(f"Failed to load legacy model file {legacy}")
+                    payload = None
+        if payload is None:
+            continue
+        payload.setdefault("features", payload.get("features", None))
+        payload.setdefault("ensemble_models", payload.get("ensemble_models", {}))
+        payload.setdefault("regime_models", payload.get("regime_models", {}))
+        payload.setdefault("horizon_models", payload.get("horizon_models", {}))
+        payload.setdefault("meta", payload.get("meta", {}))
+        payload.setdefault("performance_mae", payload.get("performance_mae", {}))
+        payload.setdefault("calibration", payload.get("calibration", {}))
+        payload.setdefault("calibration_sig", payload.get("calibration_sig", {"Weak":0.5,"Medium":0.5,"Strong":0.5}))
+        res[key] = payload
+    # Meta model (stacked)
+    meta_path = _model_path("meta", "4min", instr_key)
+    if os.path.exists(meta_path):
+        try:
+            res["meta"] = joblib.load(meta_path)
+        except Exception:
+            logger.exception("Failed to load meta model")
+    else:
+        if instr_key == DEFAULT_INSTRUMENT:
+            meta_legacy = os.path.join(MODEL_DIR, META_MODEL_FILE)
+            if os.path.exists(meta_legacy):
+                try:
+                    res["meta"] = joblib.load(meta_legacy)
+                except Exception:
+                    logger.exception("Failed to load legacy meta model")
+    regime_path = os.path.join(MODEL_DIR, REGIME_MODEL_FILE)
+    # prefer instrument-scoped regime
+    inst_regime = _model_path("regime", "4min", instr_key)
+    if os.path.exists(inst_regime):
+        regime_path = inst_regime
+    if os.path.exists(regime_path) and (instr_key == DEFAULT_INSTRUMENT or os.path.exists(inst_regime)):
+        try:
+            regime_payload = joblib.load(regime_path)
+            # guard against legacy (non-GMM) regime payloads
+            try:
+                from regime_model import extract_regime_pipeline
+                scaler, gmm = extract_regime_pipeline(regime_payload)
+                if gmm is None:
+                    legacy_path = os.path.join(MODEL_DIR, "regime_model.legacy.pkl")
+                    try:
+                        if os.path.exists(regime_path) and not os.path.exists(legacy_path):
+                            os.replace(regime_path, legacy_path)
+                            logger.warning("Legacy/invalid regime model detected; moved to regime_model.legacy.pkl")
+                        else:
+                            logger.warning("Legacy/invalid regime model detected; ignoring payload")
+                    except Exception:
+                        logger.warning("Legacy/invalid regime model detected; ignoring payload")
+                    regime_payload = None
+            except Exception:
+                pass
+            res["regime"] = regime_payload
+        except Exception:
+            logger.exception("Failed to load regime model")
+            res["regime"] = None
+    else:
+        res["regime"] = None
+    if include_modes:
+        res["modes"] = {}
+        for mode in ("daily_high", "daily_low", "weekend"):
+            res["modes"][mode] = _load_mode_models(mode, instrument_key=instr_key)
+    _MODEL_CACHE[cache_key] = {"signature": signature, "models": res}
+    return res
+
+def _model_tiebreaker_epsilon(model_key: str) -> float:
+    h = abs(hash(model_key)) % 1000
+    return h / 1_000_000.0
+
+def _dynamic_confidence_by_sigbucket_from_payload(pred_ret, resid_std, payload, model_key=None, instrument_key=None):
+    sig_map = payload.get("calibration_sig", {"Weak":0.5,"Medium":0.5,"Strong":0.5})
+    if resid_std is None or resid_std <= 0:
+        resid_std = float(payload.get("meta", {}).get("resid_std", 1e-6))
+    try:
+        pred_bias = float(payload.get("meta", {}).get("pred_bias", 0.0))
+    except Exception:
+        pred_bias = 0.0
+    adj_pred = pred_ret - pred_bias
+    z = abs(adj_pred) / (resid_std + 1e-12)
+    if z < 0.5:
+        sig = "Weak"
+    elif z < 1.5:
+        sig = "Medium"
+    else:
+        sig = "Strong"
+    prob = sig_map.get(sig, None)
+    if prob is None:
+        try:
+            z = adj_pred / (resid_std + 1e-12)
+            prob = 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0)))
+        except Exception:
+            prob = 0.5
+    # blend with live calibration (if available)
+    if model_key is not None and instrument_key is not None:
+        live_prob, n = _live_calibration_prob(instrument_key, model_key, sig)
+        if live_prob is not None and n > 5:
+            w = min(0.5, n / 200.0)
+            prob = (1.0 - w) * prob + w * live_prob
+    return max(0.01, min(0.99, float(prob)))
+
+def _aggregate_preds(members_preds):
+    if members_preds.size == 0:
+        return 0.0, 1e-6, 0.0, 0.0, 0.0
+    mean = float(np.mean(members_preds))
+    std = float(np.std(members_preds))
+    q10 = float(np.quantile(members_preds, 0.1))
+    q50 = float(np.quantile(members_preds, 0.5))
+    q90 = float(np.quantile(members_preds, 0.9))
+    return mean, max(std, 1e-6), q10, q50, q90
+
+def _ensemble_predict_members(members, X):
+    try:
+        cap = int(MAX_ENSEMBLE_MEMBERS_PREDICT)
+    except Exception:
+        cap = 0
+    if cap > 0 and members and len(members) > cap:
+        try:
+            idxs = np.linspace(0, len(members) - 1, cap, dtype=int).tolist()
+            members = [members[i] for i in idxs]
+        except Exception:
+            members = members[:cap]
+    preds = []
+    for m in members:
+        try:
+            if m is None:
+                continue
+            p = m.predict(X)
+            if hasattr(p, "__len__"):
+                preds.append(float(p[0]))
+            else:
+                preds.append(float(p))
+        except Exception:
+            continue
+    return np.array(preds) if len(preds) > 0 else np.array([])
+
+def fallback_regime_probs(df: pd.DataFrame) -> dict:
+    out = {"Bullish": 0.0, "Neutral": 0.0, "Bearish": 0.0}
+    if df is None or df.empty:
+        return {"Bullish": 0.0, "Neutral": 100.0, "Bearish": 0.0, "dominant_component": "0", "component_probs": [1.0] + [0.0]*3, "regime_conf": 0.0}
+    recent = df["close"].iloc[-24:] if len(df) >= 24 else df["close"]
+    if recent.empty:
+        return {"Bullish": 0.0, "Neutral": 100.0, "Bearish": 0.0, "dominant_component": "0", "component_probs": [1.0] + [0.0]*3, "regime_conf": 0.0}
+    ret_6 = recent.pct_change(6).dropna()
+    mean_short = float(ret_6.mean()) if not ret_6.empty else 0.0
+    vol_short = float(ret_6.std()) if not ret_6.empty else 0.0
+    score = mean_short / (vol_short + 1e-9)
+    if score > 0.2:
+        out["Bullish"] = 0.7
+        out["Neutral"] = 0.25
+        out["Bearish"] = 0.05
+        dominant = "3"
+        comp_probs = [0.05, 0.1, 0.1, 0.75]
+    elif score < -0.2:
+        out["Bullish"] = 0.05
+        out["Neutral"] = 0.25
+        out["Bearish"] = 0.7
+        dominant = "0"
+        comp_probs = [0.75, 0.1, 0.1, 0.05]
+    else:
+        out["Bullish"] = 0.2
+        out["Neutral"] = 0.6
+        out["Bearish"] = 0.2
+        dominant = "1"
+        comp_probs = [0.2, 0.4, 0.3, 0.1]
+    for k in out:
+        out[k] = round(float(out[k] * 100.0), 1)
+        out["dominant_component"] = dominant
+        out["component_probs"] = comp_probs
+    out["regime_conf"] = 0.3
+    return out
+
+def predict_4min(models_dict, df_latest, instrument_key: str = None):
+    results = {}
+    if df_latest is None or df_latest.empty:
+        return results
+    last_price = float(df_latest["close"].iloc[-1])
+    instr_meta = _instrument_meta(instrument_key)
+
+    regime_payload = models_dict.get("regime")
+    if not regime_payload:
+        return {"error": "Regime model missing"}
+    try:
+        rp = predict_regime_probs(regime_payload, df_latest)
+    except Exception:
+        return {"error": "Regime model invalid"}
+
+    live_cal = _load_live_calibration(instrument_key) if LIVE_CALIBRATION else None
+    drift_flag = bool(live_cal.get("drift_flag", False)) if live_cal else False
+    cal_stale = bool(live_cal.get("_stale", False)) if live_cal else False
+
+    dominant_regime = rp.get("dominant_component", None)
+    comp_probs = rp.get("component_probs", None)
+    dom_prob = 0.0
+    if dominant_regime is None:
+        dominant_regime = "0"
+    try:
+        if isinstance(comp_probs, (list, tuple)) and str(dominant_regime).isdigit():
+            dom_idx = int(dominant_regime)
+            if 0 <= dom_idx < len(comp_probs):
+                dom_prob = float(comp_probs[dom_idx])
+    except Exception:
+        dom_prob = 0.0
+    if dom_prob == 0.0 and dominant_regime is not None and comp_probs is None:
+        dom_prob = 0.6
+
+    stale = _staleness_info(df_latest, instrument_key=instrument_key)
+    stale_factor = _stale_conf_factor(stale)
+    critical_stale = _is_critical_stale(stale)
+    stale_note = ""
+    if stale.get("is_stale"):
+        try:
+            mins = stale.get("age_sec", 0.0) / 60.0 if stale.get("age_sec") is not None else None
+            stale_note = f"Stale data ({mins:.1f}m old)" if mins is not None else "Stale data"
+        except Exception:
+            stale_note = "Stale data"
+
+    results_out = {}
+    # Always include regime in output (even if models fail later)
+    results_out["regime"] = rp
+    # Meta info for logging/audit
+    try:
+        last_ts = pd.to_datetime(df_latest.index[-1], utc=True, errors="coerce")
+        data_ts = last_ts.isoformat() if pd.notna(last_ts) else None
+    except Exception:
+        data_ts = None
+    results_out["_meta"] = {"data_ts": data_ts, "model_versions": {}, "staleness": stale}
+    if critical_stale:
+        guard_note = "No-trade guard: critical stale data"
+        if stale_note:
+            guard_note = f"{guard_note} | {stale_note}"
+        frozen_price = _round_to_tick(last_price, instr_meta)
+        for key in ["base", "forest", "boost", "extra_trees", "meta"]:
+            results_out[key] = {
+                "direction": "-",
+                "pred_price": float(round(frozen_price, 4)),
+                "confidence": 1.0,
+                "note": guard_note,
+                "pred_ret": 0.0,
+                "pred_norm": 0.0,
+                "pred_std_norm": 1e-6,
+                "sig_bucket": "Weak",
+            }
+        results_out["consensus"] = {
+            "direction": "-",
+            "pred_price": float(round(frozen_price, 4)),
+            "confidence": 1.0,
+            "note": guard_note,
+            "position_size": 0.0,
+        }
+        results_out["horizon"] = {"h10_norm": None, "h30_norm": None, "align_score": 0.0}
+        results_out["_meta"]["critical_stale"] = True
+        results_out["_meta"]["diversity"] = _prediction_diversity(results_out)
+        _log_prediction(instrument_key, last_price, results_out)
+        return results_out
+    model_preds = []
+    per_model_weights = {}
+
+    # base feature row for meta and sizing (compute once and cache)
+    feat_frame = _live_feature_frame(df_latest, instrument_key=instrument_key)
+    feat_cache: dict = {}
+    try:
+        X_base_feat = _get_feature_row_cached(
+            df_latest,
+            DEFAULT_FEATURES + ["trend_strength"],
+            instrument_key=instrument_key,
+            feature_frame=feat_frame,
+            cache=feat_cache
+        )
+    except Exception:
+        X_base_feat = None
+    meta_ewm_vol = float(X_base_feat.get("ewm_vol", 0.001).iloc[0]) if X_base_feat is not None and "ewm_vol" in X_base_feat.columns else 0.001
+    meta_ewm_vol = max(meta_ewm_vol, _vol_floor_from_meta(instr_meta))
+    meta_trend = float(X_base_feat.get("trend_strength", 0.0).iloc[0]) if X_base_feat is not None and "trend_strength" in X_base_feat.columns else 0.0
+
+    for key in ["base", "forest", "boost", "extra_trees"]:
+        payload = models_dict.get(key)
+        if payload is None:
+            continue
+        try:
+            ver = payload.get("meta", {}).get("version")
+            results_out["_meta"]["model_versions"][key] = ver
+        except Exception:
+            pass
+
+        feat_list = payload.get("features")
+        try:
+            X = _get_feature_row_cached(
+                df_latest,
+                feat_list,
+                instrument_key=instrument_key,
+                feature_frame=feat_frame,
+                cache=feat_cache
+            )
+        except Exception:
+            results_out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Feature error"}
+            continue
+        if X is None or X.empty:
+            results_out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Waiting…"}
+            continue
+
+        try:
+            current_vol = float(X.get("ewm_vol", 0.001).iloc[0]) if "ewm_vol" in X.columns else 0.001
+        except Exception:
+            current_vol = 0.001
+        # Use additional vol proxies and a floor to avoid near-zero predictions
+        vol_candidates = [current_vol]
+        for col in ("vol_12", "vol_6", "vol_3", "session_volatility"):
+            try:
+                if col in X.columns:
+                    vol_candidates.append(float(X[col].iloc[0]))
+            except Exception:
+                continue
+        current_vol = max([v for v in vol_candidates if np.isfinite(v)] + [_vol_floor_from_meta(instr_meta)])
+
+        ensemble_map = payload.get("ensemble_models", {}) if payload else {}
+        regime_map = payload.get("regime_models", {}) if payload else {}
+        perf = payload.get("performance_mae", {}) if payload else {}
+        win_weights = _window_weights(perf)
+
+        combined_summary = None
+        combined_weight = 0.0
+        for win in ["short", "mid", "long"]:
+            members = ensemble_map.get(win, []) or []
+            if not members:
+                continue
+            global_sum = _summarize_preds(_ensemble_predict_members(members, X))
+            reg_sum = None
+            if regime_map:
+                reg_members = regime_map.get(str(dominant_regime), {}).get(win, []) or []
+                if reg_members:
+                    reg_sum = _summarize_preds(_ensemble_predict_members(reg_members, X))
+            if reg_sum is not None and global_sum is not None:
+                w_reg = max(0.0, min(0.8, dom_prob))
+                win_sum = _blend_summaries(reg_sum, global_sum, w_reg)
+            else:
+                win_sum = reg_sum or global_sum
+            if win_sum is None:
+                continue
+            w = win_weights.get(win, 0.0)
+            if combined_summary is None:
+                combined_summary = win_sum
+                combined_weight = w
+            else:
+                total = combined_weight + w
+                w_a = combined_weight / total if total > 0 else 0.5
+                combined_summary = _blend_summaries(combined_summary, win_sum, w_a)
+                combined_weight = total
+
+        # Require ensemble summary; fall back to single-model if available
+        if combined_summary is None:
+            fb = payload.get("fallback_model")
+            if fb is None:
+                fb = payload.get("model")
+            if fb is not None:
+                try:
+                    pred_norm = float(fb.predict(X)[0])
+                    pred_std_norm = float(payload.get("meta", {}).get("resid_std", 1e-6))
+                    pred_std_norm = max(pred_std_norm, 1e-6)
+                    combined_summary = {"mean": pred_norm, "std": pred_std_norm, "q10": 0.0, "q50": pred_norm, "q90": 0.0, "p_up": float(pred_norm >= 0)}
+                except Exception:
+                    combined_summary = None
+            if combined_summary is None:
+                results_out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Ensemble not trained"}
+                continue
+
+        pred_norm = combined_summary["mean"]
+        pred_std_norm = combined_summary["std"]
+
+        # Bayesian shrinkage toward 0 (prior variance scaled by regime confidence)
+        try:
+            reg_conf = float(rp.get("regime_conf", 0.5))
+        except Exception:
+            reg_conf = 0.5
+        prior_var = max(0.2, min(2.0, 0.6 + reg_conf))
+        shrink = prior_var / (prior_var + (pred_std_norm ** 2))
+        pred_norm = pred_norm * shrink
+
+        # Predictions are trained on de-meaned targets; avoid inference-time bias correction
+        pred_norm_adj = pred_norm
+
+        # Calibrate p_up using signal-bucket calibration if available (use bias-adjusted signal)
+        p_correct_sig = _dynamic_confidence_by_sigbucket_from_payload(
+            pred_norm_adj, pred_std_norm, payload, model_key=key, instrument_key=instrument_key
+        )
+        p_up_sig = p_correct_sig if pred_norm_adj >= 0 else (1.0 - p_correct_sig)
+        p_up = 0.7 * combined_summary["p_up"] + 0.3 * p_up_sig
+        p_up = max(0.001, min(0.999, p_up))
+
+        # Regime support adjustment (boost confidence, not direction)
+        try:
+            support = rp.get("Bullish", 0.0) / 100.0 if pred_norm_adj >= 0 else rp.get("Bearish", 0.0) / 100.0
+        except Exception:
+            support = 0.0
+        try:
+            regime_conf = float(rp.get("regime_conf", 1.0))
+        except Exception:
+            regime_conf = 1.0
+        support *= (0.5 + 0.5 * max(0.0, min(1.0, regime_conf)))
+
+        target_normed = _infer_target_norm(payload.get("meta", {}))
+        pred_ret_adj = pred_norm_adj * current_vol if target_normed else pred_norm_adj
+        max_abs_ret = _max_abs_ret_from_vol(current_vol, instr_meta)
+        pred_ret_adj = max(-max_abs_ret, min(max_abs_ret, pred_ret_adj))
+        # No live bias correction in inference (keep predictions unbiased)
+        pred_price = _round_to_tick(last_price * (1.0 + pred_ret_adj), instr_meta)
+
+        # Direction should reflect the displayed price move
+        if pred_price > last_price:
+            direction = "UP"
+        elif pred_price < last_price:
+            direction = "DOWN"
+        else:
+            direction = "UP" if pred_ret_adj >= 0 else "DOWN"
+        conf = (p_up if direction == "UP" else (1.0 - p_up))
+        conf *= (0.7 + 0.3 * support)
+
+        # Penalize high dispersion relative to mean
+        dispersion = pred_std_norm / (abs(pred_norm_adj) + 1e-9)
+        dispersion = min(dispersion, 3.0)
+        conf *= (1.0 / (1.0 + 0.35 * dispersion))
+
+        # Staleness penalty (severity-scaled)
+        if stale.get("is_stale"):
+            conf *= stale_factor
+        if cal_stale:
+            conf *= 0.85
+
+        # Drift guard
+        if drift_flag:
+            conf *= 0.7
+        # Keep true low-confidence values visible instead of pinning many models to 20%.
+        conf = max(0.01, min(0.99, conf))
+        # Additional risk-off for extreme volatility
+        try:
+            vol_guard = current_vol > 0.01
+        except Exception:
+            vol_guard = False
+        low_conf = (conf < NO_SIGNAL_CONF) or (dispersion > NO_SIGNAL_DISP) or vol_guard or (stale_factor < 0.2)
+
+        # pred_price already computed above
+
+        note_parts = []
+        if stale_note:
+            note_parts.append(stale_note)
+        if low_conf:
+            note_parts.append("Low confidence")
+        if vol_guard:
+            note_parts.append("High volatility")
+        if drift_flag:
+            note_parts.append("Drift guard")
+        if cal_stale:
+            note_parts.append("Calibration stale")
+        note = " | ".join(note_parts)
+        results_out[key] = {
+            "direction": direction,
+            "pred_price": float(round(pred_price, 4)),
+            "confidence": round(float(conf * 100.0), 2),
+            "note": note,
+            "pred_ret": float(pred_ret_adj),
+            "pred_norm": float(pred_norm),
+            "pred_std_norm": float(pred_std_norm),
+            "sig_bucket": "Strong" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak"
+        }
+        model_preds.append((key, pred_ret_adj))
+        # derive model weight from blended window performance
+        try:
+            blended_mae = 0.0
+            for w in ["short", "mid", "long"]:
+                mae = perf.get(w, 1.0) if isinstance(perf, dict) else 1.0
+                try:
+                    mae = float(mae) if mae is not None else 1.0
+                except Exception:
+                    mae = 1.0
+                blended_mae += win_weights.get(w, 1.0/3.0) * mae
+            per_model_weights[key] = 1.0 / (blended_mae + 1e-6)
+        except Exception:
+            per_model_weights[key] = 1.0
+
+    # Meta-model stacking (if available)
+    meta_payload = models_dict.get("meta")
+    if meta_payload and meta_payload.get("model") is not None:
+        try:
+            try:
+                ver = meta_payload.get("meta", {}).get("version")
+                results_out["_meta"]["model_versions"]["meta"] = ver
+            except Exception:
+                pass
+            meta_features = meta_payload.get("features", [])
+            meta_row = {
+                "base": results_out.get("base", {}).get("pred_norm"),
+                "forest": results_out.get("forest", {}).get("pred_norm"),
+                "boost": results_out.get("boost", {}).get("pred_norm"),
+                "extra_trees": results_out.get("extra_trees", {}).get("pred_norm"),
+                "ewm_vol": meta_ewm_vol,
+                "trend_strength": meta_trend
+            }
+            # build feature row with proper ordering
+            meta_vec = []
+            for f in meta_features:
+                meta_vec.append(meta_row.get(f, 0.0))
+            meta_X = pd.DataFrame([meta_vec], columns=meta_features)
+            pred_meta_norm = float(meta_payload["model"].predict(meta_X)[0])
+            meta_resid = float(meta_payload.get("meta", {}).get("resid_std", 1e-6))
+            meta_resid = max(meta_resid, 1e-6)
+            # Bayesian shrinkage for meta
+            try:
+                reg_conf = float(rp.get("regime_conf", 0.5))
+            except Exception:
+                reg_conf = 0.5
+            prior_var = max(0.2, min(2.0, 0.6 + reg_conf))
+            shrink = prior_var / (prior_var + (meta_resid ** 2))
+            pred_meta_norm = pred_meta_norm * shrink
+            p_up_meta = 0.5 * (1.0 + math.erf((pred_meta_norm / (meta_resid + 1e-12)) / math.sqrt(2.0)))
+            conf_meta = max(0.01, min(0.99, p_up_meta if pred_meta_norm >= 0 else (1.0 - p_up_meta)))
+            if stale.get("is_stale"):
+                conf_meta *= 0.5
+            if drift_flag:
+                conf_meta *= 0.7
+            meta_normed = _infer_target_norm(meta_payload.get("meta", {}))
+            meta_ret = pred_meta_norm * meta_ewm_vol if meta_normed else pred_meta_norm
+            max_abs = _max_abs_ret_from_vol(meta_ewm_vol, instr_meta)
+            meta_ret = max(-max_abs, min(max_abs, meta_ret))
+            # No live bias correction in inference (keep predictions unbiased)
+            meta_price = _round_to_tick(last_price * (1.0 + meta_ret), instr_meta)
+            results_out["meta"] = {
+                "direction": "UP" if pred_meta_norm >= 0 else "DOWN",
+                "pred_price": float(round(meta_price, 4)),
+                "confidence": round(float(conf_meta * 100.0), 2),
+                "note": "Meta ensemble",
+                "pred_ret": float(meta_ret),
+                "pred_norm": float(pred_meta_norm),
+                "pred_std_norm": float(meta_resid),
+                "sig_bucket": "Strong" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 1.5 else "Medium" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 0.5 else "Weak"
+            }
+            model_preds.append(("meta", meta_ret))
+            per_model_weights["meta"] = 1.0 / (meta_resid + 1e-6)
+        except Exception:
+            logger.debug("Meta prediction failed", exc_info=True)
+
+    if not model_preds:
+        return results_out
+
+    # Consensus across models
+    try:
+        total_w = sum(per_model_weights.values()) or len(model_preds)
+        consensus_ret = 0.0
+        for k, pred in model_preds:
+            w = per_model_weights.get(k, 1.0)
+            consensus_ret += pred * (w / total_w)
+    except Exception:
+        consensus_ret = float(np.mean([p for _, p in model_preds]))
+    combined_price = _round_to_tick(last_price * (1.0 + consensus_ret), instr_meta)
+    try:
+        disagreement = float(np.std([p for _, p in model_preds])) if len(model_preds) > 0 else 0.0
+        max_abs = _max_abs_ret_from_vol(float(np.nanmean([abs(p) for _, p in model_preds]) or 0.0), instr_meta)
+        agreement_prob = max(0.01, min(0.99, (1.0 - min(1.0, disagreement / (max_abs + 1e-6)))))
+        model_conf_vals = []
+        for mk in ["base", "forest", "boost", "extra_trees", "meta"]:
+            cv = results_out.get(mk, {}).get("confidence")
+            if isinstance(cv, (int, float)):
+                model_conf_vals.append(max(0.01, min(0.99, float(cv) / 100.0)))
+        model_prob = float(np.mean(model_conf_vals)) if model_conf_vals else agreement_prob
+        # Consensus confidence must reflect both model agreement and base model conviction.
+        consensus_prob = (0.30 * agreement_prob) + (0.70 * model_prob)
+        consensus_conf = max(1.0, min(99.0, 100.0 * consensus_prob))
+        if stale.get("is_stale"):
+            consensus_conf *= stale_factor
+        if drift_flag:
+            consensus_conf *= 0.7
+        if cal_stale:
+            consensus_conf *= 0.85
+    except Exception:
+        consensus_conf = 50.0
+    consensus_dir = "UP" if combined_price > last_price else "DOWN" if combined_price < last_price else "-"
+    if consensus_conf / 100.0 < NO_SIGNAL_CONF:
+        consensus_dir = "-"
+    consensus_note = "Weighted consensus"
+    if stale_note:
+        consensus_note += f" | {stale_note}"
+    if consensus_dir == "-":
+        consensus_note += " | Low confidence"
+    if drift_flag:
+        consensus_note += " | Drift guard"
+    if cal_stale:
+        consensus_note += " | Calibration stale"
+    # Horizon alignment (optional)
+    h10 = _predict_horizon_norm(
+        models_dict,
+        df_latest,
+        10,
+        instrument_key=instrument_key,
+        feature_frame=feat_frame,
+        feat_cache=feat_cache
+    )
+    h30 = _predict_horizon_norm(
+        models_dict,
+        df_latest,
+        30,
+        instrument_key=instrument_key,
+        feature_frame=feat_frame,
+        feat_cache=feat_cache
+    )
+    try:
+        align = 0.0
+        if h10 is not None:
+            align += 1.0 if np.sign(h10) == np.sign(consensus_ret) else -1.0
+        if h30 is not None:
+            align += 1.0 if np.sign(h30) == np.sign(consensus_ret) else -1.0
+        align_score = 0.5 + 0.25 * align  # range roughly 0..1
+        align_score = max(0.1, min(1.0, align_score))
+    except Exception:
+        align_score = 0.5
+
+    # Position sizing (vol targeting + regime confidence)
+    try:
+        from config import TARGET_VOL
+        vol_target = float(instr_meta.get("target_vol", TARGET_VOL))
+    except Exception:
+        vol_target = float(instr_meta.get("target_vol", 0.004))
+    try:
+        reg_conf = float(rp.get("regime_conf", 0.5))
+    except Exception:
+        reg_conf = 0.5
+    try:
+        size_vol = min(1.0, vol_target / max(meta_ewm_vol, 1e-6))
+        size_conf = consensus_conf / 100.0
+        position_size = max(0.0, min(1.0, size_vol * size_conf * reg_conf * align_score))
+        if drift_flag:
+            position_size *= 0.5
+    except Exception:
+        position_size = 0.0
+
+    results_out["consensus"] = {
+        "direction": consensus_dir,
+        "pred_price": float(round(combined_price, 4)),
+        "confidence": round(float(consensus_conf), 2),
+        "note": consensus_note,
+        "position_size": round(float(position_size), 3)
+    }
+
+    # Degenerate-output guard: near-identical model outputs are usually low-information snapshots.
+    diversity = _prediction_diversity(results_out)
+    results_out["_meta"]["critical_stale"] = False
+    results_out["_meta"]["diversity"] = diversity
+    if diversity.get("degenerate"):
+        low_conf_count = 0
+        for mk in ["base", "forest", "boost", "extra_trees", "meta"]:
+            v = results_out.get(mk, {})
+            if isinstance(v, dict) and isinstance(v.get("confidence"), (int, float)):
+                if float(v["confidence"]) < (NO_SIGNAL_CONF * 100.0):
+                    low_conf_count += 1
+        if low_conf_count >= 3:
+            try:
+                results_out["consensus"]["direction"] = "-"
+                results_out["consensus"]["position_size"] = 0.0
+                results_out["consensus"]["confidence"] = round(
+                    min(float(results_out["consensus"].get("confidence", 50.0)), 35.0), 2
+                )
+            except Exception:
+                pass
+        try:
+            note = str(results_out["consensus"].get("note", "Weighted consensus"))
+            if "Degenerate model spread" not in note:
+                results_out["consensus"]["note"] = f"{note} | Degenerate model spread"
+        except Exception:
+            pass
+
+    results_out["regime"] = rp
+    results_out["horizon"] = {"h10_norm": h10, "h30_norm": h30, "align_score": round(float(align_score), 3)}
+    _log_prediction(instrument_key, last_price, results_out)
+    # non-blocking calibration refresh to avoid latency spikes in prediction path
+    try:
+        _schedule_live_calibration_update(instrument_key or SYMBOL)
+    except Exception:
+        logger.debug("Live calibration scheduler failed", exc_info=True)
+    return results_out
+
+def _fetch_long_daily(yahoo_sym, tz: str = "America/New_York"):
+    if not ALLOW_REMOTE_DAILY:
+        return None
+    try:
+        df = yf.download(yahoo_sym, period='5y', interval='1d', progress=False, auto_adjust=False)
+        if df.empty:
+            logger.info(f"yfinance daily fetch returned empty for {yahoo_sym}")
+            return None
+        # Handle MultiIndex columns (yfinance sometimes wraps single ticker)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)  # take field names (Open, High, etc.)
+        df = _ensure_utc_index(df, tz=tz)
+        df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+        logger.info(f"Fetched {len(df)} daily bars for {yahoo_sym}")
+        return df
+    except Exception as e:
+        logger.exception(f"Long daily fetch failed for {yahoo_sym}")
+        return None
+
+def _historical_daily_high_ratio(
+    df: pd.DataFrame,
+    minute_of_day,
+    lookback_days=90,
+    recent_weight=1.0,
+    session_open_minute: int = None,
+    session_close_minute: int = None
+):
+    if df is None or df.empty:
+        return np.array([]), np.array([])
+    df2 = df.copy()
+    df2.columns = [c.lower() for c in df2.columns]
+    if "high" not in df2.columns or "close" not in df2.columns:
+        return np.array([]), np.array([])
+    df2 = df2.dropna(subset=["close", "high"])
+    try:
+        idx = pd.to_datetime(df2.index, utc=True)
+        local_index = idx.tz_convert("America/New_York")
+    except Exception:
+        local_index = pd.to_datetime(df2.index, utc=True)
+    df2.index = local_index
+    df2["minute_of_day"] = df2.index.hour * 60 + df2.index.minute
+    if session_open_minute is not None and session_close_minute is not None:
+        df2["session_date"] = _session_dates_from_index(df2.index, session_open_minute, session_close_minute).date
+        date_key = "session_date"
+    else:
+        df2["local_date"] = df2.index.date
+        date_key = "local_date"
+    ratios = []
+    weights = []
+    unique_days = sorted(pd.Series(df2[date_key].unique()).tolist(), reverse=True)[:lookback_days]
+    tol = max(1, BAR_MINUTES)
+    for day in unique_days:
+        day_df = df2[df2[date_key] == day]
+        if day_df.empty:
+            continue
+        cand = day_df[day_df["minute_of_day"] <= (minute_of_day + tol)]
+        if cand.empty:
+            cand = day_df.iloc[:1]
+        if cand.empty:
+            continue
+        row = cand.iloc[-1]
+        price_at_time = float(row["close"])
+        if pd.isna(price_at_time) or price_at_time <= 0:
+            continue
+        future_part = day_df[day_df.index > row.name]
+        if future_part.empty:
+            continue
+        future_max = float(future_part["high"].max())
+        if pd.isna(future_max):
+            continue
+        ratio = future_max / price_at_time
+        ratios.append(ratio)
+        weights.append(1.0 / (1 + len(ratios)*0.05) * recent_weight)
+    if len(ratios) == 0:
+        logger.debug("No valid daily high ratios found in intraday data")
+    return np.array(ratios), np.array(weights)
+
+def _historical_daily_low_ratio(
+    df: pd.DataFrame,
+    minute_of_day,
+    lookback_days=90,
+    recent_weight=1.0,
+    session_open_minute: int = None,
+    session_close_minute: int = None
+):
+    if df is None or df.empty:
+        return np.array([]), np.array([])
+    df2 = df.copy()
+    df2.columns = [c.lower() for c in df2.columns]
+    if "low" not in df2.columns or "close" not in df2.columns:
+        return np.array([]), np.array([])
+    df2 = df2.dropna(subset=["close", "low"])
+    try:
+        idx = pd.to_datetime(df2.index, utc=True)
+        local_index = idx.tz_convert("America/New_York")
+    except Exception:
+        local_index = pd.to_datetime(df2.index, utc=True)
+    df2.index = local_index
+    df2["minute_of_day"] = df2.index.hour * 60 + df2.index.minute
+    if session_open_minute is not None and session_close_minute is not None:
+        df2["session_date"] = _session_dates_from_index(df2.index, session_open_minute, session_close_minute).date
+        date_key = "session_date"
+    else:
+        df2["local_date"] = df2.index.date
+        date_key = "local_date"
+    ratios = []
+    weights = []
+    unique_days = sorted(pd.Series(df2[date_key].unique()).tolist(), reverse=True)[:lookback_days]
+    tol = max(1, BAR_MINUTES)
+    for day in unique_days:
+        day_df = df2[df2[date_key] == day]
+        if day_df.empty:
+            continue
+        cand = day_df[day_df["minute_of_day"] <= (minute_of_day + tol)]
+        if cand.empty:
+            cand = day_df.iloc[:1]
+        if cand.empty:
+            continue
+        row = cand.iloc[-1]
+        price_at_time = float(row["close"])
+        if pd.isna(price_at_time) or price_at_time <= 0:
+            continue
+        future_part = day_df[day_df.index > row.name]
+        if future_part.empty:
+            continue
+        future_min = float(future_part["low"].min())
+        if pd.isna(future_min):
+            continue
+        ratio = future_min / price_at_time
+        ratios.append(ratio)
+        weights.append(1.0 / (1 + len(ratios)*0.05) * recent_weight)
+    if len(ratios) == 0:
+        logger.debug("No valid daily low ratios found in intraday data")
+    return np.array(ratios), np.array(weights)
+
+def _predict_daily_high_from_history(df, last_ts, last_price, instrument_key=None):
+    try:
+        last_local = last_ts.tz_convert("America/New_York")
+        current_date = last_local.date()
+    except Exception:
+        current_date = last_ts.date()
+    df2 = df.copy()
+    df2.columns = [c.lower() for c in df2.columns]
+    try:
+        idx = pd.to_datetime(df2.index, utc=True)
+        local_index = idx.tz_convert("America/New_York")
+    except Exception:
+        local_index = pd.to_datetime(df2.index, utc=True)
+    df2.index = local_index
+    df2["local_date"] = df2.index.date
+    past_df = df2[df2["local_date"] < current_date]
+    instr_meta = INSTRUMENTS.get(instrument_key, {})
+    open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
+    close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
+    ratios, weights = _historical_daily_high_ratio(
+        past_df,
+        open_minute,
+        lookback_days=120,
+        session_open_minute=open_minute,
+        session_close_minute=close_minute
+    )
+    yahoo_sym = instr_meta.get('yahoo', instrument_key or SYMBOL)
+    tz = instr_meta.get("tz", "America/New_York")
+    if ratios.size < 8:
+        daily_df = _fetch_long_daily(yahoo_sym, tz=tz)
+        if daily_df is not None:
+            daily_df['local_date'] = daily_df.index.tz_convert("America/New_York").date
+            past_daily = daily_df[daily_df['local_date'] < current_date]
+            past_daily = past_daily.dropna(subset=['open', 'high'])
+            if not past_daily.empty:
+                past_daily['ratio'] = past_daily['high'] / past_daily['open']
+                ratios_daily = past_daily['ratio'].values[-120:]
+                weights_daily = np.linspace(1.3, 0.7, len(ratios_daily))
+                if ratios.size > 0:
+                    ratios = np.concatenate((ratios, ratios_daily))
+                    weights = np.concatenate((weights, weights_daily * 0.7))
+                else:
+                    ratios = ratios_daily
+                    weights = weights_daily
+                logger.info(f"DailyHigh using {len(ratios_daily)} daily open-to-high ratios")
+    valid_mask = np.isfinite(ratios)
+    ratios = ratios[valid_mask]
+    weights = weights[valid_mask] if len(weights) == len(ratios) else np.ones_like(ratios)
+    today_df = df2[df2["local_date"] == current_date]
+    if today_df.empty:
+        recent_vol = df["close"].pct_change().rolling(20).std().iloc[-1] if len(df) >= 20 else 0.0
+        k = 4.0
+        ratio_est = 1.0 + k * (recent_vol or 0.005)
+        ratio_est = max(0.98, min(1.25, ratio_est))
+        conf = 25.0 if recent_vol > 0 else 15.0
+        pred_high = last_price * ratio_est
+        return float(round(pred_high, 4)), float(round(conf, 2)), f"Pre-open fallback (vol ratio {ratio_est:.3f})"
+    open_price = float(today_df["open"].iloc[0]) if "open" in today_df.columns and not pd.isna(today_df["open"].iloc[0]) else float(today_df["close"].iloc[0])
+    high_so_far = float(today_df["high"].max()) if "high" in today_df.columns else open_price
+    if ratios.size == 0:
+        recent_vol = past_df["close"].pct_change().rolling(20).std().iloc[-1] if len(past_df) >= 20 else 0.005
+        k = 4.0
+        ratio_est = 1.0 + k * recent_vol
+        ratio_est = max(0.98, min(1.25, ratio_est))
+        conf = 25.0 if recent_vol > 0 else 15.0
+        pred_high = open_price * ratio_est
+        pred_high = max(pred_high, high_so_far)
+        return float(round(pred_high, 4)), float(round(conf, 2)), f"Daily-high fallback (vol ratio {ratio_est:.3f})"
+    try:
+        order = np.argsort(ratios)
+        ratios_s = ratios[order]
+        weights_s = weights[order] if len(weights) == len(ratios) else np.ones_like(ratios_s)
+        cumw = np.cumsum(weights_s)
+        cutoff = cumw[-1] / 2.0
+        idx = np.searchsorted(cumw, cutoff)
+        median_ratio = float(ratios_s[min(max(0, idx), len(ratios_s)-1)])
+        mean_ratio = float(np.average(ratios, weights=weights))
+        ratio_est = 0.75 * median_ratio + 0.25 * mean_ratio
+        disp = float(np.std(ratios))
+        conf = 30.0 if mean_ratio <= 0 else max(10.0, min(95.0, 85.0 * (1 - disp / (mean_ratio + 1e-6))))
+        conf *= min(1.0, len(ratios) / 8.0)
+    except Exception:
+        ratio_est = 1.02
+        conf = 35.0
+    pred_high = open_price * ratio_est
+    pred_high = max(pred_high, high_so_far)
+    note = f"Daily-high from open (ratio {ratio_est:.3f}, {len(ratios)} analogs)"
+    return float(round(pred_high, 4)), float(round(conf, 2)), note
+
+def _predict_daily_low_from_history(df, last_ts, last_price, instrument_key=None):
+    try:
+        last_local = last_ts.tz_convert("America/New_York")
+        current_date = last_local.date()
+    except Exception:
+        current_date = last_ts.date()
+    df2 = df.copy()
+    df2.columns = [c.lower() for c in df2.columns]
+    try:
+        idx = pd.to_datetime(df2.index, utc=True)
+        local_index = idx.tz_convert("America/New_York")
+    except Exception:
+        local_index = pd.to_datetime(df2.index, utc=True)
+    df2.index = local_index
+    df2["local_date"] = df2.index.date
+    past_df = df2[df2["local_date"] < current_date]
+    instr_meta = INSTRUMENTS.get(instrument_key, {})
+    open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
+    close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
+    ratios, weights = _historical_daily_low_ratio(
+        past_df,
+        open_minute,
+        lookback_days=120,
+        session_open_minute=open_minute,
+        session_close_minute=close_minute
+    )
+    yahoo_sym = instr_meta.get('yahoo', instrument_key or SYMBOL)
+    tz = instr_meta.get("tz", "America/New_York")
+    if ratios.size < 8:
+        daily_df = _fetch_long_daily(yahoo_sym, tz=tz)
+        if daily_df is not None:
+            daily_df['local_date'] = daily_df.index.tz_convert("America/New_York").date
+            past_daily = daily_df[daily_df['local_date'] < current_date]
+            past_daily = past_daily.dropna(subset=['open', 'low'])
+            if not past_daily.empty:
+                past_daily['ratio'] = past_daily['low'] / past_daily['open']
+                ratios_daily = past_daily['ratio'].values[-120:]
+                weights_daily = np.linspace(1.3, 0.7, len(ratios_daily))
+                if ratios.size > 0:
+                    ratios = np.concatenate((ratios, ratios_daily))
+                    weights = np.concatenate((weights, weights_daily * 0.7))
+                else:
+                    ratios = ratios_daily
+                    weights = weights_daily
+                logger.info(f"DailyLow using {len(ratios_daily)} daily open-to-low ratios")
+    valid_mask = np.isfinite(ratios)
+    ratios = ratios[valid_mask]
+    weights = weights[valid_mask] if len(weights) == len(ratios) else np.ones_like(ratios)
+    today_df = df2[df2["local_date"] == current_date]
+    if today_df.empty:
+        recent_vol = df["close"].pct_change().rolling(20).std().iloc[-1] if len(df) >= 20 else 0.0
+        k = 4.0
+        ratio_est = 1.0 - k * (recent_vol or 0.005)
+        ratio_est = max(0.7, min(1.02, ratio_est))
+        conf = 25.0 if recent_vol > 0 else 15.0
+        pred_low = last_price * ratio_est
+        return float(round(pred_low, 4)), float(round(conf, 2)), f"Pre-open fallback (vol ratio {ratio_est:.3f})"
+    open_price = float(today_df["open"].iloc[0]) if "open" in today_df.columns and not pd.isna(today_df["open"].iloc[0]) else float(today_df["close"].iloc[0])
+    low_so_far = float(today_df["low"].min()) if "low" in today_df.columns else open_price
+    if ratios.size == 0:
+        recent_vol = past_df["close"].pct_change().rolling(20).std().iloc[-1] if len(past_df) >= 20 else 0.005
+        k = 4.0
+        ratio_est = 1.0 - k * recent_vol
+        ratio_est = max(0.7, min(1.02, ratio_est))
+        conf = 25.0 if recent_vol > 0 else 15.0
+        pred_low = open_price * ratio_est
+        pred_low = min(pred_low, low_so_far)
+        return float(round(pred_low, 4)), float(round(conf, 2)), f"Daily-low fallback (vol ratio {ratio_est:.3f})"
+    try:
+        order = np.argsort(ratios)
+        ratios_s = ratios[order]
+        weights_s = weights[order] if len(weights) == len(ratios) else np.ones_like(ratios_s)
+        cumw = np.cumsum(weights_s)
+        cutoff = cumw[-1] / 2.0
+        idx = np.searchsorted(cumw, cutoff)
+        median_ratio = float(ratios_s[min(max(0, idx), len(ratios_s)-1)])
+        mean_ratio = float(np.average(ratios, weights=weights))
+        ratio_est = 0.75 * median_ratio + 0.25 * mean_ratio
+        disp = float(np.std(ratios))
+        conf = 30.0 if mean_ratio <= 0 else max(10.0, min(95.0, 85.0 * (1 - disp / (abs(mean_ratio) + 1e-6))))
+        conf *= min(1.0, len(ratios) / 8.0)
+    except Exception:
+        ratio_est = 0.98
+        conf = 35.0
+    pred_low = open_price * ratio_est
+    pred_low = min(pred_low, low_so_far)
+    note = f"Daily-low from open (ratio {ratio_est:.3f}, {len(ratios)} analogs)"
+    return float(round(pred_low, 4)), float(round(conf, 2)), note
+
+def _historical_weekend_ratio(df, current_dt, lookback_weeks=60):
+    if df is None or df.empty:
+        return np.array([])
+    df2 = df.copy()
+    df2.columns = [c.lower() for c in df2.columns]
+    if "close" not in df2.columns:
+        return np.array([])
+    df2 = df2.dropna(subset=["close"])
+    try:
+        idx = pd.to_datetime(df2.index, utc=True)
+        local_index = idx.tz_convert("America/New_York")
+    except Exception:
+        local_index = pd.to_datetime(df2.index, utc=True)
+    df2.index = local_index
+    df2["dow"] = df2.index.weekday
+    df2["minute_of_day"] = df2.index.hour * 60 + df2.index.minute
+    try:
+        isocal = df2.index.isocalendar()
+        df2["iso_year"] = isocal.year
+        df2["iso_week"] = isocal.week
+    except Exception:
+        df2["iso_year"] = df2.index.year
+        df2["iso_week"] = df2.index.isocalendar().week
+    ratios = []
+    weeks = sorted(df2[["iso_year","iso_week"]].drop_duplicates().values.tolist(), reverse=True)[:lookback_weeks]
+    count = 0
+    cur_local = current_dt.tz_convert("America/New_York") if current_dt.tzinfo else pd.to_datetime(current_dt).tz_localize("America/New_York")
+    cur_dow = cur_local.weekday()
+    cur_mod = cur_local.hour * 60 + cur_local.minute
+    tol = max(1, BAR_MINUTES)
+    for y, w in weeks:
+        mask = (df2["iso_year"] == y) & (df2["iso_week"] == w)
+        week_df = df2[mask]
+        if week_df.empty:
+            continue
+        day_df = week_df[week_df["dow"] == cur_dow]
+        if day_df.empty:
+            continue
+        cand = day_df[day_df["minute_of_day"] <= (cur_mod + tol)]
+        if cand.empty:
+            continue
+        row = cand.iloc[-1]
+        price_at_time = float(row["close"])
+        if pd.isna(price_at_time) or price_at_time <= 0:
+            continue
+        fri_df = week_df[week_df["dow"] == 4]
+        if fri_df.empty:
+            continue
+        fri_close = float(fri_df["close"].iloc[-1])
+        if pd.isna(fri_close):
+            continue
+        ratio = fri_close / price_at_time
+        ratios.append(ratio)
+        count += 1
+    if len(ratios) == 0:
+        logger.debug("No valid weekend ratios found in intraday data")
+    return np.array(ratios)
+
+def _predict_weekend_close_from_history(df, last_ts, last_price, instrument_key=None):
+    try:
+        last_local = last_ts.tz_convert("America/New_York")
+        current_date = last_local.date()
+        current_dow = last_local.weekday()
+    except Exception:
+        current_date = last_ts.date()
+        current_dow = last_ts.weekday()
+    df2 = df.copy()
+    df2.columns = [c.lower() for c in df2.columns]
+    try:
+        idx = pd.to_datetime(df2.index, utc=True)
+        local_index = idx.tz_convert("America/New_York")
+    except Exception:
+        local_index = pd.to_datetime(df2.index, utc=True)
+    df2.index = local_index
+    isocal = df2.index.isocalendar()
+    df2["iso_year"] = isocal.year
+    df2["iso_week"] = isocal.week
+    current_iso_year = isocal['year'].iloc[-1] if not df2.empty else current_date.year
+    current_iso_week = isocal['week'].iloc[-1] if not df2.empty else current_date.isocalendar().week
+    past_mask = ((df2["iso_year"] < current_iso_year) |
+                 ((df2["iso_year"] == current_iso_year) & (df2["iso_week"] < current_iso_week)))
+    past_df = df2[past_mask]
+    instr_meta = INSTRUMENTS.get(instrument_key, {})
+    week_start_day = int(instr_meta.get("week_start_day", 0))
+    open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
+    days_back = (current_dow - week_start_day) % 7
+    week_start_date = current_date - timedelta(days=days_back)
+    open_hour = int(open_minute // 60)
+    open_min = int(open_minute % 60)
+    week_start_time = datetime.combine(week_start_date, time(open_hour, open_min))
+    week_start_ts = pd.to_datetime(week_start_time).tz_localize("America/New_York")
+    ratios = _historical_weekend_ratio(past_df, week_start_ts, lookback_weeks=80)
+    yahoo_sym = instr_meta.get('yahoo', instrument_key or SYMBOL)
+    tz = instr_meta.get("tz", "America/New_York")
+    if ratios.size < 6:
+        daily_df = _fetch_long_daily(yahoo_sym, tz=tz)
+        if daily_df is not None:
+            daily_df['dow'] = daily_df.index.tz_convert("America/New_York").weekday
+            isocal_d = daily_df.index.isocalendar()
+            daily_df["iso_year"] = isocal_d.year
+            daily_df["iso_week"] = isocal_d.week
+            past_daily_mask = ((daily_df["iso_year"] < current_iso_year) |
+                               ((daily_df["iso_year"] == current_iso_year) & (daily_df["iso_week"] < current_iso_week)))
+            past_daily = daily_df[past_daily_mask]
+            groups = past_daily.groupby(['iso_year', 'iso_week'])
+            ratios_daily = []
+            for name, g in groups:
+                monday = g[g['dow'] == 0]
+                friday = g[g['dow'] == 4]
+                if not monday.empty and not friday.empty:
+                    monday_open = monday['open'].iloc[0]
+                    friday_close = friday['close'].iloc[-1]
+                    ratio = friday_close / monday_open
+                    ratios_daily.append(ratio)
+            if ratios_daily:
+                ratios_d = np.array(ratios_daily)
+                weights_d = np.linspace(1.3, 0.7, len(ratios_d))
+                if ratios.size > 0:
+                    ratios = np.concatenate((ratios, ratios_d))
+                    weights = np.concatenate((np.ones(len(ratios)), weights_d * 0.7))
+                else:
+                    ratios = ratios_d
+                    weights = weights_d
+                logger.info(f"WeekEnd using {len(ratios_d)} daily Monday-to-Friday ratios")
+    ratios = ratios[np.isfinite(ratios)]
+    this_week_mask = ((df2["iso_year"] == current_iso_year) & (df2["iso_week"] == current_iso_week))
+    this_week_df = df2[this_week_mask]
+    if this_week_df.empty:
+        recent_vol = df["close"].pct_change().rolling(20).std().iloc[-1] if len(df) >= 20 else 0.005
+        k = 6.0
+        ratio_est = 1.0 + k * (recent_vol or 0.005)
+        ratio_est = max(0.95, min(1.4, ratio_est))
+        conf = 20.0 if recent_vol > 0 else 10.0
+        pred_price = last_price * ratio_est
+        return float(round(pred_price, 4)), float(round(conf, 2)), f"Pre-week fallback (vol ratio {ratio_est:.3f})"
+    monday_df = this_week_df[this_week_df.index.weekday == 0]
+    if monday_df.empty:
+        return last_price, 25.0, "Weekend fallback - no Monday data yet"
+    monday_open = float(monday_df["open"].iloc[0]) if "open" in monday_df.columns and not pd.isna(monday_df["open"].iloc[0]) else float(monday_df["close"].iloc[0])
+    if ratios.size == 0:
+        recent_vol = past_df["close"].pct_change().rolling(20).std().iloc[-1] if len(past_df) >= 20 else 0.005
+        k = 6.0
+        ratio_est = 1.0 + k * recent_vol
+        ratio_est = max(0.95, min(1.4, ratio_est))
+        conf = 20.0 if recent_vol > 0 else 10.0
+        pred_price = monday_open * ratio_est
+        return float(round(pred_price, 4)), float(round(conf, 2)), f"Week-end fallback (vol ratio {ratio_est:.3f})"
+    weights = np.linspace(1.5, 0.5, len(ratios)) if len(ratios) > 1 else np.ones(len(ratios))
+    try:
+        median_ratio = float(np.median(ratios))
+        mean_ratio = float(np.average(ratios, weights=weights))
+        ratio_est = 0.7 * median_ratio + 0.3 * mean_ratio
+        rel_std = float(np.std(ratios)) / (abs(mean_ratio) + 1e-12)
+        conf = max(10.0, min(95.0, 85.0 * (1 - rel_std)))
+        conf *= min(1.0, len(ratios) / 6.0)
+    except Exception:
+        ratio_est = 1.03
+        conf = 30.0
+    pred_price = monday_open * ratio_est
+    note = f"Week-end from Monday open (ratio {ratio_est:.3f}, {len(ratios)} analogs)"
+    return float(round(pred_price, 4)), float(round(conf, 2)), note
+
+def _ensemble_summary_for_payload(payload, X, dominant_regime=None, dom_prob=0.0, comp_probs=None):
+    ensemble_map = payload.get("ensemble_models", {}) if payload else {}
+    regime_map = payload.get("regime_models", {}) if payload else {}
+    perf = payload.get("performance_mae", {}) if payload else {}
+    win_weights = _window_weights(perf)
+    combined_summary = None
+    combined_weight = 0.0
+    for win in ["short", "mid", "long"]:
+        members = ensemble_map.get(win, []) or []
+        if not members:
+            continue
+        global_sum = _summarize_preds(_ensemble_predict_members(members, X))
+        reg_sum = None
+        if regime_map and dominant_regime is not None:
+            reg_members, reg_key, reg_prob = _select_regime_members(
+                regime_map,
+                win,
+                dominant_regime=dominant_regime,
+                comp_probs=comp_probs
+            )
+            if reg_members:
+                reg_sum = _summarize_preds(_ensemble_predict_members(reg_members, X))
+        if reg_sum is not None and global_sum is not None:
+            reg_weight = reg_prob if reg_prob is not None else dom_prob
+            w_reg = max(0.0, min(0.8, reg_weight))
+            win_sum = _blend_summaries(reg_sum, global_sum, w_reg)
+        else:
+            win_sum = reg_sum or global_sum
+        if win_sum is None:
+            continue
+        w = win_weights.get(win, 0.0)
+        if combined_summary is None:
+            combined_summary = win_sum
+            combined_weight = w
+        else:
+            total = combined_weight + w
+            w_a = combined_weight / total if total > 0 else 0.5
+            combined_summary = _blend_summaries(combined_summary, win_sum, w_a)
+            combined_weight = total
+    return combined_summary
+
+def _predict_mode_group(models_group, df_latest, instrument_key, rp, dominant_regime, dom_prob, stale, mode_label,
+                        clamp_min=None, clamp_max=None, horizon_scale=1.0, max_cap=0.08,
+                        feature_row: pd.DataFrame | None = None, last_price_override: float | None = None,
+                        comp_probs=None):
+    if df_latest is None or df_latest.empty:
+        return {}
+    if not models_group:
+        return {
+            k: {"direction": "-", "pred_price": "-", "confidence": "-", "note": f"Missing ML models ({mode_label})"}
+            for k in ["base", "forest", "boost", "extra_trees"]
+        }
+    instr_meta = _instrument_meta(instrument_key)
+    last_price = float(last_price_override) if last_price_override is not None else float(df_latest["close"].iloc[-1])
+    stale_note = ""
+    stale_factor = _stale_conf_factor(stale)
+    if stale.get("is_stale"):
+        try:
+            mins = stale.get("age_sec", 0.0) / 60.0 if stale.get("age_sec") is not None else None
+            stale_note = f"Stale data ({mins:.1f}m old)" if mins is not None else "Stale data"
+        except Exception:
+            stale_note = "Stale data"
+    out = {}
+    for key in ["base", "forest", "boost", "extra_trees"]:
+        payload = models_group.get(key)
+        if payload is None:
+            out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "No model"}
+            continue
+        feat_list = payload.get("features")
+        try:
+            if feature_row is not None:
+                X = feature_row[feat_list] if feat_list else feature_row
+            else:
+                X = make_feature_matrix(df_latest, feature_list=feat_list, instrument_key=instrument_key) if feat_list else make_feature_matrix(df_latest, instrument_key=instrument_key)
+        except Exception:
+            out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Feature error"}
+            continue
+        if X is None or X.empty:
+            out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Waiting…"}
+            continue
+        try:
+            current_vol = float(X.get("ewm_vol", 0.001).iloc[0]) if "ewm_vol" in X.columns else 0.001
+        except Exception:
+            current_vol = 0.001
+        vol_candidates = [current_vol]
+        for col in ("vol_12", "vol_6", "vol_3", "session_volatility"):
+            try:
+                if col in X.columns:
+                    vol_candidates.append(float(X[col].iloc[0]))
+            except Exception:
+                continue
+        current_vol = max([v for v in vol_candidates if np.isfinite(v)] + [_vol_floor_from_meta(instr_meta)])
+        combined_summary = _ensemble_summary_for_payload(payload, X, dominant_regime, dom_prob, comp_probs=comp_probs)
+        if combined_summary is None:
+            fb = payload.get("fallback_model")
+            if fb is None:
+                fb = payload.get("model")
+            if fb is not None:
+                try:
+                    pred_norm = float(fb.predict(X)[0])
+                    pred_std_norm = float(payload.get("meta", {}).get("resid_std", 1e-6))
+                    pred_std_norm = max(pred_std_norm, 1e-6)
+                    combined_summary = {"mean": pred_norm, "std": pred_std_norm, "q10": 0.0, "q50": pred_norm, "q90": 0.0, "p_up": float(pred_norm >= 0)}
+                except Exception:
+                    combined_summary = None
+            if combined_summary is None:
+                out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Ensemble not trained"}
+                continue
+        pred_norm = combined_summary["mean"]
+        pred_std_norm = combined_summary["std"]
+        try:
+            reg_conf = float(rp.get("regime_conf", 0.5))
+        except Exception:
+            reg_conf = 0.5
+        prior_var = max(0.2, min(2.0, 0.6 + reg_conf))
+        shrink = prior_var / (prior_var + (pred_std_norm ** 2))
+        pred_norm = pred_norm * shrink
+        p_correct_sig = _dynamic_confidence_by_sigbucket_from_payload(
+            pred_norm, pred_std_norm, payload, model_key=key, instrument_key=instrument_key
+        )
+        p_up_sig = p_correct_sig if pred_norm >= 0 else (1.0 - p_correct_sig)
+        p_up = 0.7 * combined_summary["p_up"] + 0.3 * p_up_sig
+        p_up = max(0.001, min(0.999, p_up))
+        target_normed = _infer_target_norm(payload.get("meta", {}))
+        pred_ret = pred_norm * current_vol if target_normed else pred_norm
+        max_abs_ret = _max_abs_ret_from_vol(current_vol, instr_meta) * max(1.0, horizon_scale)
+        max_abs_ret = min(max_cap, max_abs_ret)
+        pred_ret = max(-max_abs_ret, min(max_abs_ret, pred_ret))
+        pred_price = last_price * (1.0 + pred_ret)
+        clamp_note = None
+        if clamp_min is not None and pred_price < clamp_min:
+            pred_price = clamp_min
+            clamp_note = "Clamped to high so far"
+        if clamp_max is not None and pred_price > clamp_max:
+            pred_price = clamp_max
+            clamp_note = "Clamped to low so far"
+        pred_price = _round_to_tick(pred_price, instr_meta)
+        direction = "UP" if pred_price >= last_price else "DOWN"
+        conf = p_up if direction == "UP" else (1.0 - p_up)
+        try:
+            support = rp.get("Bullish", 0.0) / 100.0 if direction == "UP" else rp.get("Bearish", 0.0) / 100.0
+        except Exception:
+            support = 0.0
+        support *= (0.5 + 0.5 * max(0.0, min(1.0, reg_conf)))
+        conf *= (0.7 + 0.3 * support)
+        dispersion = pred_std_norm / (abs(pred_norm) + 1e-9)
+        dispersion = min(dispersion, 3.0)
+        conf *= (1.0 / (1.0 + 0.35 * dispersion))
+        if stale.get("is_stale"):
+            conf *= stale_factor
+        # Keep true low-confidence values visible instead of pinning many models to 20%.
+        conf = max(0.01, min(0.99, conf))
+        note_parts = ["ML ensemble"]
+        if clamp_note:
+            note_parts.append(clamp_note)
+        if stale_note:
+            note_parts.append(stale_note)
+        out[key] = {
+            "direction": direction,
+            "pred_price": float(round(pred_price, 4)),
+            "confidence": round(float(conf * 100.0), 2),
+            "note": " | ".join(note_parts),
+            "pred_ret": float(pred_ret),
+            "pred_norm": float(pred_norm),
+            "pred_std_norm": float(pred_std_norm),
+            "sig_bucket": "Strong" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak"
+        }
+    return out
+
+def predict_horizon(models_dict, df_latest, instrument_key: str = None, mode: str = "DailyHigh"):
+    if df_latest is None or df_latest.empty:
+        return {}
+    stale = _staleness_info(df_latest, instrument_key=instrument_key)
+    regime_payload = models_dict.get("regime")
+    if not regime_payload:
+        return {"error": "Regime model missing"}
+    try:
+        rp = predict_regime_probs(regime_payload, df_latest)
+    except Exception:
+        return {"error": "Regime model invalid"}
+    mode_norm = (mode or "DailyHigh").strip().lower()
+    # Determine dominant regime for regime-aware ensembles
+    dominant_regime = rp.get("dominant_component", None)
+    comp_probs = rp.get("component_probs", None)
+    dom_prob = 0.0
+    if dominant_regime is None:
+        dominant_regime = "0"
+    try:
+        if isinstance(comp_probs, (list, tuple)) and str(dominant_regime).isdigit():
+            dom_idx = int(dominant_regime)
+            if 0 <= dom_idx < len(comp_probs):
+                dom_prob = float(comp_probs[dom_idx])
+    except Exception:
+        dom_prob = 0.0
+    if dom_prob == 0.0 and dominant_regime is not None and comp_probs is None:
+        dom_prob = 0.6
+
+    modes = models_dict.get("modes", {}) if isinstance(models_dict, dict) else {}
+    last_price = float(df_latest["close"].iloc[-1])
+    if mode_norm in ("dailyhigh", "daily_high", "daily-high", "dailylow", "daily_low", "daily-low"):
+        # Guard: require real OHLC for daily high/low
+        try:
+            if not all(c in df_latest.columns for c in ("open", "high", "low")):
+                raise RuntimeError("Missing real OHLC data")
+        except Exception:
+            placeholder = {
+                k: {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Missing real OHLC data"}
+                for k in ["base", "forest", "boost", "extra_trees"]
+            }
+            return {"high": placeholder, "low": placeholder, "regime": rp}
+
+        instr_meta = _instrument_meta(instrument_key)
+        tz = instr_meta.get("tz", "America/New_York")
+        session_open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
+        session_close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
+        try:
+            idx_local = pd.to_datetime(df_latest.index, utc=True).tz_convert(tz)
+        except Exception:
+            idx_local = pd.to_datetime(df_latest.index)
+        session_dates = _session_dates_from_index(idx_local, session_open_minute, session_close_minute)
+        target_session = _target_session_date(instr_meta)
+        # Normalize to date keys to avoid dtype mismatches (datetime vs date)
+        try:
+            session_dates_key = pd.to_datetime(session_dates).date
+        except Exception:
+            session_dates_key = session_dates
+        try:
+            target_session_key = pd.to_datetime(target_session).date()
+        except Exception:
+            target_session_key = target_session
+        try:
+            prev_dates = session_dates_key[session_dates_key < target_session_key]
+        except Exception:
+            prev_dates = []
+        # Strict cutoff: require a prior session
+        if prev_dates is None or len(prev_dates) == 0:
+            placeholder = {
+                k: {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Insufficient prior session history"}
+                for k in ["base", "forest", "boost", "extra_trees"]
+            }
+            return {"high": placeholder, "low": placeholder, "regime": rp}
+        try:
+            feature_session = prev_dates.max()
+        except Exception:
+            feature_session = prev_dates[-1]
+
+        # Build a historical slice up to the prior session (no current-session data)
+        try:
+            session_series = pd.Series(session_dates_key, index=df_latest.index)
+            df_hist = df_latest.loc[session_series <= feature_session].copy()
+        except Exception:
+            df_hist = df_latest.copy()
+        if feature_session is None or (isinstance(feature_session, float) and np.isnan(feature_session)):
+            placeholder = {
+                k: {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Insufficient session history"}
+                for k in ["base", "forest", "boost", "extra_trees"]
+            }
+            return {"high": placeholder, "low": placeholder, "regime": rp}
+
+        feat_df = build_feature_frame(df_hist, instrument_key=instrument_key)
+        feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
+        if "session_date" not in feat_df.columns:
+            try:
+                idx_local_hist = pd.to_datetime(df_hist.index, utc=True).tz_convert(tz)
+            except Exception:
+                idx_local_hist = pd.to_datetime(df_hist.index)
+            session_dates_hist = _session_dates_from_index(idx_local_hist, session_open_minute, session_close_minute)
+            try:
+                session_dates_hist = pd.to_datetime(session_dates_hist).date
+            except Exception:
+                pass
+            feat_df["session_date"] = session_dates_hist
+        feat_df = feat_df.dropna(subset=["close"])
+        try:
+            session_col = feat_df["session_date"]
+            if pd.api.types.is_datetime64_any_dtype(session_col):
+                session_key = session_col.dt.date
+            else:
+                session_key = session_col
+        except Exception:
+            session_key = feat_df["session_date"]
+        row_candidates = feat_df[session_key == feature_session]
+        if row_candidates.empty:
+            placeholder = {
+                k: {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Missing session features"}
+                for k in ["base", "forest", "boost", "extra_trees"]
+            }
+            return {"high": placeholder, "low": placeholder, "regime": rp}
+        feature_row = row_candidates.tail(1).copy()
+        feature_row = feature_row.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        try:
+            last_price_feature = float(feature_row["close"].iloc[-1])
+        except Exception:
+            last_price_feature = last_price
+
+        high_models = modes.get("daily_high", {})
+        low_models = modes.get("daily_low", {})
+        # Daily forecasts are intentionally based on prior session close; avoid stale penalty
+        stale_daily = {"is_stale": False, "age_sec": None, "threshold_sec": None}
+        high = _predict_mode_group(
+            high_models,
+            df_hist,
+            instrument_key,
+            rp,
+            dominant_regime,
+            dom_prob,
+            stale_daily,
+            "daily_high",
+            horizon_scale=1.0,
+            max_cap=0.25,
+            feature_row=feature_row,
+            last_price_override=last_price_feature,
+            comp_probs=comp_probs
+        )
+        low = _predict_mode_group(
+            low_models,
+            df_hist,
+            instrument_key,
+            rp,
+            dominant_regime,
+            dom_prob,
+            stale_daily,
+            "daily_low",
+            horizon_scale=1.0,
+            max_cap=0.25,
+            feature_row=feature_row,
+            last_price_override=last_price_feature,
+            comp_probs=comp_probs
+        )
+        # Annotate notes to reflect cutoff
+        for block in (high, low):
+            try:
+                for k, v in block.items():
+                    if not isinstance(v, dict):
+                        continue
+                    note = v.get("note") or ""
+                    suffix = "As of prior session close"
+                    v["note"] = f"{note} | {suffix}" if note else suffix
+            except Exception:
+                pass
+        try:
+            target_meta = str(pd.to_datetime(target_session).date())
+        except Exception:
+            target_meta = str(target_session)
+        try:
+            feature_meta = str(pd.to_datetime(feature_session).date())
+        except Exception:
+            feature_meta = str(feature_session)
+        meta = {
+            "target_session_date": target_meta,
+            "feature_session_date": feature_meta
+        }
+        return {"high": high, "low": low, "regime": rp, "meta": meta}
+
+    if mode_norm in ("weekend", "week_end", "week-end", "weekend_close", "week_end_close"):
+        instr_meta = _instrument_meta(instrument_key)
+        tz = instr_meta.get("tz", "America/New_York")
+        session_open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
+        session_close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
+        try:
+            idx_local = pd.to_datetime(df_latest.index, utc=True).tz_convert(tz)
+        except Exception:
+            idx_local = pd.to_datetime(df_latest.index)
+        session_dates = _session_dates_from_index(idx_local, session_open_minute, session_close_minute)
+        target_session = _target_session_date(instr_meta)
+        try:
+            session_dates_key = pd.to_datetime(session_dates).date
+        except Exception:
+            session_dates_key = session_dates
+        try:
+            target_session_key = pd.to_datetime(target_session).date()
+        except Exception:
+            target_session_key = target_session
+        try:
+            prev_dates = session_dates_key[session_dates_key < target_session_key]
+        except Exception:
+            prev_dates = []
+        if prev_dates is None or len(prev_dates) == 0:
+            placeholder = {
+                k: {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Insufficient prior session history"}
+                for k in ["base", "forest", "boost", "extra_trees"]
+            }
+            return {"week": placeholder, "regime": rp}
+        try:
+            feature_session = prev_dates.max()
+        except Exception:
+            feature_session = prev_dates[-1]
+
+        # Historical slice up to prior session close (no current-session data)
+        try:
+            session_series = pd.Series(session_dates_key, index=df_latest.index)
+            df_hist = df_latest.loc[session_series <= feature_session].copy()
+        except Exception:
+            df_hist = df_latest.copy()
+
+        feat_df = build_feature_frame(df_hist, instrument_key=instrument_key)
+        feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
+        feat_df = feat_df.dropna(subset=["close"])
+        if feat_df.empty:
+            placeholder = {
+                k: {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Missing session features"}
+                for k in ["base", "forest", "boost", "extra_trees"]
+            }
+            return {"week": placeholder, "regime": rp}
+        feature_row = feat_df.tail(1).copy()
+        feature_row = feature_row.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        try:
+            last_price_feature = float(feature_row["close"].iloc[-1])
+        except Exception:
+            last_price_feature = last_price
+
+        week_models = modes.get("weekend", {})
+        # Detect legacy weekend models (trained on week-end bars)
+        legacy_weekend = False
+        try:
+            ok = False
+            for mk in ["base", "forest", "boost", "extra_trees"]:
+                payload = week_models.get(mk)
+                if not isinstance(payload, dict):
+                    continue
+                meta = payload.get("meta", {})
+                if meta.get("weekend_horizon") == "per_session":
+                    ok = True
+                    break
+            legacy_weekend = not ok
+        except Exception:
+            legacy_weekend = False
+        stale_week = {"is_stale": False, "age_sec": None, "threshold_sec": None}
+        week = _predict_mode_group(
+            week_models,
+            df_hist,
+            instrument_key,
+            rp,
+            dominant_regime,
+            dom_prob,
+            stale_week,
+            "weekend",
+            horizon_scale=1.0,
+            max_cap=0.3,
+            feature_row=feature_row,
+            last_price_override=last_price_feature,
+            comp_probs=comp_probs
+        )
+        try:
+            for k, v in week.items():
+                if not isinstance(v, dict):
+                    continue
+                note = v.get("note") or ""
+                suffix = "As of prior session close"
+                v["note"] = f"{note} | {suffix}" if note else suffix
+                if legacy_weekend:
+                    v["note"] = f"{v['note']} | Legacy weekend model (retrain recommended)"
+        except Exception:
+            pass
+        try:
+            target_week = _target_week_key(instr_meta)
+            target_week_str = f"{target_week[0]}-W{target_week[1]}"
+        except Exception:
+            target_week_str = None
+        meta = {"target_week": target_week_str, "feature_session_date": str(feature_session)}
+        return {"week": week, "regime": rp, "meta": meta}
+
+    # Unknown mode: return placeholders
+    placeholder = {
+        k: {"direction": "-", "pred_price": "-", "confidence": "-", "note": f"Unknown mode {mode}"}
+        for k in ["base", "forest", "boost", "extra_trees"]
+    }
+    return {"week": placeholder, "regime": rp}

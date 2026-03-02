@@ -1,0 +1,15 @@
+# Mac
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IntelliJ
+.idea/
+*.iml
+
+# Model artifacts (optional)
+models/
+data/

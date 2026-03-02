@@ -1,0 +1,7 @@
+numpy
+pandas
+scikit-learn
+joblib
+yfinance
+alpaca-py
+ib-insync
