@@ -31,12 +31,12 @@ MIN_STALE_SECONDS = 120
 NO_SIGNAL_CONF = 0.40
 NO_SIGNAL_DISP = 3.0
 
-_LIVE_CAL_CACHE = {"ts": None, "data": None}
-_LAST_CAL_UPDATE = None
+_LIVE_CAL_CACHE = {}
+_LAST_CAL_UPDATE = {}
 _EXTRA_TREES_AUTO_ATTEMPTED = False
 _MODEL_CACHE = {}
 _CAL_UPDATE_LOCK = threading.Lock()
-_CAL_UPDATE_IN_FLIGHT = False
+_CAL_UPDATE_IN_FLIGHT = set()
 
 def _interval_minutes(interval: str) -> int:
     interval = str(interval).strip().lower()
@@ -646,12 +646,14 @@ def _load_live_calibration(instrument_key: str):
     if not LIVE_CALIBRATION:
         return None
     try:
+        instr = str(instrument_key or SYMBOL)
         now = datetime.now(timezone.utc)
-        if _LIVE_CAL_CACHE["ts"] is not None:
-            age = (now - _LIVE_CAL_CACHE["ts"]).total_seconds()
+        cached = _LIVE_CAL_CACHE.get(instr)
+        if isinstance(cached, dict) and cached.get("ts") is not None:
+            age = (now - cached["ts"]).total_seconds()
             if age < 60:
-                return _LIVE_CAL_CACHE["data"]
-        path = os.path.join(DATA_DIR, f"calibration_live_{instrument_key or SYMBOL}.json")
+                return cached.get("data")
+        path = os.path.join(DATA_DIR, f"calibration_live_{instr}.json")
         if not os.path.exists(path):
             return None
         with open(path, "r") as f:
@@ -667,8 +669,7 @@ def _load_live_calibration(instrument_key: str):
                 data["_stale"] = age_days > float(CALIBRATION_MAX_AGE_DAYS)
         except Exception:
             data["_stale"] = True
-        _LIVE_CAL_CACHE["ts"] = now
-        _LIVE_CAL_CACHE["data"] = data
+        _LIVE_CAL_CACHE[instr] = {"ts": now, "data": data}
         return data
     except Exception:
         logger.exception("Failed to load live calibration")
@@ -686,7 +687,9 @@ def _live_calibration_prob(instrument_key: str, model_key: str, sig_bucket: str)
         total = float(bucket.get("total", 0))
         if total <= 0:
             return None, 0
-        return wins / total, int(total)
+        # Keep bucket probabilities realistic under low sample sizes.
+        smoothed = (wins + 1.0) / (total + 2.0)
+        return float(smoothed), int(total)
     except Exception:
         return None, 0
 
@@ -709,36 +712,41 @@ def _schedule_live_calibration_update(instrument_key: str):
     """Schedule calibration refresh in the background to keep prediction latency stable."""
     if not LIVE_CALIBRATION:
         return
-    global _LAST_CAL_UPDATE, _CAL_UPDATE_IN_FLIGHT
+    instr = str(instrument_key or SYMBOL)
     now = datetime.now(timezone.utc)
     try:
-        if _LAST_CAL_UPDATE is not None and (now - _LAST_CAL_UPDATE).total_seconds() < 300:
+        last_update = _LAST_CAL_UPDATE.get(instr)
+        if last_update is not None and (now - last_update).total_seconds() < 300:
             return
     except Exception:
         pass
     with _CAL_UPDATE_LOCK:
-        if _CAL_UPDATE_IN_FLIGHT:
+        if instr in _CAL_UPDATE_IN_FLIGHT:
             return
-        _CAL_UPDATE_IN_FLIGHT = True
-        _LAST_CAL_UPDATE = now
+        _CAL_UPDATE_IN_FLIGHT.add(instr)
+        _LAST_CAL_UPDATE[instr] = now
 
-    def _job():
-        global _CAL_UPDATE_IN_FLIGHT
+    def _job(target_instr: str):
         try:
             from calibration_tracker import update_live_calibration
-            update_live_calibration(instrument_key or SYMBOL, horizon_minutes=4)
+            update_live_calibration(target_instr, horizon_minutes=4)
         except Exception:
             logger.debug("Live calibration update failed", exc_info=True)
         finally:
             with _CAL_UPDATE_LOCK:
-                _CAL_UPDATE_IN_FLIGHT = False
+                _CAL_UPDATE_IN_FLIGHT.discard(target_instr)
+            # Force a fresh read after background update.
+            try:
+                _LIVE_CAL_CACHE.pop(target_instr, None)
+            except Exception:
+                pass
 
     try:
-        th = threading.Thread(target=_job, daemon=True)
+        th = threading.Thread(target=_job, args=(instr,), daemon=True)
         th.start()
     except Exception:
         with _CAL_UPDATE_LOCK:
-            _CAL_UPDATE_IN_FLIGHT = False
+            _CAL_UPDATE_IN_FLIGHT.discard(instr)
 
 def _log_prediction(instrument_key, last_price, results_out):
     if not LOG_PREDICTIONS and not LIVE_CALIBRATION:

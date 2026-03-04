@@ -288,7 +288,7 @@ def main():
     for instr in instr_list:
         if instr not in INSTRUMENTS:
             out["instruments"][instr] = {"status": "fail", "error": "Instrument not defined"}
-            out["status"] = "warn"
+            out["status"] = "fail"
             continue
         rep = _check_instrument(instr, quick=args.quick, online=args.online)
         out["instruments"][instr] = rep

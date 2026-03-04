@@ -81,11 +81,19 @@ def _load_state(instrument_key: str):
 
 def _save_state(instrument_key: str, state: dict):
     path = _calibration_state_path(instrument_key)
+    tmp_path = f"{path}.tmp"
     try:
-        with open(path, "w") as f:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp_path, "w") as f:
             json.dump(state, f)
+        os.replace(tmp_path, path)
     except Exception:
         logger.exception("Failed to write calibration state")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 def _bucket_from_sig(sig):
     if sig in ("Weak", "Medium", "Strong"):
@@ -166,6 +174,7 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
     model_keys = ["base", "forest", "boost", "extra_trees", "meta"]
     updated = 0
     skipped = 0
+    processed_timestamps = []
     _apply_decay(state, now)
     state.setdefault("global", {}).setdefault("wins", 0.0)
     state.setdefault("global", {}).setdefault("total", 0.0)
@@ -192,6 +201,7 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
             skipped += 1
             continue
 
+        row_used = False
         for k in model_keys:
             pred_ret = row.get(f"{k}_pred_ret")
             sig = row.get(f"{k}_sig_bucket")
@@ -217,13 +227,21 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
             # global stats
             state["global"]["wins"] += int(correct)
             state["global"]["total"] += 1
-        updated += 1
+            row_used = True
+        if row_used:
+            updated += 1
+            processed_timestamps.append(ts)
+        else:
+            skipped += 1
 
     # update last_processed
     try:
-        state["last_processed"] = preds["timestamp"].max().isoformat()
+        if processed_timestamps:
+            latest_ts = pd.to_datetime(max(processed_timestamps), utc=True, errors="coerce")
+            if pd.notna(latest_ts):
+                state["last_processed"] = latest_ts.isoformat()
     except Exception:
-        state["last_processed"] = datetime.now(timezone.utc).isoformat()
+        logger.debug("Failed to advance last_processed", exc_info=True)
 
     # drift detection
     try:
