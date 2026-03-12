@@ -979,6 +979,7 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
     if DF is None or DF.empty:
         return {"folds": 0, "mae_base": [], "mae_forest": [], "mae_boost": [], "mae_extra_trees": [], "net_returns": []}
     y = DF["target_ret_norm_demean"] if "target_ret_norm_demean" in DF.columns else DF["target_ret_norm"]
+    y_real = DF["target_ret"] if "target_ret" in DF.columns else y
     feats_base = DEFAULT_FEATURES
     feats_forest = DEFAULT_FEATURES + ["ret_2", "ret_4", "mom_3"]
     feats_boost = DEFAULT_FEATURES + ["ret_2", "ret_4"]
@@ -991,6 +992,7 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
     if n < (n_splits + 1) * 10:
         return {"folds": 0, "mae_base": [], "mae_forest": [], "mae_boost": [], "mae_extra_trees": [], "net_returns": []}
     test_size = max(1, n // (n_splits + 1))
+    gap = max(0, int(TS_SPLIT_GAP_BARS))
     mae_base = []
     mae_forest = []
     mae_boost = []
@@ -999,17 +1001,71 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
     directional_acc = []
     sharpes = []
     active_fraction = []
+
+    def _optimize_signal_threshold(pred_train, y_train_arr, default_thr: float, costs: float) -> float:
+        try:
+            p = np.asarray(pred_train, dtype=float)
+            yv = np.asarray(y_train_arr, dtype=float)
+            mask = np.isfinite(p) & np.isfinite(yv)
+            p = p[mask]
+            yv = yv[mask]
+            if p.size < 40:
+                return float(max(0.0, default_thr))
+            abs_p = np.abs(p)
+            q_levels = [0.0, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.92, 0.97]
+            cand = {float(max(0.0, default_thr))}
+            for q in q_levels:
+                try:
+                    cand.add(float(np.quantile(abs_p, q)))
+                except Exception:
+                    continue
+            cand = sorted([x for x in cand if np.isfinite(x) and x >= 0.0])
+            if not cand:
+                return float(max(0.0, default_thr))
+            best_t = cand[0]
+            best_score = -np.inf
+            for t in cand:
+                pos = np.sign(p)
+                pos[np.abs(p) < t] = 0.0
+                gross = pos * yv
+                trades = int(np.nansum(np.abs(np.diff(np.concatenate(([0.0], pos))))))
+                score = float(np.nansum(gross) - costs * trades)
+                active = float(np.mean(pos != 0))
+                turnover = float(trades) / max(1.0, float(len(pos)))
+                if np.any(pos != 0):
+                    dir_acc = float(np.mean(np.sign(p[pos != 0]) == np.sign(yv[pos != 0])))
+                else:
+                    dir_acc = 0.5
+                score_per_bar = score / max(1.0, float(len(yv)))
+                # Prefer thresholds that are profitable after costs, directionally reliable,
+                # and not unrealistically always-on.
+                score_adj = (
+                    score_per_bar
+                    + (0.0004 * (dir_acc - 0.5))
+                    - (0.0003 * max(0.0, active - 0.55))
+                    - (0.0002 * max(0.0, 0.05 - active))
+                    - (0.0002 * turnover)
+                )
+                if score_adj > best_score:
+                    best_score = score_adj
+                    best_t = float(t)
+            return float(max(0.0, best_t))
+        except Exception:
+            return float(max(0.0, default_thr))
+
     for i in range(1, n_splits + 1):
         train_end = test_size * i
+        train_end_purged = max(1, train_end - gap)
         test_start = train_end
         test_end = min(n, test_start + test_size)
-        if train_end < 2 or test_start >= n:
+        if train_end_purged < 2 or test_start >= n:
             continue
-        Xb_train, Xb_test = X_base.iloc[:train_end], X_base.iloc[test_start:test_end]
-        Xf_train, Xf_test = X_forest.iloc[:train_end], X_forest.iloc[test_start:test_end]
-        Xg_train, Xg_test = X_boost.iloc[:train_end], X_boost.iloc[test_start:test_end]
-        Xe_train, Xe_test = X_extra.iloc[:train_end], X_extra.iloc[test_start:test_end]
-        y_train, y_test = y.iloc[:train_end], y.iloc[test_start:test_end]
+        Xb_train, Xb_test = X_base.iloc[:train_end_purged], X_base.iloc[test_start:test_end]
+        Xf_train, Xf_test = X_forest.iloc[:train_end_purged], X_forest.iloc[test_start:test_end]
+        Xg_train, Xg_test = X_boost.iloc[:train_end_purged], X_boost.iloc[test_start:test_end]
+        Xe_train, Xe_test = X_extra.iloc[:train_end_purged], X_extra.iloc[test_start:test_end]
+        y_train, y_test = y.iloc[:train_end_purged], y.iloc[test_start:test_end]
+        y_train_real, y_test_real = y_real.iloc[:train_end_purged], y_real.iloc[test_start:test_end]
         pipe_base = _ridge_pipeline()
         # use recency weighting in training fold
         try:
@@ -1018,42 +1074,74 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
         except Exception:
             pipe_base.fit(Xb_train, y_train)
         pred_base = pipe_base.predict(Xb_test)
+        pred_base_train = pipe_base.predict(Xb_train)
         mae_base.append(float(mean_absolute_error(y_test, pred_base)))
         rf = _forest_ctor(seed=RANDOM_STATE)
         try:
             rf.fit(Xf_train, y_train)
             pred_rf = rf.predict(Xf_test)
+            pred_rf_train = rf.predict(Xf_train)
             mae_forest.append(float(mean_absolute_error(y_test, pred_rf)))
         except Exception:
             pred_rf = np.zeros(len(Xb_test))
+            pred_rf_train = np.zeros(len(Xb_train))
             mae_forest.append(float("nan"))
         boost = _boost_ctor(seed=RANDOM_STATE)
         try:
             boost.fit(Xg_train, y_train)
             pred_boost = boost.predict(Xg_test)
+            pred_boost_train = boost.predict(Xg_train)
             mae_boost.append(float(mean_absolute_error(y_test, pred_boost)))
         except Exception:
             pred_boost = np.zeros(len(Xb_test))
+            pred_boost_train = np.zeros(len(Xb_train))
             mae_boost.append(float("nan"))
         extra = _extra_trees_ctor(seed=RANDOM_STATE)
         try:
             extra.fit(Xe_train, y_train)
             pred_extra = extra.predict(Xe_test)
+            pred_extra_train = extra.predict(Xe_train)
             mae_extra_trees.append(float(mean_absolute_error(y_test, pred_extra)))
         except Exception:
             pred_extra = np.zeros(len(Xb_test))
+            pred_extra_train = np.zeros(len(Xb_train))
             mae_extra_trees.append(float("nan"))
-        preds_mean = (pred_base + (pred_rf if 'pred_rf' in locals() else 0) + (pred_boost if 'pred_boost' in locals() else 0) + (pred_extra if 'pred_extra' in locals() else 0)) / 4.0
-        realized = y_test.values
+        # Convert normalized predictions back to raw returns for PnL/cost evaluation.
         try:
-            sig_ref = float(np.std(y_train))
+            vol_series = pd.to_numeric(DF.get("ewm_vol", pd.Series(0.001, index=DF.index)), errors="coerce").fillna(0.001)
+            vol_train = np.maximum(vol_series.iloc[:train_end_purged].values.astype(float), 1e-6)
+            vol_test = np.maximum(vol_series.iloc[test_start:test_end].values.astype(float), 1e-6)
+        except Exception:
+            vol_train = np.ones(len(Xb_train), dtype=float)
+            vol_test = np.ones(len(Xb_test), dtype=float)
+        pred_base_raw = np.asarray(pred_base, dtype=float) * vol_test
+        pred_rf_raw = np.asarray(pred_rf, dtype=float) * vol_test
+        pred_boost_raw = np.asarray(pred_boost, dtype=float) * vol_test
+        pred_extra_raw = np.asarray(pred_extra, dtype=float) * vol_test
+        pred_base_train_raw = np.asarray(pred_base_train, dtype=float) * vol_train
+        pred_rf_train_raw = np.asarray(pred_rf_train, dtype=float) * vol_train
+        pred_boost_train_raw = np.asarray(pred_boost_train, dtype=float) * vol_train
+        pred_extra_train_raw = np.asarray(pred_extra_train, dtype=float) * vol_train
+
+        stack_test = np.vstack([pred_base_raw, pred_rf_raw, pred_boost_raw, pred_extra_raw])
+        stack_train = np.vstack([pred_base_train_raw, pred_rf_train_raw, pred_boost_train_raw, pred_extra_train_raw])
+        preds_mean = (0.7 * np.mean(stack_test, axis=0)) + (0.3 * np.median(stack_test, axis=0))
+        preds_train_mean = (0.7 * np.mean(stack_train, axis=0)) + (0.3 * np.median(stack_train, axis=0))
+        realized = y_test_real.values
+        if include_transaction_costs:
+            costs = TRANSACTION_COST_PER_TRADE + SLIPPAGE_PCT
+        else:
+            costs = 0.0
+        try:
+            sig_ref = float(np.std(y_train_real))
         except Exception:
             sig_ref = 0.0
         try:
             sig_mult = float(BACKTEST_SIGNAL_STD_MULT)
         except Exception:
             sig_mult = 0.0
-        sig_thr = max(0.0, sig_mult * max(0.0, sig_ref))
+        sig_thr_default = max(0.0, sig_mult * max(0.0, sig_ref))
+        sig_thr = _optimize_signal_threshold(preds_train_mean, y_train_real.values, sig_thr_default, costs)
         pos = np.sign(preds_mean)
         if sig_thr > 0:
             pos[np.abs(preds_mean) < sig_thr] = 0.0
@@ -1073,10 +1161,6 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
         except Exception:
             directional_acc.append(float("nan"))
         gross = pos * realized
-        if include_transaction_costs:
-            costs = TRANSACTION_COST_PER_TRADE + SLIPPAGE_PCT
-        else:
-            costs = 0.0
         trades = int(np.nansum(np.abs(np.diff(np.concatenate(([0], pos))))))
         net_return = float(np.nansum(gross) - costs * trades)
         net_returns.append(net_return)

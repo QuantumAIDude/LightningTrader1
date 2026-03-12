@@ -12,6 +12,7 @@ import os
 from datetime import datetime, timezone
 
 from config import INSTRUMENTS, DATA_DIR
+from instrument_onboarding import ensure_runtime_instruments
 from system_checkup import _check_instrument
 
 
@@ -39,6 +40,10 @@ def _append_alert(path: str, msg: str):
 
 
 def main():
+    try:
+        ensure_runtime_instruments(force=False, auto_onboard=True)
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="Continuous monitor cycle for LightningTrader4000")
     parser.add_argument(
         "--instrument",
@@ -92,6 +97,7 @@ def main():
         rep = _check_instrument(instr, quick=args.quick, online=args.online)
         status = str(rep.get("status", "fail")).lower()
         drift_flag = bool(rep.get("calibration", {}).get("drift_flag", False))
+        horizon_drift = bool(rep.get("horizon_accuracy", {}).get("drift_flag", False))
         cal_stale = bool(rep.get("calibration", {}).get("stale", True))
         stale = bool(rep.get("data", {}).get("staleness", {}).get("is_stale", True))
         market_state = rep.get("data", {}).get("staleness", {}).get("market_state")
@@ -105,6 +111,7 @@ def main():
             "instrument": instr,
             "status": status,
             "drift_flag": drift_flag,
+            "horizon_drift_flag": horizon_drift,
             "calibration_stale": cal_stale,
             "data_stale": stale,
             "market_state": market_state,
@@ -124,6 +131,8 @@ def main():
 
         if drift_flag:
             _append_alert(args.alert_log, f"{instr} DRIFT_FLAG calibration drift detected")
+        if horizon_drift:
+            _append_alert(args.alert_log, f"{instr} HORIZON_DRIFT daily/weekend drift detected")
         if cal_stale:
             _append_alert(args.alert_log, f"{instr} CALIBRATION_STALE calibration stats are stale")
         if critical_stale:

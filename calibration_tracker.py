@@ -71,13 +71,32 @@ def _calibration_state_path(instrument_key: str) -> str:
 def _load_state(instrument_key: str):
     path = _calibration_state_path(instrument_key)
     if not os.path.exists(path):
-        return {"last_processed": None, "last_update": None, "by_model": {}, "by_model_stats": {}, "global": {}}
+        return {
+            "last_processed": None,
+            "last_update": None,
+            "by_model": {},
+            "by_model_stats": {},
+            "global": {},
+            "recent_outcomes": [],
+            "recent_abs_errors": []
+        }
     try:
         with open(path, "r") as f:
-            return json.load(f)
+            state = json.load(f)
+        state.setdefault("recent_outcomes", [])
+        state.setdefault("recent_abs_errors", [])
+        return state
     except Exception:
         logger.exception("Failed to read calibration state")
-        return {"last_processed": None, "last_update": None, "by_model": {}, "by_model_stats": {}, "global": {}}
+        return {
+            "last_processed": None,
+            "last_update": None,
+            "by_model": {},
+            "by_model_stats": {},
+            "global": {},
+            "recent_outcomes": [],
+            "recent_abs_errors": []
+        }
 
 def _save_state(instrument_key: str, state: dict):
     path = _calibration_state_path(instrument_key)
@@ -171,7 +190,7 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
     if preds.empty:
         return {"updated": 0, "skipped": 0}
 
-    model_keys = ["base", "forest", "boost", "extra_trees", "meta"]
+    model_keys = ["base", "forest", "boost", "extra_trees", "meta", "consensus"]
     updated = 0
     skipped = 0
     processed_timestamps = []
@@ -202,6 +221,7 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
             continue
 
         row_used = False
+        row_preds = []
         for k in model_keys:
             pred_ret = row.get(f"{k}_pred_ret")
             sig = row.get(f"{k}_sig_bucket")
@@ -212,6 +232,7 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
             except Exception:
                 continue
             correct = (pred_ret >= 0) == (actual_ret >= 0)
+            row_preds.append(pred_ret)
             bucket = _bucket_from_sig(sig)
             state.setdefault("by_model", {}).setdefault(k, {}).setdefault(bucket, {"wins": 0, "total": 0})
             state["by_model"][k][bucket]["wins"] += int(correct)
@@ -229,6 +250,38 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
             state["global"]["total"] += 1
             row_used = True
         if row_used:
+            # Keep a short, row-level correctness history for faster drift reaction.
+            # Prefer consensus if present; otherwise use mean model sign.
+            row_correct = None
+            try:
+                c_pred = row.get("consensus_pred_ret")
+                if c_pred is not None and not pd.isna(c_pred):
+                    c_pred = float(c_pred)
+                    row_correct = int((c_pred >= 0) == (actual_ret >= 0))
+            except Exception:
+                row_correct = None
+            if row_correct is None and row_preds:
+                try:
+                    row_correct = int((float(np.mean(row_preds)) >= 0) == (actual_ret >= 0))
+                except Exception:
+                    row_correct = None
+            if row_correct is not None:
+                recent = state.setdefault("recent_outcomes", [])
+                recent.append(int(row_correct))
+                if len(recent) > 500:
+                    state["recent_outcomes"] = recent[-500:]
+            try:
+                c_pred = row.get("consensus_pred_ret")
+                if c_pred is not None and not pd.isna(c_pred):
+                    c_pred = float(c_pred)
+                    abs_err = abs(float(actual_ret - c_pred))
+                    if np.isfinite(abs_err):
+                        errs = state.setdefault("recent_abs_errors", [])
+                        errs.append(float(abs_err))
+                        if len(errs) > 1000:
+                            state["recent_abs_errors"] = errs[-1000:]
+            except Exception:
+                pass
             updated += 1
             processed_timestamps.append(ts)
         else:
@@ -249,8 +302,22 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
         wins = float(state["global"].get("wins", 0.0))
         acc = wins / total if total > 0 else 1.0
         state["drift_score"] = float(acc)
-        state["drift_flag"] = bool(total >= DRIFT_MIN_SAMPLES and acc < DRIFT_ACC_THRESHOLD)
+        global_drift = bool(total >= DRIFT_MIN_SAMPLES and acc < DRIFT_ACC_THRESHOLD)
+        recent_outcomes = [int(x) for x in state.get("recent_outcomes", []) if str(x) in ("0", "1")]
+        recent_min = max(24, int(DRIFT_MIN_SAMPLES // 3))
+        recent_window = max(40, int(DRIFT_MIN_SAMPLES))
+        recent_slice = recent_outcomes[-recent_window:] if recent_outcomes else []
+        recent_total = len(recent_slice)
+        recent_acc = (float(np.mean(recent_slice)) if recent_total > 0 else 1.0)
+        # Slightly stricter threshold for recent window so we react earlier to sharp degradation.
+        recent_thresh = min(0.55, float(DRIFT_ACC_THRESHOLD) + 0.05)
+        recent_drift = bool(recent_total >= recent_min and recent_acc < recent_thresh)
+        state["recent_acc"] = float(recent_acc)
+        state["recent_total"] = int(recent_total)
+        state["recent_drift_flag"] = bool(recent_drift)
+        state["drift_flag"] = bool(global_drift or recent_drift)
     except Exception:
         state["drift_flag"] = False
+        state["recent_drift_flag"] = False
     _save_state(instrument_key, state)
     return {"updated": updated, "skipped": skipped}

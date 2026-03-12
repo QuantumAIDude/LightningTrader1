@@ -22,10 +22,10 @@ from config import DEFAULT_INSTRUMENT, DATA_DIR, MODEL_DIR, INSTRUMENTS
 from data_fetch import (
     fetch_recent_intraday,
     fetch_recent_intraday_alpaca,
-    fetch_recent_intraday_ibkr,
     fetch_recent_intraday_yfinance,
 )
 from features import build_features_for_training, DEFAULT_FEATURES
+from instrument_onboarding import ensure_runtime_instruments, register_instrument
 from model_trainers import train_all_models, walk_forward_validate, _ridge_pipeline
 from model_utils import load_models, predict_4min, predict_horizon
 from regime_model import extract_regime_pipeline
@@ -73,11 +73,6 @@ def _fetch_ohlc(instr_key: str, provider: str) -> pd.DataFrame:
     if provider == "alpaca":
         sym = instr.get("alpaca", instr_key)
         return fetch_recent_intraday_alpaca(sym)
-    if provider == "ibkr":
-        meta = instr.get("ibkr")
-        if not meta:
-            return pd.DataFrame()
-        return fetch_recent_intraday_ibkr(meta)
     if provider == "yfinance":
         sym = instr.get("yahoo", instr_key)
         return fetch_recent_intraday_yfinance(sym, tz=instr.get("tz", "America/New_York"))
@@ -139,9 +134,9 @@ def _check_predictions(models, df, instr_key):
 def main():
     parser = argparse.ArgumentParser(description="Generate OHLC CSV, retrain models, and validate.")
     parser.add_argument("--instrument", default=DEFAULT_INSTRUMENT,
-                        help="Comma-separated list of instruments (e.g., QQQ,GCG26)")
+                        help="Comma-separated list of instruments (e.g., QQQ,AAPL)")
     parser.add_argument("--provider", default="auto",
-                        help="Comma-separated list or single value: auto|alpaca|ibkr|yfinance")
+                        help="Comma-separated list or single value: auto|alpaca|yfinance")
     parser.add_argument("--input-csv", default=None,
                         help="Comma-separated list of local OHLC CSVs instead of fetching.")
     parser.add_argument("--min-ohlc-coverage", type=float, default=0.90)
@@ -149,6 +144,10 @@ def main():
     parser.add_argument("--wf-splits", type=int, default=5)
     parser.add_argument("--report", default=None, help="Optional JSON report output.")
     args = parser.parse_args()
+    try:
+        ensure_runtime_instruments(force=False, auto_onboard=True)
+    except Exception:
+        pass
 
     instr_list = [s.strip() for s in str(args.instrument).split(",") if s.strip()]
     if not instr_list:
@@ -175,6 +174,11 @@ def main():
     report = {"ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "instruments": {}}
 
     for idx, instr in enumerate(instr_list):
+        if instr not in INSTRUMENTS:
+            try:
+                register_instrument(instr, persist=True)
+            except Exception:
+                pass
         report["instruments"][instr] = {}
         provider = provider_list[idx]
         input_csv = input_list[idx] if input_list else None
@@ -186,11 +190,6 @@ def main():
                 continue
             df = pd.read_csv(input_csv, index_col=0, parse_dates=True)
         else:
-            # Guard: Alpaca does not provide futures
-            instr_meta = INSTRUMENTS.get(instr, {})
-            if provider == "alpaca" and instr_meta.get("type") == "futures":
-                report["instruments"][instr]["error"] = "Alpaca does not support futures; use IBKR or a CSV."
-                continue
             df = _fetch_ohlc(instr, provider)
 
         if df is None or df.empty:

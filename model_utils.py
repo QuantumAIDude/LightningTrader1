@@ -8,12 +8,54 @@ import numpy as np
 import pandas as pd
 import logging
 import warnings
-from config import MODEL_DIR, BASE_MODEL_FILE, FOREST_MODEL_FILE, BOOST_MODEL_FILE, EXTRA_TREES_MODEL_FILE, REGIME_MODEL_FILE, META_MODEL_FILE, INSTRUMENTS, INTERVAL, SYMBOL, DATA_DIR, LIVE_CALIBRATION, EXTRA_TREES_N_ESTIMATORS, EXTRA_TREES_MAX_DEPTH, EXTRA_TREES_MIN_SAMPLES_LEAF, ALLOW_REMOTE_DAILY, DEFAULT_INSTRUMENT, MAX_ENSEMBLE_MEMBERS_PREDICT
+from config import (
+    MODEL_DIR,
+    BASE_MODEL_FILE,
+    FOREST_MODEL_FILE,
+    BOOST_MODEL_FILE,
+    EXTRA_TREES_MODEL_FILE,
+    REGIME_MODEL_FILE,
+    META_MODEL_FILE,
+    INSTRUMENTS,
+    INTERVAL,
+    SYMBOL,
+    DATA_DIR,
+    LIVE_CALIBRATION,
+    EXTRA_TREES_N_ESTIMATORS,
+    EXTRA_TREES_MAX_DEPTH,
+    EXTRA_TREES_MIN_SAMPLES_LEAF,
+    ALLOW_REMOTE_DAILY,
+    DEFAULT_INSTRUMENT,
+    MAX_ENSEMBLE_MEMBERS_PREDICT,
+    AUTO_FAST_RETRAIN_ON_DRIFT,
+    DRIFT_RETRAIN_COOLDOWN_MIN,
+    TRANSACTION_COST_PER_TRADE,
+    SLIPPAGE_PCT,
+    LIVE_COST_MULTIPLIER,
+    LIVE_MIN_EDGE_BPS,
+    LIVE_UNCERTAINTY_EDGE_MULT,
+    DROP_INCOMPLETE_LAST_BAR,
+    INCOMPLETE_BAR_GRACE_SEC,
+    LIVE_BIAS_CORRECTION,
+    LIVE_BIAS_MIN_SAMPLES,
+    LIVE_BIAS_WEIGHT_MAX,
+    LIVE_BIAS_MAX_ABS_MULT,
+    AUTO_HORIZON_RETRAIN_ON_DRIFT,
+    HORIZON_DRIFT_RETRAIN_COOLDOWN_MIN,
+    HORIZON_ACCURACY_UPDATE_COOLDOWN_SEC,
+)
 try:
     from config import LOG_PREDICTIONS
 except Exception:
     LOG_PREDICTIONS = False
-from features import make_feature_matrix, build_feature_frame, build_features_for_training, DEFAULT_FEATURES, LIVE_MAX_BARS
+from features import (
+    make_feature_matrix,
+    build_feature_frame,
+    build_features_for_training,
+    build_next_session_dataset,
+    DEFAULT_FEATURES,
+    LIVE_MAX_BARS,
+)
 from sklearn.ensemble import ExtraTreesRegressor
 from regime_model import predict_regime_probs
 from datetime import datetime, timedelta, timezone, time
@@ -37,6 +79,15 @@ _EXTRA_TREES_AUTO_ATTEMPTED = False
 _MODEL_CACHE = {}
 _CAL_UPDATE_LOCK = threading.Lock()
 _CAL_UPDATE_IN_FLIGHT = set()
+_DRIFT_RETRAIN_LOCK = threading.Lock()
+_DRIFT_RETRAIN_IN_FLIGHT = set()
+_LAST_DRIFT_RETRAIN = {}
+_HORIZON_ACC_LOCK = threading.Lock()
+_HORIZON_ACC_IN_FLIGHT = set()
+_LAST_HORIZON_ACC_UPDATE = {}
+_HORIZON_RETRAIN_LOCK = threading.Lock()
+_HORIZON_RETRAIN_IN_FLIGHT = set()
+_LAST_HORIZON_RETRAIN = {}
 
 def _interval_minutes(interval: str) -> int:
     interval = str(interval).strip().lower()
@@ -161,6 +212,208 @@ def _round_to_tick(price: float, instr_meta: dict) -> float:
     if tick and tick > 0:
         return float(round(price / tick) * tick)
     return float(price)
+
+def _weighted_quantile(values, quantile: float, weights=None):
+    try:
+        vals = np.asarray(values, dtype=float)
+        if vals.size == 0:
+            return np.nan
+        mask = np.isfinite(vals)
+        vals = vals[mask]
+        if vals.size == 0:
+            return np.nan
+        if weights is None:
+            return float(np.quantile(vals, max(0.0, min(1.0, quantile))))
+        w = np.asarray(weights, dtype=float)
+        if w.size != mask.size:
+            w = np.ones_like(vals, dtype=float)
+        else:
+            w = w[mask]
+        w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
+        if float(np.sum(w)) <= 0:
+            return float(np.quantile(vals, max(0.0, min(1.0, quantile))))
+        order = np.argsort(vals)
+        vals_s = vals[order]
+        w_s = w[order]
+        cum = np.cumsum(w_s)
+        target = max(0.0, min(1.0, quantile)) * float(cum[-1])
+        idx = int(np.searchsorted(cum, target, side="left"))
+        idx = min(max(idx, 0), len(vals_s) - 1)
+        return float(vals_s[idx])
+    except Exception:
+        return np.nan
+
+def _daily_range_priors(df_hist: pd.DataFrame, instrument_key: str = None, lookback_sessions: int = 180):
+    """
+    Build robust priors for next-session high/low returns from prior close.
+    Priors are used to keep daily high/low forecasts realistic when ML outputs collapse.
+    """
+    try:
+        ds = build_next_session_dataset(df_hist, instrument_key=instrument_key)
+    except Exception:
+        return None
+    if ds is None or ds.empty:
+        return None
+    try:
+        use = ds[["target_high_ret", "target_low_ret"]].replace([np.inf, -np.inf], np.nan).dropna()
+    except Exception:
+        return None
+    if use.empty:
+        return None
+    if lookback_sessions and len(use) > int(lookback_sessions):
+        use = use.tail(int(lookback_sessions))
+    if len(use) < 12:
+        return None
+    high = pd.to_numeric(use["target_high_ret"], errors="coerce").values
+    low = pd.to_numeric(use["target_low_ret"], errors="coerce").values
+    mask = np.isfinite(high) & np.isfinite(low)
+    high = high[mask]
+    low = low[mask]
+    if len(high) < 12:
+        return None
+    rng = np.maximum(high - low, 0.0)
+    n = len(high)
+    # Recent samples receive more weight.
+    weights = np.linspace(0.7, 1.3, n, dtype=float)
+    high_med = _weighted_quantile(high, 0.50, weights)
+    low_med = _weighted_quantile(low, 0.50, weights)
+    high_q65 = _weighted_quantile(high, 0.65, weights)
+    high_q75 = _weighted_quantile(high, 0.75, weights)
+    low_q35 = _weighted_quantile(low, 0.35, weights)
+    low_q25 = _weighted_quantile(low, 0.25, weights)
+    high_prior = 0.65 * high_med + 0.35 * high_q65
+    low_prior = 0.65 * low_med + 0.35 * low_q35
+    mid_med = _weighted_quantile(0.5 * (high + low), 0.50, weights)
+    range_q45 = _weighted_quantile(rng, 0.45, weights)
+    range_q60 = _weighted_quantile(rng, 0.60, weights)
+    range_q92 = _weighted_quantile(rng, 0.92, weights)
+    # Volatility floor prevents unrealistically narrow high/low spread.
+    try:
+        close = pd.to_numeric(df_hist.get("close"), errors="coerce")
+        ret = close.pct_change().dropna()
+        rv = float(ret.tail(max(20, int(240 // max(1, BAR_MINUTES)))).std()) if not ret.empty else 0.0
+    except Exception:
+        rv = 0.0
+    vol_floor = max(0.0015, 2.2 * max(0.0, rv))
+    min_range = max(float(range_q45 if np.isfinite(range_q45) else 0.0), vol_floor)
+    med_range = max(float(range_q60 if np.isfinite(range_q60) else min_range), min_range)
+    max_range = max(float(range_q92 if np.isfinite(range_q92) else med_range * 1.8), med_range)
+    try:
+        if high_prior < low_prior:
+            high_prior, low_prior = low_prior, high_prior
+    except Exception:
+        pass
+    try:
+        down_share = abs(float(low_q25)) / (abs(float(low_q25)) + abs(float(high_q75)) + 1e-9)
+    except Exception:
+        down_share = 0.55
+    down_share = float(max(0.50, min(0.72, down_share)))
+    return {
+        "high_ret_prior": float(high_prior),
+        "low_ret_prior": float(low_prior),
+        "low_tail_ret_prior": float(low_q25 if np.isfinite(low_q25) else low_prior),
+        "mid_ret_prior": float(mid_med if np.isfinite(mid_med) else 0.5 * (high_prior + low_prior)),
+        "down_share": float(down_share),
+        "min_range_ret": float(min_range),
+        "med_range_ret": float(med_range),
+        "max_range_ret": float(max_range),
+        "n_samples": int(n),
+    }
+
+def _enforce_daily_high_low_consistency(high_block: dict, low_block: dict, base_price: float, instr_meta: dict,
+                                        priors: dict | None):
+    if not isinstance(high_block, dict) or not isinstance(low_block, dict):
+        return
+    if not isinstance(base_price, (int, float)) or float(base_price) <= 0:
+        return
+    if not isinstance(priors, dict):
+        return
+    try:
+        min_range = max(0.0005, float(priors.get("min_range_ret", 0.002)))
+        med_range = max(min_range, float(priors.get("med_range_ret", min_range)))
+        max_range = max(med_range, float(priors.get("max_range_ret", med_range * 2.0)))
+        high_prior = float(priors.get("high_ret_prior", med_range))
+        low_prior = float(priors.get("low_ret_prior", -med_range))
+        low_tail = float(priors.get("low_tail_ret_prior", low_prior))
+        mid_prior = float(priors.get("mid_ret_prior", 0.5 * (high_prior + low_prior)))
+        down_share = float(priors.get("down_share", 0.55))
+        down_share = max(0.50, min(0.72, down_share))
+    except Exception:
+        return
+    try:
+        tick = float(instr_meta.get("tick_size", 0.0) or 0.0)
+    except Exception:
+        tick = 0.0
+    if tick <= 0:
+        tick = 0.01
+    for key in ("base", "forest", "boost", "extra_trees"):
+        h = high_block.get(key)
+        l = low_block.get(key)
+        if not isinstance(h, dict) or not isinstance(l, dict):
+            continue
+        key_adj = {
+            "base": -0.015,
+            "forest": -0.005,
+            "boost": 0.005,
+            "extra_trees": 0.015,
+        }.get(key, 0.0)
+        hp = h.get("pred_price")
+        lp = l.get("pred_price")
+        if not isinstance(hp, (int, float)) or not isinstance(lp, (int, float)):
+            continue
+        try:
+            h_conf = float(h.get("confidence", 0.0)) / 100.0
+        except Exception:
+            h_conf = 0.0
+        try:
+            l_conf = float(l.get("confidence", 0.0)) / 100.0
+        except Exception:
+            l_conf = 0.0
+        # More confidence -> keep more ML signal, otherwise pull toward historical prior.
+        w_h = max(0.25, min(0.90, h_conf + key_adj))
+        w_l = max(0.18, min(0.85, (l_conf * 0.88) - (0.8 * key_adj)))
+        model_down_share = max(0.48, min(0.75, down_share + (0.5 * key_adj)))
+        ret_h_ml = float(hp / base_price) - 1.0
+        ret_l_ml = float(lp / base_price) - 1.0
+        ret_h = (w_h * ret_h_ml) + ((1.0 - w_h) * high_prior)
+        ret_l = (w_l * ret_l_ml) + ((1.0 - w_l) * low_prior)
+        # Low-side forecasts are often underestimating downside tails; blend a tail prior when confidence is weak.
+        tail_mix = max(0.0, min(0.45, (0.55 - l_conf)))
+        ret_l = (1.0 - tail_mix) * ret_l + tail_mix * low_tail
+        spread = ret_h - ret_l
+        if spread < min_range:
+            mid = (0.65 * (0.5 * (ret_h + ret_l))) + (0.35 * mid_prior)
+            target = max(min_range, 0.85 * med_range) * (1.0 + (0.15 * key_adj))
+            ret_h = mid + (1.0 - model_down_share) * target
+            ret_l = mid - model_down_share * target
+        spread = ret_h - ret_l
+        if spread > max_range:
+            mid = 0.5 * (ret_h + ret_l)
+            ret_h = mid + (1.0 - model_down_share) * max_range
+            ret_l = mid - model_down_share * max_range
+        if l_conf < 0.55:
+            ret_l = min(ret_l, low_prior)
+        if ret_h < ret_l:
+            ret_h, ret_l = ret_l, ret_h
+        hp_new = _round_to_tick(base_price * (1.0 + ret_h), instr_meta)
+        lp_new = _round_to_tick(base_price * (1.0 + ret_l), instr_meta)
+        if hp_new < (lp_new + tick):
+            mid_p = 0.5 * (hp_new + lp_new)
+            hp_new = _round_to_tick(mid_p + tick, instr_meta)
+            lp_new = _round_to_tick(mid_p - tick, instr_meta)
+        h["pred_price"] = float(round(hp_new, 4))
+        l["pred_price"] = float(round(lp_new, 4))
+        h["pred_ret"] = float((hp_new / base_price) - 1.0)
+        l["pred_ret"] = float((lp_new / base_price) - 1.0)
+        h["direction"] = "UP" if hp_new >= base_price else "DOWN"
+        l["direction"] = "UP" if lp_new >= base_price else "DOWN"
+        note_h = str(h.get("note") or "")
+        note_l = str(l.get("note") or "")
+        tag = f"Range prior blend (n={int(priors.get('n_samples', 0))})"
+        if tag not in note_h:
+            h["note"] = f"{note_h} | {tag}" if note_h else tag
+        if tag not in note_l:
+            l["note"] = f"{note_l} | {tag}" if note_l else tag
 
 def _auto_train_extra_trees(instrument_key: str = None):
     """Lightweight fallback: train ExtraTrees from cached price history if missing on disk."""
@@ -377,6 +630,39 @@ def _staleness_info(df_latest: pd.DataFrame, instrument_key: str = None):
         "market_state": market_state
     }
 
+def _drop_incomplete_last_bar(df_latest: pd.DataFrame, instrument_key: str = None):
+    """
+    Drop the newest bar if it is likely incomplete (very recent or timestamped in the future).
+    This avoids using partial bars that can distort short-horizon signals.
+    Returns (df, dropped_flag).
+    """
+    if not DROP_INCOMPLETE_LAST_BAR:
+        return df_latest, False
+    if df_latest is None or getattr(df_latest, "empty", True):
+        return df_latest, False
+    try:
+        last_ts = pd.to_datetime(df_latest.index[-1], utc=True, errors="coerce")
+    except Exception:
+        return df_latest, False
+    if pd.isna(last_ts):
+        return df_latest, False
+    now = pd.Timestamp.now(tz="UTC")
+    try:
+        age_sec = float((now - last_ts).total_seconds())
+    except Exception:
+        return df_latest, False
+    # Grace window: either explicit seconds or a fraction of bar length (whichever is larger).
+    bar_sec = max(1.0, float(BAR_MINUTES) * 60.0)
+    grace = max(1.0, float(INCOMPLETE_BAR_GRACE_SEC), 0.10 * bar_sec)
+    # If last timestamp is in the future or too close to now, treat as incomplete.
+    if age_sec < -grace or age_sec < grace:
+        try:
+            if len(df_latest) >= 2:
+                return df_latest.iloc[:-1].copy(), True
+        except Exception:
+            pass
+    return df_latest, False
+
 def _stale_conf_factor(stale: dict | None) -> float:
     """Confidence multiplier based on staleness severity."""
     if not stale or not stale.get("is_stale"):
@@ -585,6 +871,41 @@ def _max_abs_ret_from_vol(vol: float, instr_meta: dict = None) -> float:
             mult = mult
     return float(max(0.003, min(0.05, mult * v)))
 
+def _estimated_trade_cost_ret(last_price: float, instr_meta: dict = None, spread_frac: float | None = None) -> float:
+    """
+    Conservative one-way cost proxy in return units:
+    commission/slippage base + half-tick spread proxy.
+    """
+    try:
+        lp = float(last_price)
+    except Exception:
+        lp = 0.0
+    try:
+        # Use a one-way conservative proxy (half of round-trip assumptions).
+        base = 0.5 * (float(TRANSACTION_COST_PER_TRADE) + float(SLIPPAGE_PCT))
+    except Exception:
+        base = 0.0
+    try:
+        mult = max(0.1, float(LIVE_COST_MULTIPLIER))
+    except Exception:
+        mult = 1.0
+    tick_spread = 0.0
+    try:
+        if instr_meta is not None and lp > 0:
+            tick = float(instr_meta.get("tick_size", 0.0) or 0.0)
+            if tick > 0:
+                tick_spread = 0.5 * (tick / lp)
+    except Exception:
+        tick_spread = 0.0
+    spread_cost = 0.0
+    try:
+        if spread_frac is not None and float(spread_frac) > 0:
+            spread_cost = 0.5 * float(spread_frac)
+    except Exception:
+        spread_cost = 0.0
+    spread_term = max(tick_spread, spread_cost)
+    return float(max(0.0, mult * (base + spread_term)))
+
 def _predict_horizon_norm(models_dict, df_latest, horizon_minutes: int, instrument_key: str = None,
                           feature_frame: pd.DataFrame | None = None, feat_cache: dict | None = None):
     try:
@@ -708,6 +1029,125 @@ def _live_calibration_bias(instrument_key: str, model_key: str):
     except Exception:
         return 0.0
 
+def _live_bias_adjustment(live_cal: dict | None, model_key: str, pred_ret: float,
+                          max_abs_ret: float, drift_flag: bool = False):
+    """
+    Apply conservative bias correction using recent live errors.
+    Returns (adjusted_pred, applied_bias).
+    """
+    if not LIVE_BIAS_CORRECTION:
+        return pred_ret, 0.0
+    if not isinstance(live_cal, dict) or live_cal.get("_stale"):
+        return pred_ret, 0.0
+    try:
+        stats = live_cal.get("by_model_stats", {}).get(model_key, {})
+        total = float(stats.get("total", 0.0))
+        if total < float(LIVE_BIAS_MIN_SAMPLES):
+            return pred_ret, 0.0
+        bias = float(stats.get("sum_error", 0.0)) / max(1.0, total)
+        cap = float(LIVE_BIAS_MAX_ABS_MULT) * float(max_abs_ret)
+        if not np.isfinite(cap) or cap <= 0:
+            cap = float(max_abs_ret)
+        bias = max(-cap, min(cap, bias))
+        weight = min(float(LIVE_BIAS_WEIGHT_MAX), total / max(1.0, float(LIVE_BIAS_MIN_SAMPLES) * 4.0))
+        if drift_flag:
+            weight *= 0.6
+        adj = weight * bias
+        return float(pred_ret + adj), float(adj)
+    except Exception:
+        return pred_ret, 0.0
+
+def _live_model_weight_multiplier(live_cal: dict | None, model_key: str) -> float:
+    """
+    Reliability multiplier from live stats.
+    >1 boosts models with stronger recent hit-rate; <1 downweights degrading models.
+    """
+    if not isinstance(live_cal, dict):
+        return 1.0
+    if bool(live_cal.get("_stale", False)):
+        return 1.0
+    try:
+        stats = live_cal.get("by_model_stats", {}).get(model_key, {})
+        total = float(stats.get("total", 0.0))
+        wins = float(stats.get("wins", 0.0))
+        if total < 12:
+            return 1.0
+        acc = wins / max(1.0, total)
+        sum_abs = float(stats.get("sum_abs_error", 0.0))
+        mae = sum_abs / max(1.0, total)
+        acc_mult = max(0.60, min(1.45, acc / 0.52))
+        err_mult = max(0.70, min(1.20, 1.0 / (1.0 + 45.0 * max(0.0, mae))))
+        return float(acc_mult * err_mult)
+    except Exception:
+        return 1.0
+
+def _conformal_abs_error_threshold(live_cal: dict | None, quantile: float = 0.80, min_n: int = 40):
+    """
+    Empirical absolute-error threshold from recent consensus outcomes.
+    Used as a light conformal-style uncertainty band for live no-trade gating.
+    """
+    if not isinstance(live_cal, dict):
+        return None
+    if bool(live_cal.get("_stale", False)):
+        return None
+    try:
+        vals = live_cal.get("recent_abs_errors", [])
+        if not isinstance(vals, list):
+            return None
+        arr = np.asarray(vals, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < int(min_n):
+            return None
+        q = max(0.55, min(0.95, float(quantile)))
+        return float(np.quantile(arr, q))
+    except Exception:
+        return None
+
+def _schedule_fast_retrain_on_drift(instrument_key: str, live_cal: dict | None):
+    """
+    Trigger lightweight retraining when live calibration signals drift.
+    This keeps models adaptive without blocking inference.
+    """
+    if not AUTO_FAST_RETRAIN_ON_DRIFT:
+        return
+    if not isinstance(live_cal, dict):
+        return
+    drift = bool(live_cal.get("drift_flag", False) or live_cal.get("recent_drift_flag", False))
+    if not drift:
+        return
+    instr = str(instrument_key or SYMBOL)
+    now = datetime.now(timezone.utc)
+    cooldown_min = max(15, int(DRIFT_RETRAIN_COOLDOWN_MIN))
+    with _DRIFT_RETRAIN_LOCK:
+        last = _LAST_DRIFT_RETRAIN.get(instr)
+        if last is not None and (now - last).total_seconds() < (cooldown_min * 60.0):
+            return
+        if instr in _DRIFT_RETRAIN_IN_FLIGHT:
+            return
+        _DRIFT_RETRAIN_IN_FLIGHT.add(instr)
+        _LAST_DRIFT_RETRAIN[instr] = now
+
+    def _worker(target_instr: str):
+        try:
+            from bootstrap_models_fast import bootstrap_fast_models
+            logger.warning("Drift-triggered fast retrain started for %s", target_instr)
+            bootstrap_fast_models(target_instr)
+            # Clear cache to force fresh model reload on next inference.
+            try:
+                _MODEL_CACHE.pop((target_instr, True), None)
+                _MODEL_CACHE.pop((target_instr, False), None)
+            except Exception:
+                pass
+            logger.warning("Drift-triggered fast retrain completed for %s", target_instr)
+        except Exception:
+            logger.exception("Drift-triggered fast retrain failed for %s", target_instr)
+        finally:
+            with _DRIFT_RETRAIN_LOCK:
+                _DRIFT_RETRAIN_IN_FLIGHT.discard(target_instr)
+
+    th = threading.Thread(target=_worker, args=(instr,), daemon=True)
+    th.start()
+
 def _schedule_live_calibration_update(instrument_key: str):
     """Schedule calibration refresh in the background to keep prediction latency stable."""
     if not LIVE_CALIBRATION:
@@ -800,6 +1240,192 @@ def _log_prediction(instrument_key, last_price, results_out):
             writer.writerow(row_to_write)
     except Exception:
         logger.exception("Failed to log prediction")
+
+
+def _log_horizon_prediction(instrument_key, last_price, mode, results_out):
+    """
+    Persist daily/weekend horizon predictions for post-close accuracy accounting.
+    This log is used by horizon_accuracy_tracker to resolve realized errors later.
+    """
+    try:
+        import csv
+
+        instr = instrument_key or SYMBOL
+        mode_norm = str(mode or "").strip().lower()
+        ts = datetime.now(timezone.utc).isoformat()
+        row = {
+            "timestamp": ts,
+            "instrument": instr,
+            "mode": mode_norm,
+            "last_price": last_price,
+            "target_session_date": None,
+            "target_week": None,
+            "feature_session_date": None,
+        }
+        meta = results_out.get("meta", {}) if isinstance(results_out, dict) else {}
+        if isinstance(meta, dict):
+            row["target_session_date"] = meta.get("target_session_date")
+            row["target_week"] = meta.get("target_week")
+            row["feature_session_date"] = meta.get("feature_session_date")
+        reg = results_out.get("regime", {}) if isinstance(results_out, dict) else {}
+        row["regime_bullish"] = reg.get("Bullish") if isinstance(reg, dict) else None
+        row["regime_neutral"] = reg.get("Neutral") if isinstance(reg, dict) else None
+        row["regime_bearish"] = reg.get("Bearish") if isinstance(reg, dict) else None
+        row["regime_conf"] = reg.get("regime_conf") if isinstance(reg, dict) else None
+
+        saw_numeric = False
+        if "daily" in mode_norm:
+            high = results_out.get("high", {}) if isinstance(results_out, dict) else {}
+            low = results_out.get("low", {}) if isinstance(results_out, dict) else {}
+            for k in ["base", "forest", "boost", "extra_trees", "meta", "consensus"]:
+                hv = high.get(k, {}) if isinstance(high, dict) else {}
+                lv = low.get(k, {}) if isinstance(low, dict) else {}
+                hp = hv.get("pred_price") if isinstance(hv, dict) else None
+                lp = lv.get("pred_price") if isinstance(lv, dict) else None
+                row[f"{k}_high_pred_price"] = hp
+                row[f"{k}_low_pred_price"] = lp
+                row[f"{k}_high_conf"] = hv.get("confidence") if isinstance(hv, dict) else None
+                row[f"{k}_low_conf"] = lv.get("confidence") if isinstance(lv, dict) else None
+                try:
+                    if hp is not None and np.isfinite(float(hp)):
+                        saw_numeric = True
+                except Exception:
+                    pass
+                try:
+                    if lp is not None and np.isfinite(float(lp)):
+                        saw_numeric = True
+                except Exception:
+                    pass
+        elif "week" in mode_norm:
+            week = results_out.get("week", {}) if isinstance(results_out, dict) else {}
+            for k in ["base", "forest", "boost", "extra_trees", "meta", "consensus"]:
+                wv = week.get(k, {}) if isinstance(week, dict) else {}
+                wp = wv.get("pred_price") if isinstance(wv, dict) else None
+                row[f"{k}_week_pred_price"] = wp
+                row[f"{k}_week_conf"] = wv.get("confidence") if isinstance(wv, dict) else None
+                try:
+                    if wp is not None and np.isfinite(float(wp)):
+                        saw_numeric = True
+                except Exception:
+                    pass
+        if not saw_numeric:
+            return
+
+        path = os.path.join(DATA_DIR, f"predictions_horizon_{instr}.csv")
+        fieldnames = list(row.keys())
+        if os.path.exists(path):
+            try:
+                with open(path, "r", newline="") as f:
+                    reader = csv.reader(f)
+                    existing_header = next(reader, None)
+                if existing_header:
+                    fieldnames = existing_header
+            except Exception:
+                pass
+        write_header = (not os.path.exists(path)) or (os.path.getsize(path) == 0)
+        row_to_write = {k: row.get(k) for k in fieldnames}
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row_to_write)
+    except Exception:
+        logger.exception("Failed to log horizon prediction")
+
+
+def _schedule_horizon_retrain_if_needed(instrument_key: str, metrics: dict | None):
+    if not AUTO_HORIZON_RETRAIN_ON_DRIFT:
+        return
+    if not isinstance(metrics, dict):
+        return
+    by_h = metrics.get("by_horizon", {})
+    if not isinstance(by_h, dict) or not by_h:
+        return
+    daily_drift = bool(by_h.get("daily_high", {}).get("drift_flag", False) or by_h.get("daily_low", {}).get("drift_flag", False))
+    week_drift = bool(by_h.get("weekend", {}).get("drift_flag", False))
+    if not (daily_drift or week_drift or bool(metrics.get("global_drift_flag", False))):
+        return
+
+    instr = str(instrument_key or SYMBOL)
+    now = datetime.now(timezone.utc)
+    cooldown_min = max(60, int(HORIZON_DRIFT_RETRAIN_COOLDOWN_MIN))
+    with _HORIZON_RETRAIN_LOCK:
+        last = _LAST_HORIZON_RETRAIN.get(instr)
+        if last is not None and (now - last).total_seconds() < (cooldown_min * 60.0):
+            return
+        if instr in _HORIZON_RETRAIN_IN_FLIGHT:
+            return
+        _HORIZON_RETRAIN_IN_FLIGHT.add(instr)
+        _LAST_HORIZON_RETRAIN[instr] = now
+
+    modes_filter = []
+    if daily_drift:
+        modes_filter.extend(["daily_high", "daily_low"])
+    if week_drift:
+        modes_filter.append("weekend")
+    if not modes_filter:
+        modes_filter = ["daily_high", "daily_low", "weekend"]
+
+    def _worker(target_instr: str, target_modes: list[str]):
+        try:
+            from data_fetch import update_price_data
+            from model_trainers import train_all_models
+
+            logger.warning("Horizon drift retrain started for %s (%s)", target_instr, ",".join(target_modes))
+            df = update_price_data(target_instr)
+            if df is not None and not df.empty:
+                train_all_models(
+                    df,
+                    instrument_key=target_instr,
+                    train_horizons=True,
+                    modes_filter=target_modes,
+                )
+                try:
+                    _MODEL_CACHE.pop((target_instr, True), None)
+                    _MODEL_CACHE.pop((target_instr, False), None)
+                except Exception:
+                    pass
+            logger.warning("Horizon drift retrain completed for %s", target_instr)
+        except Exception:
+            logger.exception("Horizon drift retrain failed for %s", target_instr)
+        finally:
+            with _HORIZON_RETRAIN_LOCK:
+                _HORIZON_RETRAIN_IN_FLIGHT.discard(target_instr)
+
+    th = threading.Thread(target=_worker, args=(instr, modes_filter), daemon=True)
+    th.start()
+
+
+def _schedule_horizon_accuracy_update(instrument_key: str):
+    instr = str(instrument_key or SYMBOL)
+    now = datetime.now(timezone.utc)
+    cooldown_sec = max(60, int(HORIZON_ACCURACY_UPDATE_COOLDOWN_SEC))
+    try:
+        last = _LAST_HORIZON_ACC_UPDATE.get(instr)
+        if last is not None and (now - last).total_seconds() < cooldown_sec:
+            return
+    except Exception:
+        pass
+    with _HORIZON_ACC_LOCK:
+        if instr in _HORIZON_ACC_IN_FLIGHT:
+            return
+        _HORIZON_ACC_IN_FLIGHT.add(instr)
+        _LAST_HORIZON_ACC_UPDATE[instr] = now
+
+    def _worker(target_instr: str):
+        try:
+            from horizon_accuracy_tracker import update_horizon_accuracy
+
+            metrics = update_horizon_accuracy(target_instr)
+            _schedule_horizon_retrain_if_needed(target_instr, metrics)
+        except Exception:
+            logger.debug("Horizon accuracy update failed", exc_info=True)
+        finally:
+            with _HORIZON_ACC_LOCK:
+                _HORIZON_ACC_IN_FLIGHT.discard(target_instr)
+
+    th = threading.Thread(target=_worker, args=(instr,), daemon=True)
+    th.start()
 
 def _safe_instrument_tag(instr_key: str) -> str:
     return str(instr_key or DEFAULT_INSTRUMENT).replace("/", "_").replace("\\", "_")
@@ -1080,6 +1706,9 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
     results = {}
     if df_latest is None or df_latest.empty:
         return results
+    df_latest, partial_dropped = _drop_incomplete_last_bar(df_latest, instrument_key=instrument_key)
+    if df_latest is None or df_latest.empty:
+        return {"error": "No complete bars available"}
     last_price = float(df_latest["close"].iloc[-1])
     instr_meta = _instrument_meta(instrument_key)
 
@@ -1092,8 +1721,12 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         return {"error": "Regime model invalid"}
 
     live_cal = _load_live_calibration(instrument_key) if LIVE_CALIBRATION else None
-    drift_flag = bool(live_cal.get("drift_flag", False)) if live_cal else False
+    drift_flag = bool(live_cal.get("drift_flag", False) or live_cal.get("recent_drift_flag", False)) if live_cal else False
     cal_stale = bool(live_cal.get("_stale", False)) if live_cal else False
+    try:
+        _schedule_fast_retrain_on_drift(instrument_key or SYMBOL, live_cal)
+    except Exception:
+        logger.debug("Drift retrain scheduler failed", exc_info=True)
 
     dominant_regime = rp.get("dominant_component", None)
     comp_probs = rp.get("component_probs", None)
@@ -1130,7 +1763,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         data_ts = last_ts.isoformat() if pd.notna(last_ts) else None
     except Exception:
         data_ts = None
-    results_out["_meta"] = {"data_ts": data_ts, "model_versions": {}, "staleness": stale}
+    results_out["_meta"] = {"data_ts": data_ts, "model_versions": {}, "staleness": stale, "partial_bar_dropped": bool(partial_dropped)}
     if critical_stale:
         guard_note = "No-trade guard: critical stale data"
         if stale_note:
@@ -1280,18 +1913,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
             reg_conf = 0.5
         prior_var = max(0.2, min(2.0, 0.6 + reg_conf))
         shrink = prior_var / (prior_var + (pred_std_norm ** 2))
-        pred_norm = pred_norm * shrink
-
-        # Predictions are trained on de-meaned targets; avoid inference-time bias correction
-        pred_norm_adj = pred_norm
-
-        # Calibrate p_up using signal-bucket calibration if available (use bias-adjusted signal)
-        p_correct_sig = _dynamic_confidence_by_sigbucket_from_payload(
-            pred_norm_adj, pred_std_norm, payload, model_key=key, instrument_key=instrument_key
-        )
-        p_up_sig = p_correct_sig if pred_norm_adj >= 0 else (1.0 - p_correct_sig)
-        p_up = 0.7 * combined_summary["p_up"] + 0.3 * p_up_sig
-        p_up = max(0.001, min(0.999, p_up))
+        pred_norm_adj = pred_norm * shrink
 
         # Regime support adjustment (boost confidence, not direction)
         try:
@@ -1308,7 +1930,31 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         pred_ret_adj = pred_norm_adj * current_vol if target_normed else pred_norm_adj
         max_abs_ret = _max_abs_ret_from_vol(current_vol, instr_meta)
         pred_ret_adj = max(-max_abs_ret, min(max_abs_ret, pred_ret_adj))
-        # No live bias correction in inference (keep predictions unbiased)
+
+        # Optional live bias correction (conservative, based on recent errors).
+        pred_ret_adj, bias_adj = _live_bias_adjustment(
+            live_cal, key, pred_ret_adj, max_abs_ret, drift_flag=drift_flag
+        )
+        if bias_adj != 0.0:
+            try:
+                if target_normed:
+                    pred_norm_adj += bias_adj / max(current_vol, 1e-9)
+                else:
+                    pred_norm_adj += bias_adj
+            except Exception:
+                pass
+            pred_ret_adj = max(-max_abs_ret, min(max_abs_ret, pred_ret_adj))
+        else:
+            bias_adj = 0.0
+
+        # Calibrate p_up using signal-bucket calibration if available (bias-adjusted signal)
+        p_correct_sig = _dynamic_confidence_by_sigbucket_from_payload(
+            pred_norm_adj, pred_std_norm, payload, model_key=key, instrument_key=instrument_key
+        )
+        p_up_sig = p_correct_sig if pred_norm_adj >= 0 else (1.0 - p_correct_sig)
+        p_up = 0.7 * combined_summary["p_up"] + 0.3 * p_up_sig
+        p_up = max(0.001, min(0.999, p_up))
+
         pred_price = _round_to_tick(last_price * (1.0 + pred_ret_adj), instr_meta)
 
         # Direction should reflect the displayed price move
@@ -1349,6 +1995,10 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         note_parts = []
         if stale_note:
             note_parts.append(stale_note)
+        if partial_dropped:
+            note_parts.append("Partial bar dropped")
+        if abs(bias_adj) > 1e-6:
+            note_parts.append(f"Bias adj {bias_adj * 10000.0:+.2f} bps")
         if low_conf:
             note_parts.append("Low confidence")
         if vol_guard:
@@ -1364,9 +2014,9 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
             "confidence": round(float(conf * 100.0), 2),
             "note": note,
             "pred_ret": float(pred_ret_adj),
-            "pred_norm": float(pred_norm),
+            "pred_norm": float(pred_norm_adj),
             "pred_std_norm": float(pred_std_norm),
-            "sig_bucket": "Strong" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak"
+            "sig_bucket": "Strong" if (abs(pred_norm_adj) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm_adj) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak"
         }
         model_preds.append((key, pred_ret_adj))
         # derive model weight from blended window performance
@@ -1379,7 +2029,9 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
                 except Exception:
                     mae = 1.0
                 blended_mae += win_weights.get(w, 1.0/3.0) * mae
-            per_model_weights[key] = 1.0 / (blended_mae + 1e-6)
+            base_w = 1.0 / (blended_mae + 1e-6)
+            base_w *= _live_model_weight_multiplier(live_cal, key)
+            per_model_weights[key] = max(1e-6, float(base_w))
         except Exception:
             per_model_weights[key] = 1.0
 
@@ -1427,20 +2079,35 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
             meta_ret = pred_meta_norm * meta_ewm_vol if meta_normed else pred_meta_norm
             max_abs = _max_abs_ret_from_vol(meta_ewm_vol, instr_meta)
             meta_ret = max(-max_abs, min(max_abs, meta_ret))
-            # No live bias correction in inference (keep predictions unbiased)
+            meta_ret, meta_bias_adj = _live_bias_adjustment(
+                live_cal, "meta", meta_ret, max_abs, drift_flag=drift_flag
+            )
+            if meta_bias_adj != 0.0:
+                try:
+                    if meta_normed:
+                        pred_meta_norm += meta_bias_adj / max(meta_ewm_vol, 1e-9)
+                    else:
+                        pred_meta_norm += meta_bias_adj
+                except Exception:
+                    pass
+                meta_ret = max(-max_abs, min(max_abs, meta_ret))
+            else:
+                meta_bias_adj = 0.0
             meta_price = _round_to_tick(last_price * (1.0 + meta_ret), instr_meta)
             results_out["meta"] = {
                 "direction": "UP" if pred_meta_norm >= 0 else "DOWN",
                 "pred_price": float(round(meta_price, 4)),
                 "confidence": round(float(conf_meta * 100.0), 2),
-                "note": "Meta ensemble",
+                "note": "Meta ensemble" + (f" | Bias adj {meta_bias_adj * 10000.0:+.2f} bps" if abs(meta_bias_adj) > 1e-6 else ""),
                 "pred_ret": float(meta_ret),
                 "pred_norm": float(pred_meta_norm),
                 "pred_std_norm": float(meta_resid),
                 "sig_bucket": "Strong" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 1.5 else "Medium" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 0.5 else "Weak"
             }
             model_preds.append(("meta", meta_ret))
-            per_model_weights["meta"] = 1.0 / (meta_resid + 1e-6)
+            meta_w = 1.0 / (meta_resid + 1e-6)
+            meta_w *= _live_model_weight_multiplier(live_cal, "meta")
+            per_model_weights["meta"] = max(1e-6, float(meta_w))
         except Exception:
             logger.debug("Meta prediction failed", exc_info=True)
 
@@ -1451,12 +2118,30 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
     try:
         total_w = sum(per_model_weights.values()) or len(model_preds)
         consensus_ret = 0.0
+        pred_vals = []
         for k, pred in model_preds:
             w = per_model_weights.get(k, 1.0)
             consensus_ret += pred * (w / total_w)
+            pred_vals.append(float(pred))
+        if pred_vals:
+            med_ret = float(np.median(pred_vals))
+            consensus_ret = (0.75 * float(consensus_ret)) + (0.25 * med_ret)
     except Exception:
         consensus_ret = float(np.mean([p for _, p in model_preds]))
+    # Optional bias correction on consensus signal (uses live calibration stats).
+    try:
+        max_abs_cons = _max_abs_ret_from_vol(meta_ewm_vol, instr_meta)
+    except Exception:
+        max_abs_cons = MAX_ABS_RET
+    consensus_ret, consensus_bias_adj = _live_bias_adjustment(
+        live_cal, "consensus", consensus_ret, max_abs_cons, drift_flag=drift_flag
+    )
+    if consensus_bias_adj != 0.0:
+        consensus_ret = max(-max_abs_cons, min(max_abs_cons, consensus_ret))
+    else:
+        consensus_bias_adj = 0.0
     combined_price = _round_to_tick(last_price * (1.0 + consensus_ret), instr_meta)
+    disagreement = 0.0
     try:
         disagreement = float(np.std([p for _, p in model_preds])) if len(model_preds) > 0 else 0.0
         max_abs = _max_abs_ret_from_vol(float(np.nanmean([abs(p) for _, p in model_preds]) or 0.0), instr_meta)
@@ -1478,14 +2163,71 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
             consensus_conf *= 0.85
     except Exception:
         consensus_conf = 50.0
-    consensus_dir = "UP" if combined_price > last_price else "DOWN" if combined_price < last_price else "-"
+
+    spread_frac = None
+    try:
+        if "ask" in df_latest.columns and "bid" in df_latest.columns:
+            spread = float(df_latest["ask"].iloc[-1] - df_latest["bid"].iloc[-1])
+            if spread > 0 and last_price > 0:
+                spread_frac = spread / last_price
+    except Exception:
+        spread_frac = None
+    cost_ret_est = _estimated_trade_cost_ret(last_price, instr_meta, spread_frac=spread_frac)
+    try:
+        min_edge_floor = max(0.0, float(LIVE_MIN_EDGE_BPS) / 10000.0)
+    except Exception:
+        min_edge_floor = 0.0
+    try:
+        unc_mult = max(0.0, float(LIVE_UNCERTAINTY_EDGE_MULT))
+    except Exception:
+        unc_mult = 0.0
+    uncertainty_penalty = unc_mult * max(0.0, disagreement)
+    edge_ret = abs(float(consensus_ret)) - (cost_ret_est + min_edge_floor + uncertainty_penalty)
+    conformal_band = _conformal_abs_error_threshold(live_cal, quantile=0.80, min_n=40)
+    conformal_block = bool(conformal_band is not None and abs(float(consensus_ret)) <= float(conformal_band))
+    if edge_ret <= 0.0:
+        consensus_conf = min(float(consensus_conf), 35.0)
+    else:
+        edge_scale = edge_ret / max(1e-6, (cost_ret_est + min_edge_floor))
+        conf_mult = max(0.35, min(1.15, 0.55 + (0.25 * edge_scale)))
+        consensus_conf *= conf_mult
+    if conformal_block:
+        consensus_conf = min(float(consensus_conf), 33.0)
+        edge_ret = min(float(edge_ret), float(abs(consensus_ret) - float(conformal_band)))
+    consensus_conf = max(1.0, min(99.0, float(consensus_conf)))
+
+    vote_dir = 0.0
+    vote_strength = 0.0
+    try:
+        total_w = sum(per_model_weights.values()) or len(model_preds)
+        vote_dir = float(sum(per_model_weights.get(k, 1.0) * np.sign(p) for k, p in model_preds))
+        vote_strength = abs(vote_dir) / max(float(total_w), 1e-9)
+    except Exception:
+        vote_dir = 0.0
+        vote_strength = 0.0
+    if vote_strength >= 0.12 and vote_dir != 0.0:
+        consensus_dir = "UP" if vote_dir > 0 else "DOWN"
+    else:
+        consensus_dir = "UP" if combined_price > last_price else "DOWN" if combined_price < last_price else "-"
     if consensus_conf / 100.0 < NO_SIGNAL_CONF:
+        consensus_dir = "-"
+    if edge_ret <= 0.0:
+        consensus_dir = "-"
+    if conformal_block:
         consensus_dir = "-"
     consensus_note = "Weighted consensus"
     if stale_note:
         consensus_note += f" | {stale_note}"
+    if partial_dropped:
+        consensus_note += " | Partial bar dropped"
+    if abs(consensus_bias_adj) > 1e-6:
+        consensus_note += f" | Bias adj {consensus_bias_adj * 10000.0:+.2f} bps"
     if consensus_dir == "-":
         consensus_note += " | Low confidence"
+    if edge_ret <= 0.0:
+        consensus_note += " | Cost-adjusted edge <= 0"
+    if conformal_block:
+        consensus_note += " | Conformal uncertainty band"
     if drift_flag:
         consensus_note += " | Drift guard"
     if cal_stale:
@@ -1534,6 +2276,12 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         position_size = max(0.0, min(1.0, size_vol * size_conf * reg_conf * align_score))
         if drift_flag:
             position_size *= 0.5
+        if consensus_dir == "-":
+            position_size = 0.0
+        if edge_ret <= 0.0:
+            position_size = 0.0
+        if conformal_block:
+            position_size = 0.0
     except Exception:
         position_size = 0.0
 
@@ -1542,7 +2290,13 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         "pred_price": float(round(combined_price, 4)),
         "confidence": round(float(consensus_conf), 2),
         "note": consensus_note,
-        "position_size": round(float(position_size), 3)
+        "position_size": round(float(position_size), 3),
+        "pred_ret": float(consensus_ret),
+        "edge_bps": round(float(edge_ret * 10000.0), 3),
+        "cost_bps_est": round(float(cost_ret_est * 10000.0), 3),
+        "disagreement_bps": round(float(disagreement * 10000.0), 3),
+        "conformal_band_bps": round(float(conformal_band * 10000.0), 3) if conformal_band is not None else None,
+        "sig_bucket": "Strong" if (abs(consensus_ret) / (disagreement + 1e-9)) >= 1.5 else "Medium" if (abs(consensus_ret) / (disagreement + 1e-9)) >= 0.5 else "Weak",
     }
 
     # Degenerate-output guard: near-identical model outputs are usually low-information snapshots.
@@ -2229,6 +2983,9 @@ def _predict_mode_group(models_group, df_latest, instrument_key, rp, dominant_re
 def predict_horizon(models_dict, df_latest, instrument_key: str = None, mode: str = "DailyHigh"):
     if df_latest is None or df_latest.empty:
         return {}
+    df_latest, _ = _drop_incomplete_last_bar(df_latest, instrument_key=instrument_key)
+    if df_latest is None or df_latest.empty:
+        return {"error": "No complete bars available"}
     stale = _staleness_info(df_latest, instrument_key=instrument_key)
     regime_payload = models_dict.get("regime")
     if not regime_payload:
@@ -2386,6 +3143,19 @@ def predict_horizon(models_dict, df_latest, instrument_key: str = None, mode: st
             last_price_override=last_price_feature,
             comp_probs=comp_probs
         )
+        # Keep high/low forecasts realistic by blending with historical session priors
+        # and enforcing a minimum daily range based on observed distributions.
+        try:
+            priors = _daily_range_priors(df_hist, instrument_key=instrument_key)
+            _enforce_daily_high_low_consistency(
+                high,
+                low,
+                base_price=last_price_feature,
+                instr_meta=instr_meta,
+                priors=priors,
+            )
+        except Exception:
+            logger.debug("Daily high/low consistency adjustment failed", exc_info=True)
         # Annotate notes to reflect cutoff
         for block in (high, low):
             try:
@@ -2409,7 +3179,18 @@ def predict_horizon(models_dict, df_latest, instrument_key: str = None, mode: st
             "target_session_date": target_meta,
             "feature_session_date": feature_meta
         }
-        return {"high": high, "low": low, "regime": rp, "meta": meta}
+        out_daily = {"high": high, "low": low, "regime": rp, "meta": meta}
+        try:
+            _log_horizon_prediction(
+                instrument_key=instrument_key,
+                last_price=last_price_feature,
+                mode="daily_high_low",
+                results_out=out_daily,
+            )
+            _schedule_horizon_accuracy_update(instrument_key or SYMBOL)
+        except Exception:
+            logger.debug("Daily horizon side-effects failed", exc_info=True)
+        return out_daily
 
     if mode_norm in ("weekend", "week_end", "week-end", "weekend_close", "week_end_close"):
         instr_meta = _instrument_meta(instrument_key)
@@ -2517,7 +3298,18 @@ def predict_horizon(models_dict, df_latest, instrument_key: str = None, mode: st
         except Exception:
             target_week_str = None
         meta = {"target_week": target_week_str, "feature_session_date": str(feature_session)}
-        return {"week": week, "regime": rp, "meta": meta}
+        out_week = {"week": week, "regime": rp, "meta": meta}
+        try:
+            _log_horizon_prediction(
+                instrument_key=instrument_key,
+                last_price=last_price_feature,
+                mode="weekend",
+                results_out=out_week,
+            )
+            _schedule_horizon_accuracy_update(instrument_key or SYMBOL)
+        except Exception:
+            logger.debug("Weekend horizon side-effects failed", exc_info=True)
+        return out_week
 
     # Unknown mode: return placeholders
     placeholder = {

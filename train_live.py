@@ -7,6 +7,7 @@ import pandas as pd
 
 from config import DEFAULT_INSTRUMENT, INSTRUMENTS, DATA_DIR
 from data_fetch import update_price_data
+from instrument_onboarding import ensure_runtime_instruments
 from model_trainers import train_all_models
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ def train_missing_models(instrument_key: str = None, online: bool = True, max_ru
     """
     instrument = instrument_key or DEFAULT_INSTRUMENT
     try:
+        ensure_runtime_instruments(force=False, auto_onboard=True)
         if online:
             df = update_price_data(instrument)
         else:
@@ -52,6 +54,7 @@ def train_missing_models(instrument_key: str = None, online: bool = True, max_ru
         return False
 
 def train_all_configured_instruments(online: bool = True, max_runtime_sec: float | None = None):
+    ensure_runtime_instruments(force=False, auto_onboard=True)
     ok = True
     for instrument in INSTRUMENTS.keys():
         logger.info("Training instrument %s", instrument)

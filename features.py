@@ -4,13 +4,28 @@ import numpy as np
 
 # Try to import INTERVAL from config; if not available, fall back to "1m"
 try:
-    from config import INTERVAL, TRANSACTION_COST_PER_TRADE, SLIPPAGE_PCT, INSTRUMENTS, DEFAULT_INSTRUMENT
+    from config import (
+        INTERVAL,
+        TRANSACTION_COST_PER_TRADE,
+        SLIPPAGE_PCT,
+        INSTRUMENTS,
+        DEFAULT_INSTRUMENT,
+        NEWS_PIPELINE_ENABLED,
+        NEWS_PIPELINE_SYMBOL,
+    )
 except Exception:
     INTERVAL = "1m"
     TRANSACTION_COST_PER_TRADE = 0.0003
     SLIPPAGE_PCT = 0.0005
     INSTRUMENTS = {}
     DEFAULT_INSTRUMENT = None
+    NEWS_PIPELINE_ENABLED = False
+    NEWS_PIPELINE_SYMBOL = "QQQ"
+
+try:
+    from news_pipeline import load_news_features_for_index
+except Exception:
+    load_news_features_for_index = None
 
 # ===== CONFIG =====
 # We'll target a 4-minute prediction horizon by default; compute bars from INTERVAL
@@ -27,10 +42,14 @@ DEFAULT_FEATURES = [
     "spread", "bid_ask_imbalance", "vwap_1h", "sma_1h", "sma_4h", "vwap_daily",
     # new features (added/extended)
     "vol_norm_ret", "atr_6", "vol_rolling_skew", "vol_rolling_kurt", "volume_imbalance", "hurst",
+    # robustness/realized-volatility
+    "rv_20", "robust_vol_20",
     # market structure + event intensity
     "range_1", "body_1", "dollar_vol_z", "roll_max_dist", "roll_min_dist", "cusum_intensity", "event_time_since",
     # normalization and session/futures-specific
-    "ret_1_norm", "overnight_gap", "session_volatility", "session_ret_from_open"
+    "ret_1_norm", "overnight_gap", "session_volatility", "session_ret_from_open",
+    # QQQ news sentiment context (lag-safe daily aggregates)
+    "news_sent_mean_d1", "news_sent_sum_d3", "news_headline_count_d1", "news_pos_ratio_d3", "news_neg_ratio_d3"
 ]
 LIVE_MAX_BARS = 2000  # cap live feature generation to keep UI responsive
 
@@ -128,6 +147,27 @@ BAR_MINUTES = _interval_minutes(INTERVAL)
 # number of bars per hour / day assuming typical US session 6.5h = 390 minutes
 HOUR_BARS = max(1, 60 // BAR_MINUTES)
 DAY_BARS = max(1, 390 // BAR_MINUTES)
+
+def _filter_extreme_moves(df: pd.DataFrame, instr_meta: dict | None = None) -> pd.DataFrame:
+    """
+    Drop obviously bad bars (feed glitches) to stabilize training targets.
+    This filter is only applied in training builders, not live inference.
+    """
+    if df is None or df.empty or "close" not in df.columns:
+        return df
+    series = pd.to_numeric(df["close"], errors="coerce")
+    ret = series.pct_change()
+    vol = ret.rolling(120, min_periods=30).std()
+    try:
+        vol_floor = float((instr_meta or {}).get("vol_floor", 0.00025))
+    except Exception:
+        vol_floor = 0.00025
+    vol = vol.clip(lower=vol_floor)
+    spike_mask = (ret.abs() > 0.18) | (ret.abs() > 12.0 * vol)
+    if spike_mask.any():
+        df = df.loc[~spike_mask].copy()
+    return df
+
 def _predict_bars_from_minutes(predict_minutes: int) -> int:
     try:
         pm = int(predict_minutes)
@@ -182,6 +222,39 @@ def _window_mask(minute_series, start_minute: int, end_minute: int):
     if start_minute <= end_minute:
         return (minute_series >= start_minute) & (minute_series <= end_minute)
     return (minute_series >= start_minute) | (minute_series <= end_minute)
+
+
+def _attach_news_features(df: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
+    cols = [
+        "news_sent_mean_d1",
+        "news_sent_sum_d3",
+        "news_headline_count_d1",
+        "news_pos_ratio_d3",
+        "news_neg_ratio_d3",
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0.0
+    if not NEWS_PIPELINE_ENABLED:
+        return df
+    symbol = str(instrument_key or DEFAULT_INSTRUMENT or "").upper()
+    if symbol != str(NEWS_PIPELINE_SYMBOL).upper():
+        return df
+    if load_news_features_for_index is None:
+        return df
+    try:
+        instr_meta = _get_instrument_meta(instrument_key)
+        tz = instr_meta.get("tz", "America/New_York")
+        aligned = load_news_features_for_index(symbol=symbol, index_utc=df.index, tz=tz)
+        if aligned is None or aligned.empty:
+            return df
+        for c in cols:
+            if c in aligned.columns:
+                df[c] = pd.to_numeric(aligned[c], errors="coerce").reindex(df.index).fillna(0.0)
+    except Exception:
+        # Keep feature contract stable even when news ingestion fails.
+        pass
+    return df
 
 def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
     df = df.copy()
@@ -292,7 +365,7 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
             phase_open = (mins_from_open >= 0) & (mins_from_open < 45)
             phase_close = (mins_to_close >= 0) & (mins_to_close <= 60)
             phase_lunch = _window_mask(minute_series, 11 * 60 + 30, 13 * 60 + 30)
-            # Gold/futures often react to US cash open even when trading overnight.
+            # Overnight-traded instruments often react to US cash open.
             phase_us_open = _window_mask(minute_series, 9 * 60 + 20, 10 * 60 + 30)
         else:
             rth_mask = _window_mask(minute_series, session_open_minute, session_close_minute)
@@ -403,6 +476,13 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
         df["ewm_vol"] = df["ret_1"].ewm(span=20, adjust=False).std().fillna(0.0)
     except Exception:
         df["ewm_vol"] = 0.0
+    try:
+        abs_ret = df["ret_1"].abs()
+        df["rv_20"] = np.sqrt(np.pi / 2.0) * abs_ret.rolling(20, min_periods=5).mean()
+        df["robust_vol_20"] = abs_ret.rolling(20, min_periods=5).median()
+    except Exception:
+        df["rv_20"] = 0.0
+        df["robust_vol_20"] = 0.0
     try:
         df["trend_strength"] = (df["ema_spread"].abs() / (df["ewm_vol"] + 1e-9)).fillna(0.0)
     except Exception:
@@ -551,6 +631,9 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
         df["cusum_intensity"] = 0.0
         df["event_time_since"] = 0.0
 
+    # News-driven context (QQQ only). Values remain zero for other symbols.
+    df = _attach_news_features(df, instrument_key=instrument_key)
+
     # Clip extreme feature values to stabilize training
     try:
         df["dollar_vol_z"] = df["dollar_vol_z"].clip(-5.0, 5.0)
@@ -590,8 +673,9 @@ def build_features_for_training(
 ) -> pd.DataFrame:
     """ Build features and training targets. Uses lagged/shifted computations to avoid lookahead leakage.
     Compute a triple-barrier-ish label by default. Also compute target price for regression. """
-    df = _build_base_features(df, instrument_key=instrument_key)
     instr_meta = _get_instrument_meta(instrument_key)
+    df = _filter_extreme_moves(df, instr_meta=instr_meta)
+    df = _build_base_features(df, instrument_key=instrument_key)
     if daily_horizon:
         try:
             has_ohlc_mask = df.get("_has_ohlc", pd.Series([False] * len(df), index=df.index)).astype(bool)

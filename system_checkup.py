@@ -12,6 +12,7 @@ import pandas as pd
 
 from config import INSTRUMENTS, DEFAULT_INSTRUMENT, DATA_DIR, CALIBRATION_MAX_AGE_DAYS
 from data_fetch import update_price_data
+from instrument_onboarding import ensure_runtime_instruments
 from model_utils import load_models, predict_4min, predict_horizon, _staleness_info
 from regime_model import extract_regime_pipeline
 
@@ -83,6 +84,17 @@ def _load_cached_prices(instr: str):
 
 def _load_calibration_state(instr: str):
     path = os.path.join(DATA_DIR, f"calibration_live_{instr}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _load_horizon_accuracy(instr: str):
+    path = os.path.join(DATA_DIR, f"horizon_accuracy_{instr}.json")
     if not os.path.exists(path):
         return None
     try:
@@ -199,6 +211,21 @@ def _check_instrument(instr: str, quick: bool = False, online: bool = False) -> 
         if cal_stale and report["status"] == "ok":
             report["status"] = "warn"
 
+    horizon_acc = _load_horizon_accuracy(instr)
+    if horizon_acc is None:
+        report["horizon_accuracy"] = {"status": "missing"}
+    else:
+        drift_flag = bool(horizon_acc.get("global_drift_flag", False))
+        report["horizon_accuracy"] = {
+            "status": "ok",
+            "drift_flag": drift_flag,
+            "last_update": horizon_acc.get("last_update"),
+            "newly_resolved_rows": horizon_acc.get("newly_resolved_rows"),
+            "by_horizon": horizon_acc.get("by_horizon", {}),
+        }
+        if drift_flag and report["status"] == "ok":
+            report["status"] = "warn"
+
     # Model load
     models = load_models(include_modes=(not quick), instrument_key=instr)
     required = ["base", "forest", "boost", "extra_trees", "regime"]
@@ -260,9 +287,13 @@ def _check_instrument(instr: str, quick: bool = False, online: bool = False) -> 
 
 
 def main():
+    try:
+        ensure_runtime_instruments(force=False, auto_onboard=True)
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="LightningTrader4000 system checkup")
     parser.add_argument("--instrument", default=DEFAULT_INSTRUMENT,
-                        help="Comma-separated instruments (e.g., QQQ,GCG26) or 'all'")
+                        help="Comma-separated instruments (e.g., QQQ,AAPL) or 'all'")
     parser.add_argument("--quick", action="store_true",
                         help="Skip daily/weekend checks for faster run.")
     parser.add_argument("--online", action="store_true",

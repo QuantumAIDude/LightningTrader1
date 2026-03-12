@@ -9,6 +9,7 @@ from data_fetch import update_price_data
 from config import AUTO_PREDICT_SECONDS, INSTRUMENTS, DEFAULT_INSTRUMENT
 from features import LIVE_MAX_BARS, BAR_MINUTES
 from model_trainers import train_all_models
+from instrument_onboarding import ensure_runtime_instruments, list_runtime_instruments
 import datetime
 import time
 import logging
@@ -46,6 +47,8 @@ class LightningGUI:
         self._pred_seq = 0
 
         self.executor = ThreadPoolExecutor(max_workers=2)
+        self._overview_last_refresh = 0.0
+        self._overview_refresh_sec = max(120, int(AUTO_PREDICT_SECONDS))
 
         # Top frame
         self.top_frame = tk.Frame(self.root, bg="#0f1724")
@@ -63,10 +66,16 @@ class LightningGUI:
 
         # Instrument selection
         self.instrument_var = tk.StringVar(value=DEFAULT_INSTRUMENT)
+        try:
+            ensure_runtime_instruments(force=True, auto_onboard=True)
+        except Exception:
+            pass
         instrument_frame = tk.Frame(self.top_frame, bg="#0f1724")
         instrument_frame.pack(side="left", padx=12)
         tk.Label(instrument_frame, text="Instrument:", bg="#0f1724", fg="white", font=self.small_font).pack(side="left", padx=(0,6))
-        choices = list(INSTRUMENTS.keys())
+        choices = list_runtime_instruments() or list(INSTRUMENTS.keys())
+        if choices and self.instrument_var.get() not in choices:
+            self.instrument_var.set(choices[0])
         self.instrument_menu = ttk.Combobox(instrument_frame, values=choices, textvariable=self.instrument_var, state="readonly", width=12)
         self.instrument_menu.pack(side="left")
         self.instrument_menu.bind("<<ComboboxSelected>>", self._on_instrument_change)
@@ -101,6 +110,32 @@ class LightningGUI:
         self.data_meta_var = tk.StringVar(value="Data: - | Last Bar: -")
         self.data_meta_label = tk.Label(self.summary_frame, textvariable=self.data_meta_var, font=self.small_font, fg="#cbd5f5", bg="#0f1724")
         self.data_meta_label.pack(side="right", padx=6)
+
+        # Instrument overview section: one row per symbol with all horizons.
+        self.overview_frame = tk.Frame(self.root, bg="#0f1724")
+        self.overview_frame.pack(fill="x", padx=12, pady=(0, 8))
+        self.overview_label = tk.Label(
+            self.overview_frame,
+            text="Instrument Overview (4min / Daily / WeekEnd)",
+            font=self.small_font,
+            fg="#e2e8f0",
+            bg="#0f1724",
+        )
+        self.overview_label.pack(anchor="w", padx=2, pady=(0, 3))
+        overview_cols = ("instrument", "four_min", "daily", "weekend", "status")
+        self.overview_tree = ttk.Treeview(self.overview_frame, columns=overview_cols, show="headings", height=5)
+        labels = {
+            "instrument": "Instrument",
+            "four_min": "4min",
+            "daily": "Daily High/Low",
+            "weekend": "WeekEnd",
+            "status": "Status",
+        }
+        for col in overview_cols:
+            self.overview_tree.heading(col, text=labels[col])
+            width = 190 if col == "instrument" else 240 if col in ("daily", "weekend") else 230
+            self.overview_tree.column(col, anchor=tk.CENTER, width=width)
+        self.overview_tree.pack(fill="x")
 
         # Treeview for 4min outputs
         columns_4min = ("model", "direction", "predicted_price", "confidence", "note")
@@ -154,6 +189,7 @@ class LightningGUI:
         self._ui_max_bars = self._compute_ui_max_bars()
         self.status("Initializing…")
         self._show_mode_ui()
+        self.refresh_overview_threaded()
         self._initial_loader_thread = threading.Thread(target=self._initial_model_waiter, daemon=True)
         self._initial_loader_thread.start()
 
@@ -213,6 +249,116 @@ class LightningGUI:
         self.status(f"Instrument changed to {self.instrument_var.get()}; reloading…")
         self.reload_once_threaded()
 
+    def _refresh_instrument_choices(self):
+        try:
+            ensure_runtime_instruments(force=False, auto_onboard=True)
+            choices = list_runtime_instruments()
+            if not choices:
+                choices = list(INSTRUMENTS.keys())
+        except Exception:
+            choices = list(INSTRUMENTS.keys())
+
+        def _apply():
+            try:
+                current = self.instrument_var.get()
+                self.instrument_menu.configure(values=choices)
+                if choices and current not in choices:
+                    self.instrument_var.set(choices[0])
+            except Exception:
+                pass
+
+        try:
+            self.root.after(0, _apply)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _fmt_price(v):
+        if isinstance(v, (int, float)):
+            return f"${float(v):,.2f}"
+        return "-"
+
+    def _compute_overview_rows(self):
+        rows = []
+        try:
+            ensure_runtime_instruments(force=False, auto_onboard=True)
+            symbols = list_runtime_instruments()
+        except Exception:
+            symbols = list(INSTRUMENTS.keys())
+        if not symbols:
+            return rows
+        for sym in symbols:
+            try:
+                models = load_models(instrument_key=sym)
+                df = update_price_data(sym)
+                if df is None or getattr(df, "empty", True):
+                    rows.append((sym, "-", "-", "-", "No data"))
+                    continue
+                if not models:
+                    rows.append((sym, "-", "-", "-", "No models"))
+                    continue
+
+                p4 = predict_4min(models, df, instrument_key=sym)
+                if isinstance(p4, dict) and p4.get("error"):
+                    four = "-"
+                    status = str(p4.get("error"))
+                else:
+                    c = p4.get("consensus", {}) if isinstance(p4, dict) else {}
+                    four = f"{self._fmt_price(c.get('pred_price'))} ({c.get('direction', '-')})"
+                    status = "OK"
+
+                pdaily = predict_horizon(models, df, instrument_key=sym, mode="DailyHigh")
+                daily = "-"
+                if isinstance(pdaily, dict) and not pdaily.get("error"):
+                    high_block = pdaily.get("high", {})
+                    low_block = pdaily.get("low", {})
+                    highs = [v.get("pred_price") for v in high_block.values() if isinstance(v, dict) and isinstance(v.get("pred_price"), (int, float))]
+                    lows = [v.get("pred_price") for v in low_block.values() if isinstance(v, dict) and isinstance(v.get("pred_price"), (int, float))]
+                    if highs or lows:
+                        high_avg = (sum(highs) / len(highs)) if highs else None
+                        low_avg = (sum(lows) / len(lows)) if lows else None
+                        if high_avg is not None and low_avg is not None:
+                            daily = f"H {self._fmt_price(high_avg)} / L {self._fmt_price(low_avg)}"
+                        elif high_avg is not None:
+                            daily = f"H {self._fmt_price(high_avg)}"
+                        elif low_avg is not None:
+                            daily = f"L {self._fmt_price(low_avg)}"
+
+                pweek = predict_horizon(models, df, instrument_key=sym, mode="WeekEnd")
+                week = "-"
+                if isinstance(pweek, dict) and not pweek.get("error"):
+                    block = pweek.get("week", {})
+                    vals = [v.get("pred_price") for v in block.values() if isinstance(v, dict) and isinstance(v.get("pred_price"), (int, float))]
+                    if vals:
+                        week = self._fmt_price(sum(vals) / len(vals))
+
+                rows.append((sym, four, daily, week, status))
+            except Exception:
+                rows.append((sym, "-", "-", "-", "Error"))
+        return rows
+
+    def _apply_overview_rows(self, rows):
+        try:
+            for i in self.overview_tree.get_children():
+                self.overview_tree.delete(i)
+            for row in rows:
+                self.overview_tree.insert("", "end", values=row)
+        except Exception:
+            pass
+
+    def refresh_overview_threaded(self):
+        def _job():
+            rows = self._compute_overview_rows()
+            self._overview_last_refresh = time.time()
+            try:
+                self.root.after(0, lambda: self._apply_overview_rows(rows))
+            except Exception:
+                pass
+        try:
+            self.executor.submit(_job)
+        except Exception:
+            logger.debug("Failed to schedule overview refresh", exc_info=True)
+
     def toggle_auto(self):
         self.status("Auto-refresh enabled" if self.auto_var.get() else "Auto-refresh disabled")
 
@@ -247,11 +393,13 @@ class LightningGUI:
                         self.models = models
                         self.df = self._trim_df_for_ui(update_price_data(selected))
                     self.root.after(0, self.run_prediction_and_refresh_ui)
+                    self.root.after(0, self.refresh_overview_threaded)
                     return
                 with self._lock:
                     self.models = models
                     self.df = self._trim_df_for_ui(update_price_data(selected))
                 self.root.after(0, self.run_prediction_and_refresh_ui)
+                self.root.after(0, self.refresh_overview_threaded)
                 self.status("Models loaded — predictions available")
                 return
             except Exception as e:
@@ -380,6 +528,7 @@ class LightningGUI:
                 self.models = models
                 self.df = self._trim_df_for_ui(df2)
             self.root.after(0, self.run_prediction_and_refresh_ui)
+            self.root.after(0, self.refresh_overview_threaded)
             self.status("Background training complete")
         except Exception:
             logger.exception("Background training failed")
@@ -401,6 +550,7 @@ class LightningGUI:
                     self.models = models
                     self.df = self._trim_df_for_ui(df)
                 self.root.after(0, self.run_prediction_and_refresh_ui)
+                self.root.after(0, self.refresh_overview_threaded)
                 self.status("Reload complete")
             except Exception:
                 logger.exception("Reload failed")
@@ -427,6 +577,7 @@ class LightningGUI:
                     self.models = models
                     self.df = self._trim_df_for_ui(df2)
                 self.root.after(0, self.run_prediction_and_refresh_ui)
+                self.root.after(0, self.refresh_overview_threaded)
                 self.status("Retrain complete")
             except Exception:
                 logger.exception("Retrain failed")
@@ -546,7 +697,7 @@ class LightningGUI:
             source = getattr(df_copy, "attrs", {}).get("data_source", "-")
         except Exception:
             source = "-"
-        if data_error == "no_live_futures_data":
+        if data_error:
             source = f"{source} (delayed)" if source else "delayed"
         payload["data_meta"] = f"Data: {source} | Last Bar: {last_ts_str}"
 
@@ -569,8 +720,6 @@ class LightningGUI:
                 label = model_name.replace("_", " ").title()
                 item = results.get(model_name, {})
                 note = item.get("note", "")
-                if data_error == "no_live_futures_data":
-                    note = "No live futures data"
                 pred_ret = item.get("pred_ret")
                 if isinstance(pred_ret, (float, int)):
                     move_note = f"Move {pred_ret * 10000.0:+.2f} bps"
@@ -628,8 +777,6 @@ class LightningGUI:
                     label = model_name.replace("_", " ").title()
                     item = high.get(model_name, {})
                     note = item.get("note", "")
-                    if data_error == "no_live_futures_data":
-                        note = "No live futures data"
                     pred_ret = item.get("pred_ret")
                     if isinstance(pred_ret, (float, int)):
                         move_note = f"Move {pred_ret * 10000.0:+.2f} bps"
@@ -644,8 +791,6 @@ class LightningGUI:
 
                     item_l = low.get(model_name, {})
                     note_l = item_l.get("note", "")
-                    if data_error == "no_live_futures_data":
-                        note_l = "No live futures data"
                     pred_ret_l = item_l.get("pred_ret")
                     if isinstance(pred_ret_l, (float, int)):
                         move_note_l = f"Move {pred_ret_l * 10000.0:+.2f} bps"
@@ -679,8 +824,6 @@ class LightningGUI:
                     label = model_name.replace("_", " ").title()
                     item = week.get(model_name, {})
                     note = item.get("note", "")
-                    if data_error == "no_live_futures_data":
-                        note = "No live futures data"
                     pred_ret = item.get("pred_ret")
                     if isinstance(pred_ret, (float, int)):
                         move_note = f"Move {pred_ret * 10000.0:+.2f} bps"
@@ -713,12 +856,6 @@ class LightningGUI:
 
         if df_copy is None or getattr(df_copy, "empty", True) or not models_copy:
             payload = self._build_waiting_payload(mode, "Waiting…")
-            try:
-                if df_copy is not None and hasattr(df_copy, "attrs"):
-                    if df_copy.attrs.get("data_error") == "no_live_futures_data":
-                        payload["status_messages"].append("No live futures data")
-            except Exception:
-                pass
             self.root.after(0, lambda: self._apply_prediction_payload(payload))
             return
 
@@ -772,6 +909,7 @@ class LightningGUI:
         while not self._stop_event.is_set():
             if self.auto_var.get():
                 try:
+                    self._refresh_instrument_choices()
                     selected = self.instrument_var.get()
                     df = update_price_data(selected)
                     models = load_models(instrument_key=selected)
@@ -779,6 +917,8 @@ class LightningGUI:
                         self.df = self._trim_df_for_ui(df)
                         self.models = models
                     self.root.after(0, self.run_prediction_and_refresh_ui)
+                    if (time.time() - self._overview_last_refresh) >= float(self._overview_refresh_sec):
+                        self.root.after(0, self.refresh_overview_threaded)
                 except Exception:
                     logger.exception("Background update error")
                     self.status("Background update error; see logs")

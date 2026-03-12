@@ -11,8 +11,13 @@ import json
 import os
 from datetime import datetime, timezone
 
-from config import INSTRUMENTS, DEFAULT_INSTRUMENT, MODEL_DIR
+import numpy as np
+import pandas as pd
+
+from config import INSTRUMENTS, DEFAULT_INSTRUMENT, MODEL_DIR, DATA_DIR
 from system_checkup import _check_instrument
+from data_fetch import update_price_data
+from model_trainers import walk_forward_validate
 
 
 def _ts_now() -> str:
@@ -38,6 +43,29 @@ def _parse_instruments(raw: str) -> list[str]:
     if not val or val.lower() == "all":
         return list(INSTRUMENTS.keys())
     return [s.strip() for s in val.split(",") if s.strip()]
+
+
+def _load_cached_prices(instr: str):
+    path = os.path.join(DATA_DIR, f"prices_{instr}.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+        df = df.sort_index()
+        return df
+    except Exception:
+        return None
+
+
+def _safe_mean(values):
+    try:
+        vals = [float(v) for v in (values or []) if v is not None and np.isfinite(float(v))]
+    except Exception:
+        vals = []
+    if not vals:
+        return None
+    return float(np.mean(vals))
 
 
 def main():
@@ -78,6 +106,41 @@ def main():
         "--report",
         default=None,
         help="Optional JSON report path.",
+    )
+    parser.add_argument(
+        "--require-backtest",
+        action="store_true",
+        help="Run walk-forward backtest checks and fail if quality thresholds are not met.",
+    )
+    parser.add_argument(
+        "--backtest-splits",
+        type=int,
+        default=8,
+        help="Walk-forward splits used when --require-backtest is enabled.",
+    )
+    parser.add_argument(
+        "--min-directional-acc",
+        type=float,
+        default=0.52,
+        help="Minimum mean directional accuracy on active trades for backtest gate.",
+    )
+    parser.add_argument(
+        "--min-net-return",
+        type=float,
+        default=0.0,
+        help="Minimum mean net return for backtest gate.",
+    )
+    parser.add_argument(
+        "--min-sharpe-like",
+        type=float,
+        default=0.0,
+        help="Minimum mean Sharpe-like metric for backtest gate.",
+    )
+    parser.add_argument(
+        "--min-active-fraction",
+        type=float,
+        default=0.03,
+        help="Minimum active-trade fraction to avoid degenerate always-flat strategies.",
     )
     args = parser.parse_args()
 
@@ -149,6 +212,56 @@ def main():
             pass
 
         rep["gate_failures"] = gate_failures
+
+        if args.require_backtest:
+            try:
+                if args.online:
+                    df_bt = update_price_data(instr)
+                else:
+                    df_bt = _load_cached_prices(instr)
+                if df_bt is None or df_bt.empty:
+                    gate_failures.append("Backtest gate: missing price data")
+                    rep["backtest"] = {"error": "No data"}
+                else:
+                    wf = walk_forward_validate(
+                        df_bt,
+                        n_splits=max(3, int(args.backtest_splits)),
+                        include_transaction_costs=True,
+                        instrument_key=instr,
+                    )
+                    folds = int(wf.get("folds", 0) or 0)
+                    mean_dir = _safe_mean(wf.get("directional_acc", []))
+                    mean_net = _safe_mean(wf.get("net_returns", []))
+                    mean_sharpe = _safe_mean(wf.get("sharpe_like", []))
+                    mean_active = _safe_mean(wf.get("active_fraction", []))
+                    rep["backtest"] = {
+                        "folds": folds,
+                        "directional_acc_mean": mean_dir,
+                        "net_return_mean": mean_net,
+                        "sharpe_like_mean": mean_sharpe,
+                        "active_fraction_mean": mean_active,
+                    }
+                    if folds < 3:
+                        gate_failures.append("Backtest gate: insufficient folds")
+                    if mean_dir is None or mean_dir < float(args.min_directional_acc):
+                        gate_failures.append(
+                            f"Backtest gate: directional_acc_mean {mean_dir} < {float(args.min_directional_acc):.3f}"
+                        )
+                    if mean_net is None or mean_net < float(args.min_net_return):
+                        gate_failures.append(
+                            f"Backtest gate: net_return_mean {mean_net} < {float(args.min_net_return):.6f}"
+                        )
+                    if mean_sharpe is None or mean_sharpe < float(args.min_sharpe_like):
+                        gate_failures.append(
+                            f"Backtest gate: sharpe_like_mean {mean_sharpe} < {float(args.min_sharpe_like):.4f}"
+                        )
+                    if mean_active is None or mean_active < float(args.min_active_fraction):
+                        gate_failures.append(
+                            f"Backtest gate: active_fraction_mean {mean_active} < {float(args.min_active_fraction):.3f}"
+                        )
+            except Exception as e:
+                gate_failures.append(f"Backtest gate: exception {e}")
+
         out["instruments"][instr] = rep
         if gate_failures:
             out["status"] = "fail"

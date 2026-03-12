@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+instrument_onboarding.py
+
+Runtime discovery and staged onboarding for new instruments.
+
+Workflow:
+1) Drop CSV files into data/new_instruments/<SYMBOL>.csv
+2) The onboarding pass normalizes + saves data to data/prices_<SYMBOL>.csv
+3) Instrument metadata is registered in data/instruments.json
+4) Models are bootstrapped (and optionally fully retrained) for the symbol
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+from datetime import datetime, timezone
+
+import pandas as pd
+
+from config import (
+    DATA_DIR,
+    INSTRUMENTS_FILE,
+    INSTRUMENTS,
+    AUTO_ONBOARD_FROM_STAGING,
+    AUTO_ONBOARD_BOOTSTRAP,
+    AUTO_ONBOARD_FULL_TRAIN,
+    AUTO_ONBOARD_COOLDOWN_SEC,
+    NEW_INSTRUMENTS_DIR,
+    NEW_INSTRUMENTS_PROCESSED_DIR,
+)
+
+logger = logging.getLogger(__name__)
+
+_LOCK = threading.RLock()
+_LAST_RUN_TS = 0.0
+_PROVIDER_SUFFIXES = {"alpaca", "yfinance", "auto", "ibkr"}
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9\.\-]{0,19}$")
+
+
+def _default_equity_meta(symbol: str) -> dict:
+    sym = str(symbol or "").upper()
+    return {
+        "type": "equity",
+        "alpaca": sym,
+        "yahoo": sym,
+        "tz": "America/New_York",
+        "session_open_minute": 9 * 60 + 30,
+        "session_close_minute": 16 * 60,
+        "tick_size": 0.01,
+        "vol_floor": 0.00025,
+        "max_abs_ret_mult": 6.0,
+        "stale_multiplier": 3.5,
+        "closed_max_stale_hours": 80.0,
+        "target_vol": 0.004,
+    }
+
+
+def _canonical_price_path(symbol: str) -> str:
+    safe = str(symbol or "").replace("/", "_").replace("\\", "_").upper()
+    return os.path.join(DATA_DIR, f"prices_{safe}.csv")
+
+
+def _load_registry_file(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        logger.exception("Failed reading instruments file")
+    return {}
+
+
+def _save_registry_file(path: str, payload: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def register_instrument(symbol: str, meta: dict | None = None, persist: bool = True) -> bool:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return False
+    entry = _default_equity_meta(sym)
+    if isinstance(meta, dict):
+        entry.update(meta)
+    added = sym not in INSTRUMENTS
+    INSTRUMENTS[sym] = entry
+    if persist:
+        payload = _load_registry_file(INSTRUMENTS_FILE)
+        payload[sym] = entry
+        _save_registry_file(INSTRUMENTS_FILE, payload)
+    return added
+
+
+def _symbol_from_price_filename(path: str) -> str | None:
+    name = os.path.basename(path)
+    m = re.fullmatch(r"prices_(.+)\.csv", name)
+    if not m:
+        return None
+    raw = str(m.group(1) or "")
+    if not raw:
+        return None
+    parts = raw.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].lower() in _PROVIDER_SUFFIXES:
+        return None
+    symbol = raw.upper().strip()
+    if not _SYMBOL_PATTERN.match(symbol):
+        return None
+    return symbol
+
+
+def refresh_registry_from_price_files() -> list[str]:
+    """Discover symbols from canonical price files and register missing entries."""
+    discovered = []
+    try:
+        names = os.listdir(DATA_DIR)
+    except Exception:
+        names = []
+    for name in names:
+        sym = _symbol_from_price_filename(name)
+        if not sym:
+            continue
+        if sym not in INSTRUMENTS:
+            register_instrument(sym, persist=True)
+            discovered.append(sym)
+    return sorted(set(discovered))
+
+
+def list_runtime_instruments() -> list[str]:
+    return sorted([str(k) for k in INSTRUMENTS.keys()])
+
+
+def _coerce_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    try:
+        if isinstance(out.columns, pd.MultiIndex):
+            out.columns = out.columns.get_level_values(0)
+    except Exception:
+        pass
+    out.columns = [str(c).strip().lower().replace(" ", "_") for c in out.columns]
+    # detect timestamp column
+    ts_col = None
+    for c in ("timestamp", "datetime", "date", "time"):
+        if c in out.columns:
+            ts_col = c
+            break
+    if ts_col is None:
+        # assume first column is timestamp
+        ts_col = out.columns[0]
+    out[ts_col] = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
+    out = out.dropna(subset=[ts_col]).set_index(ts_col)
+
+    # normalize common column names
+    if "adj_close" in out.columns and "close" not in out.columns:
+        out = out.rename(columns={"adj_close": "close"})
+    keep = [c for c in ("open", "high", "low", "close", "volume") if c in out.columns]
+    if "close" not in keep:
+        return pd.DataFrame()
+    out = out[keep].copy()
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna(subset=["close"])
+    if "open" not in out.columns:
+        out["open"] = out["close"]
+    if "high" not in out.columns:
+        out["high"] = out["close"]
+    if "low" not in out.columns:
+        out["low"] = out["close"]
+    if "volume" not in out.columns:
+        out["volume"] = 0.0
+    out["open"] = out["open"].fillna(out["close"])
+    out["high"] = out["high"].fillna(out["close"])
+    out["low"] = out["low"].fillna(out["close"])
+    out["volume"] = out["volume"].fillna(0.0)
+    out = out.sort_index()
+    try:
+        out = out[~out.index.duplicated(keep="last")]
+    except Exception:
+        pass
+    return out
+
+
+def _read_staged_csv(path: str) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        logger.exception("Failed reading staged instrument file: %s", path)
+        return pd.DataFrame()
+    return _coerce_ohlcv(df)
+
+
+def _safe_symbol_from_staged_filename(path: str) -> str | None:
+    base = os.path.splitext(os.path.basename(path))[0]
+    symbol = str(base).upper().strip()
+    if _SYMBOL_PATTERN.match(symbol):
+        return symbol
+    return None
+
+
+def _merge_price_frames(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    if existing is None or existing.empty:
+        return incoming
+    if incoming is None or incoming.empty:
+        return existing
+    merged = pd.concat([existing, incoming], axis=0, sort=False)
+    merged = merged[~merged.index.duplicated(keep="last")]
+    merged = merged.sort_index()
+    return merged
+
+
+def _read_existing_price_file(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+        df.columns = [str(c).lower() for c in df.columns]
+        return _coerce_ohlcv(df.reset_index().rename(columns={"index": "timestamp"}))
+    except Exception:
+        logger.exception("Failed reading existing price file: %s", path)
+        return pd.DataFrame()
+
+
+def _archive_staged_file(path: str, symbol: str):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    os.makedirs(NEW_INSTRUMENTS_PROCESSED_DIR, exist_ok=True)
+    out = os.path.join(NEW_INSTRUMENTS_PROCESSED_DIR, f"{symbol}_{ts}.csv")
+    try:
+        os.replace(path, out)
+    except Exception:
+        # Fallback: keep original file if move fails.
+        logger.exception("Failed moving staged file to processed folder: %s", path)
+
+
+def _models_exist_for_symbol(symbol: str) -> bool:
+    from model_utils import load_models
+
+    try:
+        models = load_models(instrument_key=symbol)
+    except Exception:
+        return False
+    required = ["base", "forest", "boost", "extra_trees", "regime"]
+    for key in required:
+        if models.get(key) is None:
+            return False
+    modes = models.get("modes", {}) if isinstance(models, dict) else {}
+    for mode in ("daily_high", "daily_low", "weekend"):
+        block = modes.get(mode, {})
+        if not isinstance(block, dict) or not block:
+            return False
+    return True
+
+
+def _train_symbol_if_needed(symbol: str, full_train: bool):
+    if _models_exist_for_symbol(symbol):
+        return
+    if AUTO_ONBOARD_BOOTSTRAP:
+        from bootstrap_models_fast import bootstrap_fast_models
+
+        bootstrap_fast_models(symbol)
+    if full_train:
+        from model_trainers import train_all_models
+
+        path = _canonical_price_path(symbol)
+        if os.path.exists(path):
+            df = pd.read_csv(path, index_col=0, parse_dates=True)
+            df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+            df = df.sort_index()
+            if not df.empty:
+                train_all_models(df, instrument_key=symbol, train_horizons=True)
+
+
+def process_staged_instrument_files(
+    auto_train: bool = True,
+    full_train: bool | None = None,
+) -> dict:
+    """
+    Ingest staged CSV files from NEW_INSTRUMENTS_DIR.
+    Returns a summary payload for diagnostics.
+    """
+    if full_train is None:
+        full_train = bool(AUTO_ONBOARD_FULL_TRAIN)
+    os.makedirs(NEW_INSTRUMENTS_DIR, exist_ok=True)
+    os.makedirs(NEW_INSTRUMENTS_PROCESSED_DIR, exist_ok=True)
+
+    staged = []
+    try:
+        staged = [
+            os.path.join(NEW_INSTRUMENTS_DIR, n)
+            for n in sorted(os.listdir(NEW_INSTRUMENTS_DIR))
+            if n.lower().endswith(".csv")
+        ]
+    except Exception:
+        staged = []
+
+    out = {"processed": [], "errors": []}
+    for path in staged:
+        symbol = _safe_symbol_from_staged_filename(path)
+        if not symbol:
+            out["errors"].append({"path": path, "error": "invalid_symbol_filename"})
+            continue
+        df_new = _read_staged_csv(path)
+        if df_new.empty:
+            out["errors"].append({"path": path, "symbol": symbol, "error": "invalid_or_empty_csv"})
+            continue
+        data_path = _canonical_price_path(symbol)
+        df_old = _read_existing_price_file(data_path)
+        df_all = _merge_price_frames(df_old, df_new)
+        if df_all.empty:
+            out["errors"].append({"path": path, "symbol": symbol, "error": "no_rows_after_merge"})
+            continue
+        df_all.to_csv(data_path, date_format="%Y-%m-%dT%H:%M:%SZ")
+        added = register_instrument(symbol, persist=True)
+        trained = False
+        if auto_train:
+            try:
+                _train_symbol_if_needed(symbol, full_train=bool(full_train))
+                trained = True
+            except Exception:
+                logger.exception("Auto-train failed for %s", symbol)
+        _archive_staged_file(path, symbol)
+        out["processed"].append(
+            {
+                "symbol": symbol,
+                "rows": int(len(df_all)),
+                "registered": bool(added),
+                "trained": bool(trained),
+                "path": data_path,
+            }
+        )
+    return out
+
+
+def ensure_runtime_instruments(force: bool = False, auto_onboard: bool = True) -> dict:
+    """
+    Periodically refresh runtime instruments from disk and optionally process staged files.
+    Cooldown avoids expensive work on every UI refresh.
+    """
+    global _LAST_RUN_TS
+    now = time.time()
+    with _LOCK:
+        if not force and (now - _LAST_RUN_TS) < max(5, int(AUTO_ONBOARD_COOLDOWN_SEC)):
+            return {"discovered": [], "onboarded": {"processed": [], "errors": []}, "skipped": True}
+        discovered = refresh_registry_from_price_files()
+        onboarded = {"processed": [], "errors": []}
+        if auto_onboard and AUTO_ONBOARD_FROM_STAGING:
+            onboarded = process_staged_instrument_files(auto_train=True, full_train=AUTO_ONBOARD_FULL_TRAIN)
+        _LAST_RUN_TS = now
+    return {"discovered": discovered, "onboarded": onboarded, "skipped": False}
+

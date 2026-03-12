@@ -11,12 +11,14 @@ logger = logging.getLogger(__name__)
 # configuration
 REGIME_N_COMPONENTS = 4  # default number of regimes to discover
 REGIME_FEATURES = [
-    "ret_1", "ret_6", "ret_24",
+    "ret_1", "ret_3", "ret_6", "ret_12", "ret_24",
     "vol_6", "vol_24",
-    "mom_6", "mom_24",
+    "mom_6", "mom_24", "mom_48",
     "kf_slope", "trend_strength", "ewm_vol",
+    "trend_z_24", "ret_accel_6_24", "vol_ratio_6_24",
     "vol_rolling_skew", "vol_rolling_kurt",
-    "session_volatility", "atr_6",
+    "session_volatility", "session_ret_from_open", "atr_6",
+    "tod_ret_mean", "wday_tod_ret_mean",
     "range_1", "roll_max_dist", "roll_min_dist", "dollar_vol_z", "cusum_intensity"
 ]
 
@@ -37,10 +39,14 @@ def build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().sort_index()
     if "ret_1" not in df.columns:
         df["ret_1"] = df["close"].pct_change()
+    if "ret_3" not in df.columns:
+        df["ret_3"] = df["close"].pct_change(3).fillna(0.0)
     if "vol_6" not in df.columns:
         df["vol_6"] = df["ret_1"].rolling(6).std().fillna(0.0)
     if "ret_6" not in df.columns:
         df["ret_6"] = df["close"].pct_change(6).fillna(0.0)
+    if "ret_12" not in df.columns:
+        df["ret_12"] = df["close"].pct_change(12).fillna(0.0)
     if "ret_24" not in df.columns:
         df["ret_24"] = df["close"].pct_change(24).fillna(0.0)
     if "vol_24" not in df.columns:
@@ -49,15 +55,29 @@ def build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
         df["mom_6"] = df["close"] - df["close"].shift(6)
     if "mom_24" not in df.columns:
         df["mom_24"] = df["close"] - df["close"].shift(24)
+    if "mom_48" not in df.columns:
+        df["mom_48"] = df["close"] - df["close"].shift(48)
 
     df["kf_slope"] = df.get("kf_slope", df["ret_1"] * 0.0).fillna(0.0)
     df["trend_strength"] = df.get("trend_strength", df["ret_1"] * 0.0).fillna(0.0)
     df["ewm_vol"] = df.get("ewm_vol", df["ret_1"].rolling(20).std()).fillna(0.0)
+    df["trend_z_24"] = (
+        df["ret_1"].rolling(24, min_periods=4).mean() /
+        (df["ret_1"].rolling(24, min_periods=4).std().replace(0, np.nan))
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df["ret_accel_6_24"] = (df.get("ret_6", 0.0) - df.get("ret_24", 0.0)).fillna(0.0)
+    df["vol_ratio_6_24"] = (df.get("vol_6", 0.0) / (df.get("vol_24", 0.0).replace(0, np.nan))).replace([np.inf, -np.inf], np.nan).fillna(1.0)
     df["vol_rolling_skew"] = df.get("vol_rolling_skew", df["ret_1"].rolling(24).skew()).fillna(0.0)
     df["vol_rolling_kurt"] = df.get("vol_rolling_kurt", df["ret_1"].rolling(24).kurt()).fillna(0.0)
     df["atr_6"] = df.get("atr_6", df["close"].diff().abs().rolling(6).mean()).fillna(0.0)
     if "session_volatility" not in df.columns:
         df["session_volatility"] = df["ret_1"].rolling(20).std().fillna(0.0)
+    if "session_ret_from_open" not in df.columns:
+        df["session_ret_from_open"] = 0.0
+    if "tod_ret_mean" not in df.columns:
+        df["tod_ret_mean"] = 0.0
+    if "wday_tod_ret_mean" not in df.columns:
+        df["wday_tod_ret_mean"] = 0.0
     if "range_1" not in df.columns:
         high = df["high"] if "high" in df.columns else df["close"]
         low = df["low"] if "low" in df.columns else df["close"]
@@ -87,7 +107,7 @@ def build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     if "cusum_intensity" not in df.columns:
         df["cusum_intensity"] = df["ret_1"].abs().rolling(24, min_periods=1).mean().fillna(0.0)
 
-    X = df[REGIME_FEATURES].fillna(0.0)
+    X = df[REGIME_FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return X
 
 def extract_regime_pipeline(payload):
@@ -284,9 +304,17 @@ def train_regime(df: pd.DataFrame, lookback_days: int = None):
         "scaler": scaler,
         "gmm": gmm
     }
-    return {"pipeline": pipeline, "map": comp_map, "detail": comp_detail, "stats": comp_stats, "transition": transition, "gmm": gmm}
+    return {
+        "pipeline": pipeline,
+        "map": comp_map,
+        "detail": comp_detail,
+        "stats": comp_stats,
+        "transition": transition,
+        "gmm": gmm,
+        "features": list(X.columns),
+    }
 
-def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 7):
+def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 6):
     """
     Given a regime payload and a dataframe, returns a dict of regime probabilities percentages.
     The payload is trained on the longer history; for the *current* regime probabilities we focus on a
@@ -318,9 +346,72 @@ def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 7):
         if df_recent is None or df_recent.empty:
             df_recent = df.copy().tail(24)
 
+        # Adaptive lookback: respond faster when short-horizon volatility/shift rises.
+        try:
+            ret_probe = pd.to_numeric(df_recent["close"], errors="coerce").pct_change().fillna(0.0)
+            rv_short = float(ret_probe.tail(max(6, bars_per_hour)).std())
+            rv_long = float(ret_probe.tail(max(24, bars_per_hour * 6)).std())
+            if np.isfinite(rv_short) and np.isfinite(rv_long) and rv_short > 1.35 * max(rv_long, 1e-8):
+                df_recent = df.tail(max(8, int(recent_bars * 0.55)))
+        except Exception:
+            pass
+
         Xr = build_regime_features(df_recent).fillna(0.0)
+        # Backward/forward compatibility: align inference features with scaler fit schema.
+        fit_features = None
+        try:
+            p_feats = payload.get("features") if isinstance(payload, dict) else None
+            if isinstance(p_feats, (list, tuple)) and len(p_feats) > 0:
+                fit_features = [str(c) for c in p_feats]
+        except Exception:
+            fit_features = None
+        if fit_features is None:
+            try:
+                s_feats = getattr(scaler, "feature_names_in_", None)
+                if s_feats is not None and len(s_feats) > 0:
+                    fit_features = [str(c) for c in list(s_feats)]
+            except Exception:
+                fit_features = None
+        if fit_features:
+            for c in fit_features:
+                if c not in Xr.columns:
+                    Xr[c] = 0.0
+            Xr = Xr[fit_features]
+        else:
+            try:
+                n_expected = int(getattr(scaler, "n_features_in_", 0) or 0)
+            except Exception:
+                n_expected = 0
+            if n_expected > 0 and Xr.shape[1] != n_expected:
+                if Xr.shape[1] > n_expected:
+                    Xr = Xr.iloc[:, :n_expected]
+                else:
+                    for i in range(n_expected - Xr.shape[1]):
+                        Xr[f"_pad_{i}"] = 0.0
         Xs = scaler.transform(Xr)
-        probs = gmm.predict_proba(Xs).mean(axis=0)  # average posterior over recent window
+        post = gmm.predict_proba(Xs)
+        # Exponentially weighted posterior (recent bars matter more) for faster adaptation.
+        try:
+            n = int(post.shape[0])
+            if n <= 1:
+                probs = post.mean(axis=0)
+                shock_score = 0.0
+            else:
+                close_probe = pd.to_numeric(df_recent["close"], errors="coerce").pct_change().fillna(0.0).values[-n:]
+                base_scale = float(np.nanstd(close_probe)) + 1e-9
+                recent_abs = float(np.nanmean(np.abs(close_probe[-max(3, n // 4):]))) if len(close_probe) else 0.0
+                shock_score = max(0.0, recent_abs / base_scale)
+                half_life = max(2.0, (0.28 * n) if shock_score > 1.35 else (0.55 * n))
+                idx = np.arange(n - 1, -1, -1, dtype=float)
+                w = np.exp(-np.log(2.0) * (idx / half_life))
+                w = np.where(np.isfinite(w), w, 0.0)
+                probs = np.average(post, axis=0, weights=w)
+                # Blend with very latest posterior; increase blend during shocks.
+                latest_w = 0.45 if shock_score > 1.35 else 0.25
+                probs = (1.0 - latest_w) * probs + latest_w * post[-1]
+        except Exception:
+            probs = post.mean(axis=0)
+            shock_score = 0.0
         # Transition smoothing based on last assignment
         try:
             last_comp = int(gmm.predict(Xs)[-1])
@@ -328,7 +419,8 @@ def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 7):
             if transition is not None and last_comp < transition.shape[0]:
                 trans_row = np.array(transition[last_comp], dtype=float)
                 if np.isfinite(trans_row).all():
-                    probs = 0.7 * probs + 0.3 * trans_row
+                    trans_w = 0.20 if shock_score > 1.35 else 0.30
+                    probs = (1.0 - trans_w) * probs + trans_w * trans_row
         except Exception:
             pass
 
@@ -428,6 +520,8 @@ def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 7):
         dominant_comp = int(np.argmax(probs))
         out["dominant_component"] = str(int(dominant_comp))
         out["component_probs"] = [float(p) for p in probs]
+        out["recent_window_bars"] = int(len(Xs))
+        out["shock_score"] = float(round(shock_score, 4))
         try:
             p = np.clip(probs, 1e-9, 1.0)
             entropy = float(-np.sum(p * np.log(p)) / np.log(len(p)))

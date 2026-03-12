@@ -11,8 +11,10 @@ from config import (
     DATA_DIR, SYMBOL, INTERVAL, MAX_HISTORY_DAYS,
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, DATA_PROVIDER,
     IB_GATEWAY_HOST, IB_GATEWAY_PORT, IB_CLIENT_ID, INSTRUMENTS,
-    YFINANCE_LOOKBACK_DAYS, YFINANCE_REFRESH_BUFFER_DAYS
+    YFINANCE_LOOKBACK_DAYS, YFINANCE_REFRESH_BUFFER_DAYS, NEWS_PIPELINE_SYMBOL
 )
+from instrument_onboarding import ensure_runtime_instruments
+from news_pipeline import maybe_refresh_news
 
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
@@ -470,8 +472,17 @@ def fetch_recent_intraday(symbol_key: str, retries=3, pause=3):
 
 def update_price_data(instr_key: str = None):
     with _DATA_LOCK:
+        try:
+            ensure_runtime_instruments(force=False, auto_onboard=True)
+        except Exception:
+            logger.debug("Runtime instrument refresh failed", exc_info=True)
         if instr_key is None:
             instr_key = SYMBOL
+        try:
+            if str(instr_key).upper() == str(NEWS_PIPELINE_SYMBOL).upper():
+                maybe_refresh_news(symbol=instr_key)
+        except Exception:
+            logger.debug("News refresh failed", exc_info=True)
 
         instr = INSTRUMENTS.get(instr_key, {})
         instr_type = instr.get("type", "equity")
