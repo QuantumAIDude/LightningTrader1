@@ -48,6 +48,9 @@ from config import (
     READINESS_ENFORCE_LIVE_GATE,
     READINESS_MIN_PASS_STREAK_DAYS,
     READINESS_MAX_AGE_HOURS,
+    REGIME_LOOK_HOURS_4MIN,
+    REGIME_LOOK_HOURS_DAILY,
+    REGIME_LOOK_HOURS_WEEKEND,
 )
 try:
     from config import LOG_PREDICTIONS
@@ -1832,7 +1835,11 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
     if not regime_payload:
         return {"error": "Regime model missing"}
     try:
-        rp = predict_regime_probs(regime_payload, df_latest)
+        rp = predict_regime_probs(
+            regime_payload,
+            df_latest,
+            recent_look_hours=max(1, int(REGIME_LOOK_HOURS_4MIN)),
+        )
     except Exception:
         return {"error": "Regime model invalid"}
 
@@ -1885,6 +1892,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         "model_versions": {},
         "staleness": stale,
         "partial_bar_dropped": bool(partial_dropped),
+        "regime_look_hours": int(REGIME_LOOK_HOURS_4MIN),
         "readiness_locked": bool(readiness_locked),
         "readiness_state": readiness_state if isinstance(readiness_state, dict) else None,
     }
@@ -3144,21 +3152,33 @@ def _predict_mode_group(models_group, df_latest, instrument_key, rp, dominant_re
         }
     return out
 
-def predict_horizon(models_dict, df_latest, instrument_key: str = None, mode: str = "DailyHigh"):
+def predict_horizon(
+    models_dict,
+    df_latest,
+    instrument_key: str = None,
+    mode: str = "DailyHigh",
+    log_side_effects: bool = True,
+):
     if df_latest is None or df_latest.empty:
         return {}
     df_latest, _ = _drop_incomplete_last_bar(df_latest, instrument_key=instrument_key)
     if df_latest is None or df_latest.empty:
         return {"error": "No complete bars available"}
     stale = _staleness_info(df_latest, instrument_key=instrument_key)
+    mode_norm = (mode or "DailyHigh").strip().lower()
     regime_payload = models_dict.get("regime")
     if not regime_payload:
         return {"error": "Regime model missing"}
     try:
-        rp = predict_regime_probs(regime_payload, df_latest)
+        if mode_norm in ("dailyhigh", "daily_high", "daily-high", "dailylow", "daily_low", "daily-low"):
+            look_hours = max(1, int(REGIME_LOOK_HOURS_DAILY))
+        elif mode_norm in ("weekend", "week_end", "week-end", "weekend_close", "week_end_close"):
+            look_hours = max(1, int(REGIME_LOOK_HOURS_WEEKEND))
+        else:
+            look_hours = max(1, int(REGIME_LOOK_HOURS_4MIN))
+        rp = predict_regime_probs(regime_payload, df_latest, recent_look_hours=look_hours)
     except Exception:
         return {"error": "Regime model invalid"}
-    mode_norm = (mode or "DailyHigh").strip().lower()
     # Determine dominant regime for regime-aware ensembles
     dominant_regime = rp.get("dominant_component", None)
     comp_probs = rp.get("component_probs", None)
@@ -3341,19 +3361,21 @@ def predict_horizon(models_dict, df_latest, instrument_key: str = None, mode: st
             feature_meta = str(feature_session)
         meta = {
             "target_session_date": target_meta,
-            "feature_session_date": feature_meta
+            "feature_session_date": feature_meta,
+            "regime_look_hours": int(look_hours),
         }
         out_daily = {"high": high, "low": low, "regime": rp, "meta": meta}
-        try:
-            _log_horizon_prediction(
-                instrument_key=instrument_key,
-                last_price=last_price_feature,
-                mode="daily_high_low",
-                results_out=out_daily,
-            )
-            _schedule_horizon_accuracy_update(instrument_key or SYMBOL)
-        except Exception:
-            logger.debug("Daily horizon side-effects failed", exc_info=True)
+        if log_side_effects:
+            try:
+                _log_horizon_prediction(
+                    instrument_key=instrument_key,
+                    last_price=last_price_feature,
+                    mode="daily_high_low",
+                    results_out=out_daily,
+                )
+                _schedule_horizon_accuracy_update(instrument_key or SYMBOL)
+            except Exception:
+                logger.debug("Daily horizon side-effects failed", exc_info=True)
         return out_daily
 
     if mode_norm in ("weekend", "week_end", "week-end", "weekend_close", "week_end_close"):
@@ -3461,18 +3483,23 @@ def predict_horizon(models_dict, df_latest, instrument_key: str = None, mode: st
             target_week_str = f"{target_week[0]}-W{target_week[1]}"
         except Exception:
             target_week_str = None
-        meta = {"target_week": target_week_str, "feature_session_date": str(feature_session)}
+        meta = {
+            "target_week": target_week_str,
+            "feature_session_date": str(feature_session),
+            "regime_look_hours": int(look_hours),
+        }
         out_week = {"week": week, "regime": rp, "meta": meta}
-        try:
-            _log_horizon_prediction(
-                instrument_key=instrument_key,
-                last_price=last_price_feature,
-                mode="weekend",
-                results_out=out_week,
-            )
-            _schedule_horizon_accuracy_update(instrument_key or SYMBOL)
-        except Exception:
-            logger.debug("Weekend horizon side-effects failed", exc_info=True)
+        if log_side_effects:
+            try:
+                _log_horizon_prediction(
+                    instrument_key=instrument_key,
+                    last_price=last_price_feature,
+                    mode="weekend",
+                    results_out=out_week,
+                )
+                _schedule_horizon_accuracy_update(instrument_key or SYMBOL)
+            except Exception:
+                logger.debug("Weekend horizon side-effects failed", exc_info=True)
         return out_week
 
     # Unknown mode: return placeholders
