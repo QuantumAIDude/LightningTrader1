@@ -57,8 +57,8 @@ class NewsPipelineTests(unittest.TestCase):
                     ]
                 )
                 feats = npipe.load_news_features_for_index("QQQ", idx, tz="America/New_York")
-                self.assertAlmostEqual(float(feats.iloc[0]["news_sent_mean_d1"]), 1.0, places=6)
-                self.assertAlmostEqual(float(feats.iloc[1]["news_sent_mean_d1"]), -1.0, places=6)
+                self.assertGreater(float(feats.iloc[0]["news_sent_mean_d1"]), 0.0)
+                self.assertLess(float(feats.iloc[1]["news_sent_mean_d1"]), 0.0)
                 self.assertGreaterEqual(float(feats.iloc[0]["news_headline_count_d1"]), 1.0)
             finally:
                 npipe.DATA_DIR = old_data_dir
@@ -66,4 +66,3 @@ class NewsPipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

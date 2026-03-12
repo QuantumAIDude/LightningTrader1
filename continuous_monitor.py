@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from config import INSTRUMENTS, DATA_DIR
 from instrument_onboarding import ensure_runtime_instruments
+from readiness_tracker import update_readiness_state
 from system_checkup import _check_instrument
 
 
@@ -75,6 +76,11 @@ def main():
         action="store_true",
         help="Exit non-zero on warnings as well as failures.",
     )
+    parser.add_argument(
+        "--update-readiness",
+        action="store_true",
+        help="Also run readiness tracker update (backtest-based, heavier).",
+    )
     args = parser.parse_args()
 
     instruments = _parse_instruments(args.instrument)
@@ -95,6 +101,12 @@ def main():
             continue
 
         rep = _check_instrument(instr, quick=args.quick, online=args.online)
+        readiness = None
+        if args.update_readiness:
+            try:
+                readiness = update_readiness_state(instr, online=args.online)
+            except Exception:
+                readiness = {"error": "readiness_update_failed"}
         status = str(rep.get("status", "fail")).lower()
         drift_flag = bool(rep.get("calibration", {}).get("drift_flag", False))
         horizon_drift = bool(rep.get("horizon_accuracy", {}).get("drift_flag", False))
@@ -103,6 +115,7 @@ def main():
         market_state = rep.get("data", {}).get("staleness", {}).get("market_state")
         diag = rep.get("predictions", {}).get("4min", {}).get("diagnostics", {})
         critical_stale = bool(diag.get("critical_stale", False)) if isinstance(diag, dict) else False
+        readiness_locked = bool(diag.get("readiness_locked", False)) if isinstance(diag, dict) else False
         diversity = diag.get("diversity", {}) if isinstance(diag, dict) else {}
         degenerate = bool(diversity.get("degenerate", False)) if isinstance(diversity, dict) else False
 
@@ -116,9 +129,11 @@ def main():
             "data_stale": stale,
             "market_state": market_state,
             "critical_stale": critical_stale,
+            "readiness_locked": readiness_locked,
             "degenerate_spread": degenerate,
             "last_ts": rep.get("data", {}).get("last_ts"),
             "latency_4min_s": rep.get("predictions", {}).get("4min_latency_s"),
+            "readiness": readiness,
         }
         _append_jsonl(args.event_log, event)
 
@@ -137,6 +152,8 @@ def main():
             _append_alert(args.alert_log, f"{instr} CALIBRATION_STALE calibration stats are stale")
         if critical_stale:
             _append_alert(args.alert_log, f"{instr} CRITICAL_STALE no-trade guard triggered")
+        if readiness_locked:
+            _append_alert(args.alert_log, f"{instr} READINESS_LOCK live gate not satisfied")
         if degenerate:
             _append_alert(args.alert_log, f"{instr} DEGENERATE_SPREAD near-identical model outputs")
 

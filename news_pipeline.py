@@ -31,6 +31,41 @@ _NEG_WORDS = {
     "investigation", "risk", "risks", "bearish", "decline", "declines", "selloff", "cut", "cuts",
     "warning", "warns", "slowdown", "loss", "losses", "headwind", "volatile", "uncertain",
 }
+_NEGATORS = {"no", "not", "never", "without", "hardly"}
+_INTENSIFIERS = {"strong", "sharply", "materially", "significantly", "record", "major"}
+
+# Tech relevance signals for QQQ-context headlines.
+_TECH_KEYWORDS = {
+    "ai", "semiconductor", "chip", "chips", "cloud", "software", "hardware", "datacenter",
+    "cybersecurity", "internet", "saas", "platform", "foundry", "gpu", "cpu", "bigtech", "nasdaq",
+    "technology", "tech",
+}
+_TECH_ENTITIES = {
+    "apple", "microsoft", "nvidia", "amazon", "alphabet", "google", "meta", "tesla",
+    "amd", "intel", "broadcom", "qualcomm", "adobe", "oracle", "salesforce", "netflix", "qqq",
+}
+
+_POS_PHRASES = {
+    "beats estimates": 1.25,
+    "beat estimates": 1.15,
+    "raises guidance": 1.20,
+    "raise guidance": 1.10,
+    "strong demand": 0.95,
+    "record revenue": 1.15,
+    "expands margin": 0.85,
+    "buyback": 0.65,
+}
+_NEG_PHRASES = {
+    "misses estimates": -1.25,
+    "missed estimates": -1.20,
+    "cuts guidance": -1.20,
+    "cut guidance": -1.10,
+    "antitrust probe": -1.10,
+    "regulatory probe": -0.95,
+    "weak demand": -0.95,
+    "supply constraints": -0.70,
+    "profit warning": -1.15,
+}
 
 
 def _news_path(symbol: str) -> str:
@@ -45,19 +80,79 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"[A-Za-z]+", str(text or "").lower())
 
 
-def score_headline_sentiment(headline: str) -> tuple[float, str]:
+def _phrase_score(text_norm: str) -> float:
+    score = 0.0
+    for phrase, w in _POS_PHRASES.items():
+        if phrase in text_norm:
+            score += float(w)
+    for phrase, w in _NEG_PHRASES.items():
+        if phrase in text_norm:
+            score += float(w)
+    return float(score)
+
+
+def _tech_relevance(headline: str, toks: list[str]) -> float:
+    text = str(headline or "").lower()
+    hit_terms = sum(1 for t in toks if t in _TECH_KEYWORDS or t in _TECH_ENTITIES)
+    entity_hits = sum(1 for e in _TECH_ENTITIES if e in text)
+    if hit_terms == 0 and entity_hits == 0:
+        return 0.0
+    base = min(1.0, 0.28 * float(hit_terms) + 0.30 * float(entity_hits))
+    # Headlines that mention the ETF explicitly are usually relevant.
+    if "qqq" in text or "nasdaq 100" in text:
+        base = min(1.0, base + 0.35)
+    return float(max(0.0, min(1.0, base)))
+
+
+def _headline_sentiment_detail(headline: str) -> dict:
     toks = _tokenize(headline)
     if not toks:
-        return 0.0, "neutral"
-    pos = sum(1 for t in toks if t in _POS_WORDS)
-    neg = sum(1 for t in toks if t in _NEG_WORDS)
-    denom = max(1, pos + neg)
-    score = float((pos - neg) / denom)
+        return {"score": 0.0, "label": "neutral", "relevance": 0.0, "tech_relevant": False}
+
+    text_norm = " ".join(toks)
+    score_raw = _phrase_score(text_norm)
+    for i, tok in enumerate(toks):
+        weight = 0.0
+        if tok in _POS_WORDS:
+            weight = 1.0
+        elif tok in _NEG_WORDS:
+            weight = -1.0
+        if weight == 0.0:
+            continue
+        prev = toks[i - 1] if i > 0 else ""
+        prev2 = toks[i - 2] if i > 1 else ""
+        if prev in _NEGATORS or prev2 in _NEGATORS:
+            weight *= -0.8
+        if prev in _INTENSIFIERS or prev2 in _INTENSIFIERS:
+            weight *= 1.2
+        score_raw += weight
+
+    norm = max(2.0, float(len(toks)) ** 0.65)
+    score = float(score_raw / norm)
+    relevance = _tech_relevance(headline, toks)
+    if relevance <= 0.0:
+        score = 0.0
+    else:
+        # Downweight weakly relevant stories.
+        score *= (0.45 + 0.55 * relevance)
+    score = float(max(-1.0, min(1.0, score)))
     if score > 0.15:
-        return score, "positive"
-    if score < -0.15:
-        return score, "negative"
-    return score, "neutral"
+        label = "positive"
+    elif score < -0.15:
+        label = "negative"
+    else:
+        label = "neutral"
+    return {
+        "score": float(score),
+        "label": label,
+        "relevance": float(relevance),
+        "tech_relevant": bool(relevance >= 0.25),
+    }
+
+
+def score_headline_sentiment(headline: str) -> tuple[float, str]:
+    detail = _headline_sentiment_detail(headline)
+    return float(detail["score"]), str(detail["label"])
 
 
 def _parse_item(item: dict, symbol: str) -> dict | None:
@@ -94,7 +189,7 @@ def _parse_item(item: dict, symbol: str) -> dict | None:
         ts = pd.NaT
     if pd.isna(ts):
         ts = pd.Timestamp.now(tz="UTC")
-    score, label = score_headline_sentiment(title)
+    sent = _headline_sentiment_detail(title)
     uid = str(base.get("id") or item.get("id") or item.get("uuid") or "") or None
     if uid is None:
         uid = f"{ts.isoformat()}|{title[:120]}"
@@ -105,8 +200,10 @@ def _parse_item(item: dict, symbol: str) -> dict | None:
         "headline": str(title),
         "source": str(source),
         "url": str(url) if url else None,
-        "sentiment_score": float(score),
-        "sentiment_label": label,
+        "sentiment_score": float(sent["score"]),
+        "sentiment_label": str(sent["label"]),
+        "relevance_score": float(sent["relevance"]),
+        "tech_relevant": int(1 if sent["tech_relevant"] else 0),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -248,6 +345,28 @@ def load_news_features_for_index(
         return pd.DataFrame(0.0, index=index_utc, columns=cols)
     df["sentiment_score"] = pd.to_numeric(df.get("sentiment_score"), errors="coerce").fillna(0.0)
     df["sentiment_label"] = df.get("sentiment_label", "neutral").astype(str).str.lower()
+    if "relevance_score" in df.columns:
+        df["relevance_score"] = pd.to_numeric(df.get("relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    else:
+        df["relevance_score"] = 0.0
+    # Backward compatibility: infer relevance when old rows lack relevance annotations.
+    if float(df["relevance_score"].abs().sum()) == 0.0 and "headline" in df.columns:
+        try:
+            df["relevance_score"] = df["headline"].astype(str).apply(
+                lambda h: float(_headline_sentiment_detail(h)["relevance"])
+            ).clip(0.0, 1.0)
+        except Exception:
+            pass
+    if "tech_relevant" in df.columns:
+        df["tech_relevant"] = pd.to_numeric(df.get("tech_relevant"), errors="coerce").fillna(0).astype(int)
+    else:
+        df["tech_relevant"] = (df["relevance_score"] >= 0.25).astype(int)
+    # Keep only relevant stories for QQQ signal extraction.
+    df = df[(df["tech_relevant"] > 0) | (df["relevance_score"] >= 0.25)].copy()
+    if df.empty:
+        return pd.DataFrame(0.0, index=index_utc, columns=cols)
+    # Relevance-weighted score reduces noise from loosely related articles.
+    df["sentiment_score"] = df["sentiment_score"] * (0.5 + 0.5 * df["relevance_score"])
     local_dt = df["published_at"].dt.tz_convert(tz)
     df["news_date"] = pd.to_datetime(local_dt.dt.date)
     grouped = df.groupby("news_date", sort=True)

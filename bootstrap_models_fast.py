@@ -138,6 +138,7 @@ def bootstrap_fast_models(instrument_key: str):
                 "ensemble_models": {},
                 "regime_models": {},
                 "horizon_models": {},
+                "performance": {},
                 "performance_mae": {},
                 "calibration": {},
                 "calibration_sig": {"Weak": 0.5, "Medium": 0.5, "Strong": 0.5},

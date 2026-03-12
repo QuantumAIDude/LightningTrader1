@@ -55,6 +55,8 @@ AUTO_WINDOW_SELECTION = os.environ.get("AUTO_WINDOW_SELECTION", "true").lower() 
 WINDOW_SELECTION_SPLITS = int(os.environ.get("WINDOW_SELECTION_SPLITS", "4"))
 # Purged/gapped split to reduce short-horizon leakage between train/test slices.
 TS_SPLIT_GAP_BARS = int(os.environ.get("TS_SPLIT_GAP_BARS", "2"))
+# Optimize window selection for deployability (directional edge / cost-aware net), not MAE alone.
+WINDOW_SELECTION_DEPLOY_METRIC = os.environ.get("WINDOW_SELECTION_DEPLOY_METRIC", "true").lower() in ("1", "true", "yes")
 
 def _parse_days_list(val: str, default: list[int]) -> list[int]:
     try:
@@ -147,10 +149,24 @@ AUTO_HORIZON_RETRAIN_ON_DRIFT = os.environ.get("AUTO_HORIZON_RETRAIN_ON_DRIFT", 
 HORIZON_DRIFT_RETRAIN_COOLDOWN_MIN = int(os.environ.get("HORIZON_DRIFT_RETRAIN_COOLDOWN_MIN", "360"))
 HORIZON_DRIFT_MIN_SAMPLES = int(os.environ.get("HORIZON_DRIFT_MIN_SAMPLES", "12"))
 HORIZON_ACCURACY_UPDATE_COOLDOWN_SEC = int(os.environ.get("HORIZON_ACCURACY_UPDATE_COOLDOWN_SEC", "900"))
+# Require enough realized horizon samples before adaptation logic is trusted.
+HORIZON_ADAPT_MIN_TOTAL_SAMPLES = int(os.environ.get("HORIZON_ADAPT_MIN_TOTAL_SAMPLES", "30"))
+HORIZON_ADAPT_MIN_SAMPLES_PER_HORIZON = int(os.environ.get("HORIZON_ADAPT_MIN_SAMPLES_PER_HORIZON", "8"))
 # QQQ tech-news pipeline
 NEWS_PIPELINE_ENABLED = os.environ.get("NEWS_PIPELINE_ENABLED", "true").lower() in ("1", "true", "yes")
 NEWS_PIPELINE_SYMBOL = os.environ.get("NEWS_PIPELINE_SYMBOL", "QQQ").upper()
 NEWS_REFRESH_COOLDOWN_SEC = int(os.environ.get("NEWS_REFRESH_COOLDOWN_SEC", "1800"))
+
+# Daily readiness report + live trade lock
+READINESS_ENFORCE_LIVE_GATE = os.environ.get("READINESS_ENFORCE_LIVE_GATE", "true").lower() in ("1", "true", "yes")
+READINESS_MIN_PASS_STREAK_DAYS = int(os.environ.get("READINESS_MIN_PASS_STREAK_DAYS", "3"))
+READINESS_MAX_AGE_HOURS = float(os.environ.get("READINESS_MAX_AGE_HOURS", "36"))
+READINESS_BACKTEST_SPLITS = int(os.environ.get("READINESS_BACKTEST_SPLITS", "6"))
+READINESS_MIN_DIRECTIONAL_ACC = float(os.environ.get("READINESS_MIN_DIRECTIONAL_ACC", "0.52"))
+READINESS_MIN_NET_RETURN = float(os.environ.get("READINESS_MIN_NET_RETURN", "0.0"))
+READINESS_MIN_SHARPE_LIKE = float(os.environ.get("READINESS_MIN_SHARPE_LIKE", "0.0"))
+READINESS_MIN_ACTIVE_FRACTION = float(os.environ.get("READINESS_MIN_ACTIVE_FRACTION", "0.03"))
+READINESS_MIN_FOLDS = int(os.environ.get("READINESS_MIN_FOLDS", "3"))
 # Daily/weekly horizon fetch (disable remote to keep UI fast/offline)
 ALLOW_REMOTE_DAILY = os.environ.get("ALLOW_REMOTE_DAILY", "false").lower() in ("1", "true", "yes")
 

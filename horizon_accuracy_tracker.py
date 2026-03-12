@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from config import DATA_DIR, INSTRUMENTS, HORIZON_DRIFT_MIN_SAMPLES
+from config import (
+    DATA_DIR,
+    INSTRUMENTS,
+    HORIZON_DRIFT_MIN_SAMPLES,
+    HORIZON_ADAPT_MIN_TOTAL_SAMPLES,
+    HORIZON_ADAPT_MIN_SAMPLES_PER_HORIZON,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -253,9 +259,11 @@ def _load_history(path: str) -> pd.DataFrame:
 
 def _compute_metrics(history: pd.DataFrame) -> dict:
     if history is None or history.empty:
-        return {"by_horizon": {}, "global_drift_flag": False}
+        return {"by_horizon": {}, "global_drift_flag": False, "sample_summary": {"total_samples": 0, "per_horizon_max_n": {}, "sample_sufficient": False}}
     by_h = {}
     global_drift = False
+    per_h_n = {}
+    total_samples = 0
     for horizon, df_h in history.groupby("horizon"):
         h_out = {"models": {}, "drift_flag": False}
         for model, df_m in df_h.groupby("model"):
@@ -291,8 +299,28 @@ def _compute_metrics(history: pd.DataFrame) -> dict:
                 "recent_mae": recent_mae,
                 "drift_flag": drift_flag,
             }
+        try:
+            n_vals = [int(v.get("n", 0)) for v in h_out["models"].values() if isinstance(v, dict)]
+            h_n = max(n_vals) if n_vals else 0
+        except Exception:
+            h_n = 0
+        per_h_n[horizon] = int(h_n)
+        total_samples += int(h_n)
         by_h[horizon] = h_out
-    return {"by_horizon": by_h, "global_drift_flag": bool(global_drift)}
+    min_total = max(1, int(HORIZON_ADAPT_MIN_TOTAL_SAMPLES))
+    min_per_h = max(1, int(HORIZON_ADAPT_MIN_SAMPLES_PER_HORIZON))
+    sample_sufficient = bool(total_samples >= min_total)
+    if sample_sufficient and per_h_n:
+        sample_sufficient = bool(any(int(v) >= min_per_h for v in per_h_n.values()))
+    return {
+        "by_horizon": by_h,
+        "global_drift_flag": bool(global_drift),
+        "sample_summary": {
+            "total_samples": int(total_samples),
+            "per_horizon_max_n": per_h_n,
+            "sample_sufficient": bool(sample_sufficient),
+        },
+    }
 
 
 def _latest_predictions_per_target(preds: pd.DataFrame) -> dict:
@@ -426,4 +454,3 @@ def update_horizon_accuracy(instrument_key: str) -> dict:
     state["last_update"] = now_iso
     _save_state(instrument_key, state)
     return metrics
-

@@ -43,6 +43,11 @@ from config import (
     AUTO_HORIZON_RETRAIN_ON_DRIFT,
     HORIZON_DRIFT_RETRAIN_COOLDOWN_MIN,
     HORIZON_ACCURACY_UPDATE_COOLDOWN_SEC,
+    HORIZON_ADAPT_MIN_TOTAL_SAMPLES,
+    HORIZON_ADAPT_MIN_SAMPLES_PER_HORIZON,
+    READINESS_ENFORCE_LIVE_GATE,
+    READINESS_MIN_PASS_STREAK_DAYS,
+    READINESS_MAX_AGE_HOURS,
 )
 try:
     from config import LOG_PREDICTIONS
@@ -88,6 +93,7 @@ _LAST_HORIZON_ACC_UPDATE = {}
 _HORIZON_RETRAIN_LOCK = threading.Lock()
 _HORIZON_RETRAIN_IN_FLIGHT = set()
 _LAST_HORIZON_RETRAIN = {}
+_READINESS_CACHE = {}
 
 def _interval_minutes(interval: str) -> int:
     interval = str(interval).strip().lower()
@@ -456,6 +462,7 @@ def _auto_train_extra_trees(instrument_key: str = None):
             "features": extra_feats,
             "ensemble_models": {},
             "regime_models": {},
+            "performance": {},
             "performance_mae": {},
             "calibration": {},
             "calibration_sig": {"Weak": 0.5, "Medium": 0.5, "Strong": 0.5},
@@ -768,15 +775,48 @@ def _window_weights(perf: dict):
     wins = ["short", "mid", "long"]
     weights = {}
     total = 0.0
-    for w in wins:
-        mae = perf.get(w, None) if isinstance(perf, dict) else None
+    perf = perf or {}
+
+    def _entry_stats(v):
+        if isinstance(v, dict):
+            try:
+                mae = float(v.get("mae", float("nan")))
+            except Exception:
+                mae = float("nan")
+            try:
+                dacc = float(v.get("dir_acc", float("nan")))
+            except Exception:
+                dacc = float("nan")
+            try:
+                netpb = float(v.get("net_per_bar", float("nan")))
+            except Exception:
+                netpb = float("nan")
+            try:
+                active = float(v.get("active_frac", float("nan")))
+            except Exception:
+                active = float("nan")
+            return mae, dacc, netpb, active
         try:
-            mae = float(mae)
-            if np.isnan(mae) or mae <= 0:
-                mae = 1.0
+            mae = float(v)
         except Exception:
+            mae = float("nan")
+        return mae, float("nan"), float("nan"), float("nan")
+
+    for w in wins:
+        mae, dacc, netpb, active = _entry_stats(perf.get(w, None))
+        if not np.isfinite(mae) or mae <= 0:
             mae = 1.0
         weight = 1.0 / (mae + 1e-6)
+        # Deployability-aware weighting when richer diagnostics exist.
+        if np.isfinite(dacc):
+            weight *= max(0.60, min(1.60, dacc / 0.52))
+        if np.isfinite(netpb):
+            weight *= max(0.40, min(1.80, 1.0 + (netpb / 0.0002)))
+        if np.isfinite(active):
+            if active < 0.03:
+                weight *= 0.75
+            elif active > 0.70:
+                weight *= 0.85
         weights[w] = weight
         total += weight
     if total <= 0:
@@ -934,7 +974,7 @@ def _predict_horizon_norm(models_dict, df_latest, horizon_minutes: int, instrume
         if X is None or X.empty:
             continue
         ensemble_map = h_payload.get("ensemble_models", {}) if h_payload else {}
-        perf = h_payload.get("performance_mae", {}) if h_payload else {}
+        perf = h_payload.get("performance", h_payload.get("performance_mae", {})) if h_payload else {}
         win_weights = _window_weights(perf)
         combined = None
         combined_weight = 0.0
@@ -1341,8 +1381,37 @@ def _schedule_horizon_retrain_if_needed(instrument_key: str, metrics: dict | Non
     by_h = metrics.get("by_horizon", {})
     if not isinstance(by_h, dict) or not by_h:
         return
+    # Require sufficient realized samples before trusting horizon drift signals.
+    try:
+        total_samples = 0
+        horizon_counts = {}
+        for h_name, h_payload in by_h.items():
+            models = h_payload.get("models", {}) if isinstance(h_payload, dict) else {}
+            n_vals = []
+            for m_payload in models.values():
+                if not isinstance(m_payload, dict):
+                    continue
+                try:
+                    n_vals.append(int(m_payload.get("n", 0)))
+                except Exception:
+                    continue
+            h_n = max(n_vals) if n_vals else 0
+            horizon_counts[h_name] = int(h_n)
+            total_samples += int(h_n)
+        min_total = max(1, int(HORIZON_ADAPT_MIN_TOTAL_SAMPLES))
+        min_per_h = max(1, int(HORIZON_ADAPT_MIN_SAMPLES_PER_HORIZON))
+        if total_samples < min_total:
+            return
+    except Exception:
+        horizon_counts = {}
+        min_per_h = 1
     daily_drift = bool(by_h.get("daily_high", {}).get("drift_flag", False) or by_h.get("daily_low", {}).get("drift_flag", False))
     week_drift = bool(by_h.get("weekend", {}).get("drift_flag", False))
+    if daily_drift:
+        if int(horizon_counts.get("daily_high", 0)) < min_per_h and int(horizon_counts.get("daily_low", 0)) < min_per_h:
+            daily_drift = False
+    if week_drift and int(horizon_counts.get("weekend", 0)) < min_per_h:
+        week_drift = False
     if not (daily_drift or week_drift or bool(metrics.get("global_drift_flag", False))):
         return
 
@@ -1427,6 +1496,51 @@ def _schedule_horizon_accuracy_update(instrument_key: str):
     th = threading.Thread(target=_worker, args=(instr,), daemon=True)
     th.start()
 
+
+def _load_readiness_state_cached(instrument_key: str):
+    if not READINESS_ENFORCE_LIVE_GATE:
+        return None
+    instr = str(instrument_key or SYMBOL)
+    now = datetime.now(timezone.utc)
+    cached = _READINESS_CACHE.get(instr)
+    if isinstance(cached, dict):
+        ts = cached.get("ts")
+        if isinstance(ts, datetime):
+            if (now - ts).total_seconds() < 300:
+                return cached.get("state")
+    try:
+        from readiness_tracker import load_readiness_state
+
+        state = load_readiness_state(instr)
+    except Exception:
+        state = None
+    _READINESS_CACHE[instr] = {"ts": now, "state": state}
+    return state
+
+
+def _readiness_locked_state(instrument_key: str):
+    """
+    Returns (locked: bool, reason: str, state: dict|None).
+    """
+    if not READINESS_ENFORCE_LIVE_GATE:
+        return False, "", None
+    state = _load_readiness_state_cached(instrument_key or SYMBOL)
+    if not isinstance(state, dict):
+        req = max(1, int(READINESS_MIN_PASS_STREAK_DAYS))
+        return True, f"Readiness gate locked (no report; need {req}d pass streak)", None
+    fresh = bool(state.get("fresh", False))
+    live_ready = bool(state.get("live_ready", False))
+    streak = int(state.get("pass_streak_days", 0) or 0)
+    req = int(state.get("required_streak_days", max(1, int(READINESS_MIN_PASS_STREAK_DAYS))))
+    if not fresh:
+        return True, (
+            f"Readiness gate locked (report stale > {float(READINESS_MAX_AGE_HOURS):.0f}h; "
+            f"streak {streak}/{req})"
+        ), state
+    if not live_ready:
+        return True, f"Readiness gate locked (streak {streak}/{req})", state
+    return False, "", state
+
 def _safe_instrument_tag(instr_key: str) -> str:
     return str(instr_key or DEFAULT_INSTRUMENT).replace("/", "_").replace("\\", "_")
 
@@ -1484,6 +1598,7 @@ def _load_mode_models(mode: str, instrument_key: str = None):
         payload.setdefault("regime_models", payload.get("regime_models", {}))
         payload.setdefault("horizon_models", payload.get("horizon_models", {}))
         payload.setdefault("meta", payload.get("meta", {}))
+        payload.setdefault("performance", payload.get("performance", payload.get("performance_mae", {})))
         payload.setdefault("performance_mae", payload.get("performance_mae", {}))
         payload.setdefault("calibration", payload.get("calibration", {}))
         payload.setdefault("calibration_sig", payload.get("calibration_sig", {"Weak":0.5,"Medium":0.5,"Strong":0.5}))
@@ -1539,6 +1654,7 @@ def load_models(include_modes: bool = True, instrument_key: str = None):
         payload.setdefault("regime_models", payload.get("regime_models", {}))
         payload.setdefault("horizon_models", payload.get("horizon_models", {}))
         payload.setdefault("meta", payload.get("meta", {}))
+        payload.setdefault("performance", payload.get("performance", payload.get("performance_mae", {})))
         payload.setdefault("performance_mae", payload.get("performance_mae", {}))
         payload.setdefault("calibration", payload.get("calibration", {}))
         payload.setdefault("calibration_sig", payload.get("calibration_sig", {"Weak":0.5,"Medium":0.5,"Strong":0.5}))
@@ -1723,6 +1839,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
     live_cal = _load_live_calibration(instrument_key) if LIVE_CALIBRATION else None
     drift_flag = bool(live_cal.get("drift_flag", False) or live_cal.get("recent_drift_flag", False)) if live_cal else False
     cal_stale = bool(live_cal.get("_stale", False)) if live_cal else False
+    readiness_locked, readiness_reason, readiness_state = _readiness_locked_state(instrument_key or SYMBOL)
     try:
         _schedule_fast_retrain_on_drift(instrument_key or SYMBOL, live_cal)
     except Exception:
@@ -1763,7 +1880,14 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         data_ts = last_ts.isoformat() if pd.notna(last_ts) else None
     except Exception:
         data_ts = None
-    results_out["_meta"] = {"data_ts": data_ts, "model_versions": {}, "staleness": stale, "partial_bar_dropped": bool(partial_dropped)}
+    results_out["_meta"] = {
+        "data_ts": data_ts,
+        "model_versions": {},
+        "staleness": stale,
+        "partial_bar_dropped": bool(partial_dropped),
+        "readiness_locked": bool(readiness_locked),
+        "readiness_state": readiness_state if isinstance(readiness_state, dict) else None,
+    }
     if critical_stale:
         guard_note = "No-trade guard: critical stale data"
         if stale_note:
@@ -1854,7 +1978,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
 
         ensemble_map = payload.get("ensemble_models", {}) if payload else {}
         regime_map = payload.get("regime_models", {}) if payload else {}
-        perf = payload.get("performance_mae", {}) if payload else {}
+        perf = payload.get("performance", payload.get("performance_mae", {})) if payload else {}
         win_weights = _window_weights(perf)
 
         combined_summary = None
@@ -2022,14 +2146,45 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         # derive model weight from blended window performance
         try:
             blended_mae = 0.0
+            deploy_mult = 1.0
             for w in ["short", "mid", "long"]:
-                mae = perf.get(w, 1.0) if isinstance(perf, dict) else 1.0
-                try:
-                    mae = float(mae) if mae is not None else 1.0
-                except Exception:
+                entry = perf.get(w, 1.0) if isinstance(perf, dict) else 1.0
+                if isinstance(entry, dict):
+                    try:
+                        mae = float(entry.get("mae", 1.0))
+                    except Exception:
+                        mae = 1.0
+                    try:
+                        dacc = float(entry.get("dir_acc", float("nan")))
+                    except Exception:
+                        dacc = float("nan")
+                    try:
+                        netpb = float(entry.get("net_per_bar", float("nan")))
+                    except Exception:
+                        netpb = float("nan")
+                    try:
+                        active = float(entry.get("active_frac", float("nan")))
+                    except Exception:
+                        active = float("nan")
+                    if np.isfinite(dacc):
+                        deploy_mult *= max(0.70, min(1.35, dacc / 0.52))
+                    if np.isfinite(netpb):
+                        deploy_mult *= max(0.65, min(1.40, 1.0 + (netpb / 0.00025)))
+                    if np.isfinite(active):
+                        if active < 0.03:
+                            deploy_mult *= 0.85
+                        elif active > 0.70:
+                            deploy_mult *= 0.90
+                else:
+                    try:
+                        mae = float(entry) if entry is not None else 1.0
+                    except Exception:
+                        mae = 1.0
+                if not np.isfinite(mae) or mae <= 0:
                     mae = 1.0
                 blended_mae += win_weights.get(w, 1.0/3.0) * mae
             base_w = 1.0 / (blended_mae + 1e-6)
+            base_w *= max(0.50, min(2.0, deploy_mult))
             base_w *= _live_model_weight_multiplier(live_cal, key)
             per_model_weights[key] = max(1e-6, float(base_w))
         except Exception:
@@ -2215,6 +2370,8 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         consensus_dir = "-"
     if conformal_block:
         consensus_dir = "-"
+    if readiness_locked:
+        consensus_dir = "-"
     consensus_note = "Weighted consensus"
     if stale_note:
         consensus_note += f" | {stale_note}"
@@ -2232,6 +2389,8 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
         consensus_note += " | Drift guard"
     if cal_stale:
         consensus_note += " | Calibration stale"
+    if readiness_locked and readiness_reason:
+        consensus_note += f" | {readiness_reason}"
     # Horizon alignment (optional)
     h10 = _predict_horizon_norm(
         models_dict,
@@ -2282,8 +2441,13 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None):
             position_size = 0.0
         if conformal_block:
             position_size = 0.0
+        if readiness_locked:
+            position_size = 0.0
     except Exception:
         position_size = 0.0
+
+    if readiness_locked:
+        consensus_conf = min(float(consensus_conf), 33.0)
 
     results_out["consensus"] = {
         "direction": consensus_dir,
@@ -2814,7 +2978,7 @@ def _predict_weekend_close_from_history(df, last_ts, last_price, instrument_key=
 def _ensemble_summary_for_payload(payload, X, dominant_regime=None, dom_prob=0.0, comp_probs=None):
     ensemble_map = payload.get("ensemble_models", {}) if payload else {}
     regime_map = payload.get("regime_models", {}) if payload else {}
-    perf = payload.get("performance_mae", {}) if payload else {}
+    perf = payload.get("performance", payload.get("performance_mae", {})) if payload else {}
     win_weights = _window_weights(perf)
     combined_summary = None
     combined_weight = 0.0

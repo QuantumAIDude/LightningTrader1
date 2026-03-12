@@ -10,7 +10,14 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from config import INSTRUMENTS, DEFAULT_INSTRUMENT, DATA_DIR, CALIBRATION_MAX_AGE_DAYS
+from config import (
+    INSTRUMENTS,
+    DEFAULT_INSTRUMENT,
+    DATA_DIR,
+    CALIBRATION_MAX_AGE_DAYS,
+    NEWS_PIPELINE_ENABLED,
+    NEWS_PIPELINE_SYMBOL,
+)
 from data_fetch import update_price_data
 from instrument_onboarding import ensure_runtime_instruments
 from model_utils import load_models, predict_4min, predict_horizon, _staleness_info
@@ -40,7 +47,9 @@ def _summarize_prediction_block(res_block: dict) -> dict:
         "consensus": res_block.get("consensus"),
         "diagnostics": {
             "critical_stale": bool(meta.get("critical_stale", False)),
-            "diversity": meta.get("diversity")
+            "diversity": meta.get("diversity"),
+            "readiness_locked": bool(meta.get("readiness_locked", False)),
+            "readiness_state": meta.get("readiness_state"),
         }
     }
     for key in ["base", "forest", "boost", "extra_trees", "meta"]:
@@ -102,6 +111,71 @@ def _load_horizon_accuracy(instr: str):
             return json.load(f)
     except Exception:
         return None
+
+
+def _load_news_health(instr: str) -> dict:
+    out = {
+        "enabled": bool(NEWS_PIPELINE_ENABLED),
+        "symbol": str(NEWS_PIPELINE_SYMBOL).upper(),
+        "status": "not_applicable",
+    }
+    if not NEWS_PIPELINE_ENABLED:
+        out["status"] = "disabled"
+        return out
+    if str(instr).upper() != str(NEWS_PIPELINE_SYMBOL).upper():
+        return out
+    path = os.path.join(DATA_DIR, f"news_{str(instr).upper()}.csv")
+    if not os.path.exists(path):
+        out.update({"status": "missing", "rows": 0})
+        return out
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        out.update({"status": "error", "rows": 0})
+        return out
+    if df is None or df.empty:
+        out.update({"status": "missing", "rows": 0})
+        return out
+    rows = int(len(df))
+    df["published_at"] = pd.to_datetime(df.get("published_at"), utc=True, errors="coerce")
+    df = df.dropna(subset=["published_at"]).copy()
+    if df.empty:
+        out.update({"status": "missing", "rows": rows, "valid_rows": 0})
+        return out
+    now_utc = pd.Timestamp.now(tz="UTC")
+    last_ts = df["published_at"].max()
+    age_hours = float((now_utc - last_ts).total_seconds() / 3600.0) if pd.notna(last_ts) else None
+    day_count = int(df["published_at"].dt.floor("D").nunique())
+    sent = pd.to_numeric(df.get("sentiment_score"), errors="coerce").fillna(0.0)
+    sent_std = float(sent.std()) if len(sent) else 0.0
+    sent_nonzero_frac = float((sent.abs() > 1e-12).mean()) if len(sent) else 0.0
+    if "relevance_score" in df.columns:
+        rel = pd.to_numeric(df.get("relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+        relevance_mean = float(rel.mean()) if len(rel) else 0.0
+    else:
+        relevance_mean = None
+    # Signal-ready means the stream is fresh and has non-trivial variation.
+    signal_ready = bool(
+        (age_hours is not None and age_hours <= 72.0)
+        and day_count >= 5
+        and sent_nonzero_frac > 0.02
+        and sent_std > 1e-6
+    )
+    out.update(
+        {
+            "rows": rows,
+            "valid_rows": int(len(df)),
+            "last_published_at": last_ts.isoformat() if pd.notna(last_ts) else None,
+            "age_hours": round(age_hours, 2) if age_hours is not None else None,
+            "unique_days": day_count,
+            "sentiment_nonzero_frac": round(sent_nonzero_frac, 4),
+            "sentiment_std": round(sent_std, 6),
+            "relevance_mean": round(relevance_mean, 4) if relevance_mean is not None else None,
+            "signal_ready": signal_ready,
+            "status": "ok" if signal_ready else "degraded",
+        }
+    )
+    return out
 
 
 def _check_instrument(instr: str, quick: bool = False, online: bool = False) -> dict:
@@ -221,9 +295,16 @@ def _check_instrument(instr: str, quick: bool = False, online: bool = False) -> 
             "drift_flag": drift_flag,
             "last_update": horizon_acc.get("last_update"),
             "newly_resolved_rows": horizon_acc.get("newly_resolved_rows"),
+            "sample_summary": horizon_acc.get("sample_summary", {}),
             "by_horizon": horizon_acc.get("by_horizon", {}),
         }
         if drift_flag and report["status"] == "ok":
+            report["status"] = "warn"
+
+    news_health = _load_news_health(instr)
+    report["news_pipeline"] = news_health
+    if str(instr).upper() == str(NEWS_PIPELINE_SYMBOL).upper():
+        if news_health.get("status") in ("missing", "degraded", "error") and report["status"] == "ok":
             report["status"] = "warn"
 
     # Model load

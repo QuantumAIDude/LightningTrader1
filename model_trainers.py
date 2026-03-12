@@ -22,7 +22,7 @@ from config import (
     HORIZON_MINUTES, META_MODEL_FILE, INSTRUMENTS, DEFAULT_INSTRUMENT, SAVE_LEGACY_MODEL_FILES,
     AUTO_WINDOW_SELECTION, WINDOW_SELECTION_SPLITS,
     WINDOW_CANDIDATES_4MIN, WINDOW_CANDIDATES_DAILY, WINDOW_CANDIDATES_WEEKEND,
-    TS_SPLIT_GAP_BARS, BACKTEST_SIGNAL_STD_MULT
+    TS_SPLIT_GAP_BARS, BACKTEST_SIGNAL_STD_MULT, WINDOW_SELECTION_DEPLOY_METRIC
 )
 from features import build_features_for_training, build_next_session_dataset, build_next_week_dataset, DEFAULT_FEATURES
 from regime_model import train_regime, build_regime_features, extract_regime_pipeline
@@ -473,6 +473,152 @@ def train_all_models(
                 return None
             return float(np.mean(maes))
 
+        def _opt_signal_threshold(pred_train_raw: np.ndarray, y_train_raw: np.ndarray, costs: float) -> float:
+            try:
+                p = np.asarray(pred_train_raw, dtype=float)
+                yv = np.asarray(y_train_raw, dtype=float)
+                mask = np.isfinite(p) & np.isfinite(yv)
+                p = p[mask]
+                yv = yv[mask]
+                if p.size < 40:
+                    return 0.0
+                abs_p = np.abs(p)
+                cands = {0.0}
+                for q in (0.10, 0.20, 0.30, 0.45, 0.60, 0.75, 0.85, 0.92, 0.97, 0.985):
+                    try:
+                        cands.add(float(np.quantile(abs_p, q)))
+                    except Exception:
+                        continue
+                best_thr = 0.0
+                best_score = -np.inf
+                for thr in sorted([c for c in cands if np.isfinite(c) and c >= 0.0]):
+                    pos = np.sign(p)
+                    pos[np.abs(p) < thr] = 0.0
+                    gross = pos * yv
+                    trades = int(np.nansum(np.abs(np.diff(np.concatenate(([0.0], pos))))))
+                    net = float(np.nansum(gross) - costs * trades)
+                    active = float(np.mean(pos != 0))
+                    turnover = float(trades) / max(1.0, float(len(pos)))
+                    if np.any(pos != 0):
+                        dir_acc = float(np.mean(np.sign(p[pos != 0]) == np.sign(yv[pos != 0])))
+                    else:
+                        dir_acc = 0.5
+                    score = (
+                        (net / max(1.0, float(len(yv))))
+                        + (0.00045 * (dir_acc - 0.5))
+                        - (0.00085 * max(0.0, active - 0.35))
+                        - (0.00020 * max(0.0, 0.03 - active))
+                        - (0.00035 * turnover)
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_thr = float(thr)
+                return max(0.0, float(best_thr))
+            except Exception:
+                return 0.0
+
+        def _mode_horizon_minutes(mode_label: str) -> int:
+            ml = str(mode_label or "").lower()
+            if ml == "4min":
+                return 4
+            if ml in ("daily_high", "daily_low"):
+                # Session-level horizon for equities.
+                return 390
+            if ml == "weekend":
+                # Approx. five regular sessions.
+                return 1950
+            return 4
+
+        def _window_quality(df_in, days, target_col, mode_label: str):
+            df_w = slice_by_days(df_in, int(days))
+            if df_w is None or len(df_w) < 300:
+                return None
+            try:
+                Xw = df_w[DEFAULT_FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                yw = df_w[target_col].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            except Exception:
+                return None
+            n = len(Xw)
+            if n < 300:
+                return None
+            n_splits = min(WINDOW_SELECTION_SPLITS, max(2, n // 500))
+            if n_splits < 2:
+                return None
+            tss = _ts_split(n_splits)
+            maes = []
+            dir_accs = []
+            net_per_bar = []
+            active_fracs = []
+            costs = float(TRANSACTION_COST_PER_TRADE + SLIPPAGE_PCT)
+            for train_idx, test_idx in tss.split(Xw):
+                X_train, X_test = Xw.iloc[train_idx], Xw.iloc[test_idx]
+                y_train, y_test = yw.iloc[train_idx], yw.iloc[test_idx]
+                try:
+                    model = _ridge_pipeline()
+                    model.fit(X_train, y_train)
+                    preds = np.asarray(model.predict(X_test), dtype=float)
+                    maes.append(float(mean_absolute_error(y_test, preds)))
+                except Exception:
+                    continue
+                if mode_label != "4min":
+                    continue
+                try:
+                    pred_tr = np.asarray(model.predict(X_train), dtype=float)
+                    vol_train = np.maximum(
+                        pd.to_numeric(df_w.get("ewm_vol"), errors="coerce").iloc[train_idx].fillna(0.001).values.astype(float),
+                        1e-6
+                    )
+                    vol_test = np.maximum(
+                        pd.to_numeric(df_w.get("ewm_vol"), errors="coerce").iloc[test_idx].fillna(0.001).values.astype(float),
+                        1e-6
+                    )
+                    y_train_raw = np.asarray(y_train, dtype=float) * vol_train
+                    y_test_raw = np.asarray(y_test, dtype=float) * vol_test
+                    pred_tr_raw = pred_tr * vol_train
+                    pred_test_raw = preds * vol_test
+                    thr = _opt_signal_threshold(pred_tr_raw, y_train_raw, costs=costs)
+                    pos = np.sign(pred_test_raw)
+                    if thr > 0:
+                        pos[np.abs(pred_test_raw) < thr] = 0.0
+                    gross = pos * y_test_raw
+                    trades = int(np.nansum(np.abs(np.diff(np.concatenate(([0.0], pos))))))
+                    net = float(np.nansum(gross) - costs * trades)
+                    net_per_bar.append(net / max(1.0, float(len(y_test_raw))))
+                    active = float(np.mean(pos != 0))
+                    active_fracs.append(active)
+                    if np.any(pos != 0):
+                        dacc = float(np.mean(np.sign(pred_test_raw[pos != 0]) == np.sign(y_test_raw[pos != 0])))
+                    else:
+                        dacc = float("nan")
+                    dir_accs.append(dacc)
+                except Exception:
+                    continue
+            if not maes:
+                return None
+            out = {
+                "mae": float(np.mean(maes)),
+                "dir_acc": float(np.nanmean(dir_accs)) if dir_accs else float("nan"),
+                "net_per_bar": float(np.nanmean(net_per_bar)) if net_per_bar else float("nan"),
+                "active_frac": float(np.nanmean(active_fracs)) if active_fracs else float("nan"),
+            }
+            # Lower score is better.
+            if mode_label == "4min" and WINDOW_SELECTION_DEPLOY_METRIC:
+                try:
+                    dacc = out["dir_acc"] if np.isfinite(out["dir_acc"]) else 0.5
+                    netb = out["net_per_bar"] if np.isfinite(out["net_per_bar"]) else -1e-6
+                    active = out["active_frac"] if np.isfinite(out["active_frac"]) else 0.0
+                    score = float(out["mae"])
+                    score += max(0.0, 0.53 - float(dacc)) * 0.8
+                    score += max(0.0, -float(netb)) * 250.0
+                    score += max(0.0, 0.04 - float(active)) * 0.6
+                    score += max(0.0, float(active) - 0.65) * 0.25
+                    out["selection_score"] = float(score)
+                except Exception:
+                    out["selection_score"] = float(out["mae"])
+            else:
+                out["selection_score"] = float(out["mae"])
+            return out
+
         def _candidate_windows(mode_label: str, available_days: int):
             if mode_label == "4min":
                 base = WINDOW_CANDIDATES_4MIN
@@ -490,13 +636,22 @@ def train_all_models(
             candidates = _candidate_windows(mode_label, available_days)
             scores = []
             for d in candidates:
-                mae = _window_mae(df_in, d, target_col)
-                if mae is not None and np.isfinite(mae):
-                    scores.append((int(d), float(mae)))
+                if mode_label == "4min" and WINDOW_SELECTION_DEPLOY_METRIC:
+                    qual = _window_quality(df_in, d, target_col, mode_label)
+                    if not qual:
+                        continue
+                    score = qual.get("selection_score")
+                    if score is None or not np.isfinite(float(score)):
+                        continue
+                    scores.append((int(d), float(score), qual))
+                else:
+                    mae = _window_mae(df_in, d, target_col)
+                    if mae is not None and np.isfinite(mae):
+                        scores.append((int(d), float(mae), {"mae": float(mae), "selection_score": float(mae)}))
             if not scores:
-                return _resolve_windows(df_in, TRAIN_WINDOWS, horizon_minutes=4)
+                return _resolve_windows(df_in, TRAIN_WINDOWS, horizon_minutes=_mode_horizon_minutes(mode_label))
             scores.sort(key=lambda x: x[1])
-            chosen_days = sorted([d for d, _ in scores[:3]])
+            chosen_days = sorted([d for d, _, _ in scores[:3]])
             windows_sel = {}
             if len(chosen_days) >= 1:
                 windows_sel["short"] = chosen_days[0]
@@ -504,9 +659,9 @@ def train_all_models(
                 windows_sel["mid"] = chosen_days[1]
             if len(chosen_days) >= 3:
                 windows_sel["long"] = chosen_days[2]
-            return windows_sel or _resolve_windows(df_in, TRAIN_WINDOWS, horizon_minutes=4)
+            return windows_sel or _resolve_windows(df_in, TRAIN_WINDOWS, horizon_minutes=_mode_horizon_minutes(mode_label))
 
-        windows = _resolve_windows(df_full, TRAIN_WINDOWS, horizon_minutes=4)
+        windows = _resolve_windows(df_full, TRAIN_WINDOWS, horizon_minutes=_mode_horizon_minutes(mode))
         if AUTO_WINDOW_SELECTION:
             windows = _select_windows_for_mode(df_full, params['target_col'], mode)
         try:
@@ -557,11 +712,18 @@ def train_all_models(
                                     target_col='target_ret_norm_demean', min_rows: int = 120):
             payload = {"ensemble_models": {}, "features": feats, "regime_models": {}, "calibration": {}, "calibration_sig": {}}
             perf = {}
+            perf_mae = {}
             for wname, days in windows_local.items():
                 df_w = slice_by_days(df_local, int(days))
                 if df_w is None or len(df_w) < min_rows:
                     payload["ensemble_models"][wname] = []
-                    perf[wname] = float("nan")
+                    perf[wname] = {
+                        "mae": float("nan"),
+                        "dir_acc": float("nan"),
+                        "net_per_bar": float("nan"),
+                        "active_frac": float("nan"),
+                    }
+                    perf_mae[wname] = float("nan")
                     continue
                 Xw = df_w[feats].replace([np.inf, -np.inf], np.nan).fillna(0.0)
                 yw = df_w[target_col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -593,7 +755,13 @@ def train_all_models(
                 try:
                     split = int(len(Xw) * 0.8)
                     if split < 2:
-                        perf[wname] = float("nan")
+                        perf[wname] = {
+                            "mae": float("nan"),
+                            "dir_acc": float("nan"),
+                            "net_per_bar": float("nan"),
+                            "active_frac": float("nan"),
+                        }
+                        perf_mae[wname] = float("nan")
                         continue
                     Xtrain, Xtest = Xw.iloc[:split], Xw.iloc[split:]
                     ytrain, ytest = yw.iloc[:split], yw.iloc[split:]
@@ -602,7 +770,7 @@ def train_all_models(
                         # fit with simple recency weighting on the train segment
                         sw_train = _compute_recency_weights(Xtrain.index, half_life_days=7.0)
                         m.fit(Xtrain, ytrain, sample_weight=sw_train)
-                        preds = m.predict(Xtest)
+                        preds = np.asarray(m.predict(Xtest), dtype=float)
                         mae = float(mean_absolute_error(ytest, preds))
                         # store training bias/resid if single model (for diagnostics later)
                         try:
@@ -615,9 +783,52 @@ def train_all_models(
                         mae = 1.0
                         train_bias = 0.0
                         train_resid = 1e-6
-                    perf[wname] = mae
+                    dir_acc = float("nan")
+                    net_pb = float("nan")
+                    active_frac = float("nan")
+                    if mode == "4min":
+                        try:
+                            vol_train = np.maximum(
+                                pd.to_numeric(df_w.get("ewm_vol"), errors="coerce").iloc[:split].fillna(0.001).values.astype(float),
+                                1e-6
+                            )
+                            vol_test = np.maximum(
+                                pd.to_numeric(df_w.get("ewm_vol"), errors="coerce").iloc[split:].fillna(0.001).values.astype(float),
+                                1e-6
+                            )
+                            pred_train = np.asarray(m.predict(Xtrain), dtype=float)
+                            pred_train_raw = pred_train * vol_train
+                            pred_test_raw = preds * vol_test
+                            y_train_raw = np.asarray(ytrain, dtype=float) * vol_train
+                            y_test_raw = np.asarray(ytest, dtype=float) * vol_test
+                            costs = float(TRANSACTION_COST_PER_TRADE + SLIPPAGE_PCT)
+                            thr = _opt_signal_threshold(pred_train_raw, y_train_raw, costs=costs)
+                            pos = np.sign(pred_test_raw)
+                            if thr > 0:
+                                pos[np.abs(pred_test_raw) < thr] = 0.0
+                            gross = pos * y_test_raw
+                            trades = int(np.nansum(np.abs(np.diff(np.concatenate(([0.0], pos))))))
+                            net_pb = float(np.nansum(gross) - costs * trades) / max(1.0, float(len(y_test_raw)))
+                            active_frac = float(np.mean(pos != 0))
+                            if np.any(pos != 0):
+                                dir_acc = float(np.mean(np.sign(pred_test_raw[pos != 0]) == np.sign(y_test_raw[pos != 0])))
+                        except Exception:
+                            pass
+                    perf[wname] = {
+                        "mae": float(mae),
+                        "dir_acc": float(dir_acc),
+                        "net_per_bar": float(net_pb),
+                        "active_frac": float(active_frac),
+                    }
+                    perf_mae[wname] = float(mae)
                 except Exception:
-                    perf[wname] = 1.0
+                    perf[wname] = {
+                        "mae": 1.0,
+                        "dir_acc": float("nan"),
+                        "net_per_bar": float("nan"),
+                        "active_frac": float("nan"),
+                    }
+                    perf_mae[wname] = 1.0
                 try:
                     if regimes_local is not None:
                         for reg in np.unique(regimes_local):
@@ -648,7 +859,8 @@ def train_all_models(
                             payload["regime_models"].setdefault(str(reg), {})[wname] = members_r
                 except Exception:
                     pass
-            payload["performance_mae"] = perf
+            payload["performance"] = perf
+            payload["performance_mae"] = perf_mae
             # compute calibration for this model family across the full df_local slice
             try:
                 model_for_cal = model_ctor()
@@ -739,6 +951,7 @@ def train_all_models(
             },
             "regime_models": base_payload.get("regime_models", {}),
             "ensemble_models": base_payload.get("ensemble_models", {}),
+            "performance": base_payload.get("performance", {}),
             "performance_mae": base_payload.get("performance_mae", {})
         }
         models = {
@@ -759,6 +972,7 @@ def train_all_models(
                 },
                 "regime_models": forest_payload.get("regime_models", {}),
                 "ensemble_models": forest_payload["ensemble_models"],
+                "performance": forest_payload.get("performance", {}),
                 "performance_mae": forest_payload.get("performance_mae", {})
             },
             "boost": {
@@ -777,6 +991,7 @@ def train_all_models(
                 },
                 "regime_models": boost_payload.get("regime_models", {}),
                 "ensemble_models": boost_payload["ensemble_models"],
+                "performance": boost_payload.get("performance", {}),
                 "performance_mae": boost_payload.get("performance_mae", {})
             },
             "extra_trees": {
@@ -795,6 +1010,7 @@ def train_all_models(
                 },
                 "regime_models": extra_payload.get("regime_models", {}),
                 "ensemble_models": extra_payload["ensemble_models"],
+                "performance": extra_payload.get("performance", {}),
                 "performance_mae": extra_payload.get("performance_mae", {})
             }
         }
@@ -1012,7 +1228,7 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
             if p.size < 40:
                 return float(max(0.0, default_thr))
             abs_p = np.abs(p)
-            q_levels = [0.0, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.92, 0.97]
+            q_levels = [0.0, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.92, 0.97, 0.985, 0.995]
             cand = {float(max(0.0, default_thr))}
             for q in q_levels:
                 try:
@@ -1041,10 +1257,10 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
                 # and not unrealistically always-on.
                 score_adj = (
                     score_per_bar
-                    + (0.0004 * (dir_acc - 0.5))
-                    - (0.0003 * max(0.0, active - 0.55))
-                    - (0.0002 * max(0.0, 0.05 - active))
-                    - (0.0002 * turnover)
+                    + (0.0005 * (dir_acc - 0.5))
+                    - (0.0008 * max(0.0, active - 0.35))
+                    - (0.0002 * max(0.0, 0.03 - active))
+                    - (0.00035 * turnover)
                 )
                 if score_adj > best_score:
                     best_score = score_adj
@@ -1052,6 +1268,37 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
             return float(max(0.0, best_t))
         except Exception:
             return float(max(0.0, default_thr))
+
+    def _strategy_stats(pred_vals, y_vals, thr: float, costs: float, flip_sign: bool = False):
+        p = np.asarray(pred_vals, dtype=float).copy()
+        yv = np.asarray(y_vals, dtype=float).copy()
+        if flip_sign:
+            p = -p
+        pos = np.sign(p)
+        if thr > 0:
+            pos[np.abs(p) < thr] = 0.0
+        gross = pos * yv
+        trades = int(np.nansum(np.abs(np.diff(np.concatenate(([0.0], pos))))))
+        net = float(np.nansum(gross) - costs * trades)
+        active = float(np.mean(pos != 0)) if len(pos) else 0.0
+        if np.any(pos != 0):
+            dacc = float(np.mean(np.sign(p[pos != 0]) == np.sign(yv[pos != 0])))
+        else:
+            dacc = 0.5
+        score = (
+            (net / max(1.0, float(len(yv))))
+            + (0.00045 * (dacc - 0.5))
+            - (0.00080 * max(0.0, active - 0.35))
+            - (0.00020 * max(0.0, 0.03 - active))
+        )
+        return {
+            "pos": pos,
+            "net": net,
+            "dir_acc": dacc,
+            "active": active,
+            "score": score,
+            "trades": trades,
+        }
 
     for i in range(1, n_splits + 1):
         train_end = test_size * i
@@ -1141,30 +1388,57 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
         except Exception:
             sig_mult = 0.0
         sig_thr_default = max(0.0, sig_mult * max(0.0, sig_ref))
-        sig_thr = _optimize_signal_threshold(preds_train_mean, y_train_real.values, sig_thr_default, costs)
-        pos = np.sign(preds_mean)
-        if sig_thr > 0:
-            pos[np.abs(preds_mean) < sig_thr] = 0.0
-        pos[pos == 0] = 0.0
+        # Meta-selection across signal families (ensemble/momentum/contrarian) on train fold only.
+        mom1 = pd.to_numeric(DF.get("ret_1", pd.Series(0.0, index=DF.index)), errors="coerce").fillna(0.0)
+        mom6 = pd.to_numeric(DF.get("ret_6", pd.Series(0.0, index=DF.index)), errors="coerce").fillna(0.0)
+        cand_train = {
+            "ensemble": np.asarray(preds_train_mean, dtype=float),
+            "ensemble_inv": -np.asarray(preds_train_mean, dtype=float),
+            "mom1": np.asarray(mom1.iloc[:train_end_purged].values, dtype=float),
+            "mom1_inv": -np.asarray(mom1.iloc[:train_end_purged].values, dtype=float),
+            "mom6": np.asarray(mom6.iloc[:train_end_purged].values, dtype=float),
+            "mom6_inv": -np.asarray(mom6.iloc[:train_end_purged].values, dtype=float),
+        }
+        cand_test = {
+            "ensemble": np.asarray(preds_mean, dtype=float),
+            "ensemble_inv": -np.asarray(preds_mean, dtype=float),
+            "mom1": np.asarray(mom1.iloc[test_start:test_end].values, dtype=float),
+            "mom1_inv": -np.asarray(mom1.iloc[test_start:test_end].values, dtype=float),
+            "mom6": np.asarray(mom6.iloc[test_start:test_end].values, dtype=float),
+            "mom6_inv": -np.asarray(mom6.iloc[test_start:test_end].values, dtype=float),
+        }
+        best_name = "ensemble"
+        best_thr = sig_thr_default
+        best_score = -np.inf
+        for name, tr_sig in cand_train.items():
+            try:
+                tr_sig = np.asarray(tr_sig, dtype=float)
+                if tr_sig.size != len(y_train_real):
+                    continue
+                thr = _optimize_signal_threshold(tr_sig, y_train_real.values, sig_thr_default, costs)
+                st = _strategy_stats(tr_sig, y_train_real.values, thr, costs, flip_sign=False)
+                if st["score"] > best_score:
+                    best_score = float(st["score"])
+                    best_name = name
+                    best_thr = float(thr)
+            except Exception:
+                continue
+        st_test = _strategy_stats(cand_test.get(best_name, preds_mean), realized, best_thr, costs, flip_sign=False)
+        pos = st_test["pos"]
         try:
-            active_fraction.append(float(np.mean(pos != 0)))
+            active_fraction.append(float(st_test["active"]))
         except Exception:
             active_fraction.append(float("nan"))
         # directional accuracy on active (non-zero) positions
         try:
-            mask = pos != 0
-            if mask.any():
-                dir_acc = float(np.mean(np.sign(preds_mean[mask]) == np.sign(realized[mask])))
-            else:
-                dir_acc = float("nan")
+            dir_acc = float(st_test["dir_acc"])
             directional_acc.append(dir_acc)
         except Exception:
             directional_acc.append(float("nan"))
-        gross = pos * realized
-        trades = int(np.nansum(np.abs(np.diff(np.concatenate(([0], pos))))))
-        net_return = float(np.nansum(gross) - costs * trades)
+        net_return = float(st_test["net"])
         net_returns.append(net_return)
         try:
+            gross = pos * realized
             if np.std(gross) > 0:
                 sharpes.append(float(np.mean(gross) / np.std(gross)))
             else:

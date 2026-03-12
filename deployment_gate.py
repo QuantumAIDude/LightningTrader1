@@ -203,8 +203,11 @@ def main():
         try:
             diag = rep.get("predictions", {}).get("4min", {}).get("diagnostics", {})
             critical_stale = bool(diag.get("critical_stale", False))
+            readiness_locked = bool(diag.get("readiness_locked", False))
             if critical_stale:
                 gate_failures.append("Critical stale-data no-trade guard triggered")
+            if readiness_locked:
+                gate_failures.append("Readiness gate locked (pass streak not yet satisfied)")
             div = diag.get("diversity")
             if isinstance(div, dict) and bool(div.get("degenerate", False)) and not critical_stale:
                 gate_failures.append("Degenerate 4min model spread (near-identical outputs)")
