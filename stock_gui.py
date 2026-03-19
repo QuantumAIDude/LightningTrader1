@@ -273,21 +273,23 @@ class LightningGUI:
             return "Avg Discrepancy: unavailable"
         metrics = report.get("metrics", {}) if isinstance(report.get("metrics"), dict) else {}
 
-        def _block(label: str, mae_key: str, target_key: str, ok_key: str) -> str:
+        def _block(label: str, mae_key: str, target_key: str, ok_key: str, dir_key: str) -> str:
             try:
                 mae = metrics.get(mae_key)
                 target = metrics.get(target_key)
                 ok = bool(metrics.get(ok_key))
+                dir_acc = metrics.get(dir_key)
                 if mae is None or target is None:
                     return f"{label} -"
-                return f"{label} ${float(mae):.2f}/${float(target):.2f} {'OK' if ok else 'MISS'}"
+                dir_part = f" Dir {100.0 * float(dir_acc):.0f}%" if dir_acc is not None else " Dir -"
+                return f"{label} ${float(mae):.2f}/${float(target):.2f} {'OK' if ok else 'MISS'}{dir_part}"
             except Exception:
                 return f"{label} -"
 
         parts = [
-            _block("4m", "intraday_avg_discrepancy_dollars", "intraday_target_window_dollars", "intraday_success"),
-            _block("1D", "daily_avg_discrepancy_dollars", "daily_target_window_dollars", "daily_success"),
-            _block("1W", "weekend_avg_discrepancy_dollars", "weekend_target_window_dollars", "weekend_success"),
+            _block("4m", "intraday_avg_discrepancy_dollars", "intraday_target_window_dollars", "intraday_success", "intraday_updown_acc"),
+            _block("1D", "daily_avg_discrepancy_dollars", "daily_target_window_dollars", "daily_success", "daily_updown_acc"),
+            _block("1W", "weekend_avg_discrepancy_dollars", "weekend_target_window_dollars", "weekend_success", "weekend_updown_acc"),
         ]
         return f"Avg Discrepancy ({selected}): " + " | ".join(parts)
 

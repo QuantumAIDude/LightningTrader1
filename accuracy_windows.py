@@ -140,3 +140,92 @@ def summarize_price_window_errors(abs_errors, actual_prices=None, horizon: str =
         "window_threshold_mean_dollars": float(np.mean(thresholds)),
         "min_window_hit_rate": min_window_hit_rate(horizon, instrument_key=instrument_key),
     }
+
+
+def majority_direction_vote(pred_prices, reference_price) -> dict:
+    ref = _safe_float(reference_price)
+    arr = _to_float_array(pred_prices)
+    if ref is None or arr.size == 0:
+        return {
+            "direction": None,
+            "up_votes": 0,
+            "down_votes": 0,
+            "ties_excluded": 0,
+            "n_models": 0,
+        }
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {
+            "direction": None,
+            "up_votes": 0,
+            "down_votes": 0,
+            "ties_excluded": 0,
+            "n_models": 0,
+        }
+    up_votes = int(np.sum(arr > ref))
+    down_votes = int(np.sum(arr < ref))
+    if up_votes <= 0 and down_votes <= 0:
+        return {
+            "direction": None,
+            "up_votes": up_votes,
+            "down_votes": down_votes,
+            "ties_excluded": 0,
+            "n_models": int(arr.size),
+        }
+    if up_votes == down_votes:
+        return {
+            "direction": None,
+            "up_votes": up_votes,
+            "down_votes": down_votes,
+            "ties_excluded": 1,
+            "n_models": int(arr.size),
+        }
+    return {
+        "direction": "UP" if up_votes > down_votes else "DOWN",
+        "up_votes": up_votes,
+        "down_votes": down_votes,
+        "ties_excluded": 0,
+        "n_models": int(arr.size),
+    }
+
+
+def summarize_majority_direction_hits(pred_price_matrix, actual_prices, reference_prices) -> dict:
+    if pred_price_matrix is None or actual_prices is None or reference_prices is None:
+        return {"accuracy": None, "n": 0, "hits": 0, "ties_excluded": 0}
+    try:
+        pred_arr = np.asarray(pred_price_matrix, dtype=float)
+    except Exception:
+        return {"accuracy": None, "n": 0, "hits": 0, "ties_excluded": 0}
+    actual_arr = _to_float_array(actual_prices)
+    ref_arr = _to_float_array(reference_prices)
+    if pred_arr.ndim == 1:
+        pred_arr = pred_arr.reshape(1, -1)
+    n = min(pred_arr.shape[-1], actual_arr.size, ref_arr.size)
+    if n <= 0:
+        return {"accuracy": None, "n": 0, "hits": 0, "ties_excluded": 0}
+    pred_arr = pred_arr[:, :n]
+    actual_arr = actual_arr[:n]
+    ref_arr = ref_arr[:n]
+    hits = 0
+    total = 0
+    ties = 0
+    for idx in range(n):
+        ref = _safe_float(ref_arr[idx])
+        act = _safe_float(actual_arr[idx])
+        if ref is None or act is None or act == ref:
+            continue
+        vote = majority_direction_vote(pred_arr[:, idx], ref)
+        ties += int(vote.get("ties_excluded", 0) or 0)
+        direction = vote.get("direction")
+        if direction is None:
+            continue
+        actual_dir = "UP" if act > ref else "DOWN"
+        total += 1
+        if direction == actual_dir:
+            hits += 1
+    return {
+        "accuracy": (float(hits) / float(total)) if total > 0 else None,
+        "n": int(total),
+        "hits": int(hits),
+        "ties_excluded": int(ties),
+    }

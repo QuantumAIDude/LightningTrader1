@@ -71,6 +71,72 @@ class ReadinessTrackerTests(unittest.TestCase):
                 rt.DATA_DIR = old_data_dir
                 rt._models_dir_signature = old_model_sig
 
+    def test_horizon_replay_directional_accuracy_excludes_perfect_splits(self):
+        idx = pd.date_range("2026-03-01T14:30:00Z", periods=305, freq="min", tz="UTC")
+        prices = pd.DataFrame({"close": [100.0] * len(idx)}, index=idx)
+        ds_daily = pd.DataFrame(
+            {
+                "close": [100.0],
+                "target_high_ret": [0.01],
+                "target_low_ret": [-0.01],
+            },
+            index=pd.DatetimeIndex([idx[-1]], tz="UTC"),
+        )
+        ds_week = pd.DataFrame(
+            {
+                "close": [100.0],
+                "target_weekend_ret": [0.01],
+            },
+            index=pd.DatetimeIndex([idx[-1]], tz="UTC"),
+        )
+        old_load_models = rt.load_models
+        old_predict_horizon = rt.predict_horizon
+        old_build_next_session_dataset = rt.build_next_session_dataset
+        old_build_weekend_session_dataset = rt.build_weekend_session_dataset
+        try:
+            rt.load_models = lambda include_modes=True, instrument_key=None: {"ok": True}
+            rt.build_next_session_dataset = lambda df, instrument_key=None: ds_daily
+            rt.build_weekend_session_dataset = lambda df, instrument_key=None: ds_week
+
+            def _fake_predict_horizon(models, subset, instrument_key=None, mode=None, log_side_effects=False):
+                if mode == "DailyHigh":
+                    return {
+                        "high": {
+                            "base": {"pred_price": 101.0},
+                            "forest": {"pred_price": 100.8},
+                            "boost": {"pred_price": 99.2},
+                            "extra_trees": {"pred_price": 99.0},
+                        },
+                        "low": {
+                            "base": {"pred_price": 98.5},
+                            "forest": {"pred_price": 98.8},
+                            "boost": {"pred_price": 99.1},
+                            "extra_trees": {"pred_price": 101.0},
+                        },
+                    }
+                return {
+                    "week": {
+                        "base": {"pred_price": 101.2},
+                        "forest": {"pred_price": 101.0},
+                        "boost": {"pred_price": 100.9},
+                        "extra_trees": {"pred_price": 99.8},
+                    }
+                }
+
+            rt.predict_horizon = _fake_predict_horizon
+            out = rt._horizon_replay_errors(prices, "QQQ", max_daily_samples=1, max_week_samples=1)
+            self.assertEqual(out["daily_directional_samples"], 1)
+            self.assertEqual(out["daily_directional_ties"], 1)
+            self.assertAlmostEqual(out["daily_directional_acc"], 1.0, places=6)
+            self.assertEqual(out["weekend_directional_samples"], 1)
+            self.assertEqual(out["weekend_directional_ties"], 0)
+            self.assertAlmostEqual(out["weekend_directional_acc"], 1.0, places=6)
+        finally:
+            rt.load_models = old_load_models
+            rt.predict_horizon = old_predict_horizon
+            rt.build_next_session_dataset = old_build_next_session_dataset
+            rt.build_weekend_session_dataset = old_build_weekend_session_dataset
+
 
 if __name__ == "__main__":
     unittest.main()

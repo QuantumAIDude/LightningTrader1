@@ -24,7 +24,11 @@ from config import (
     WINDOW_CANDIDATES_4MIN, WINDOW_CANDIDATES_DAILY, WINDOW_CANDIDATES_WEEKEND,
     TS_SPLIT_GAP_BARS, BACKTEST_SIGNAL_STD_MULT, WINDOW_SELECTION_DEPLOY_METRIC, DATA_DIR
 )
-from accuracy_windows import price_window_threshold_dollars, summarize_price_window_errors
+from accuracy_windows import (
+    price_window_threshold_dollars,
+    summarize_majority_direction_hits,
+    summarize_price_window_errors,
+)
 from forecast_calibration import (
     apply_intraday_activity_gate,
     apply_return_calibration,
@@ -1527,6 +1531,9 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
     mae_extra_trees = []
     net_returns = []
     directional_acc = []
+    majority_direction_acc = []
+    majority_direction_samples = []
+    majority_direction_ties = []
     sharpes = []
     active_fraction = []
     trade_active_fraction = []
@@ -1917,10 +1924,21 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
             price_mae_dollars.append(float(price_metrics["mae_dollars"]) if price_metrics.get("mae_dollars") is not None else float("nan"))
             price_window_ratio.append(float(price_metrics["window_ratio_mean"]) if price_metrics.get("window_ratio_mean") is not None else float("nan"))
             price_window_hit_rate.append(float(price_metrics["window_hit_rate"]) if price_metrics.get("window_hit_rate") is not None else float("nan"))
+            dir_metrics = summarize_majority_direction_hits(
+                model_price_stack,
+                actual_prices=actual_prices,
+                reference_prices=close_test,
+            )
+            majority_direction_acc.append(float(dir_metrics["accuracy"]) if dir_metrics.get("accuracy") is not None else float("nan"))
+            majority_direction_samples.append(int(dir_metrics.get("n", 0) or 0))
+            majority_direction_ties.append(int(dir_metrics.get("ties_excluded", 0) or 0))
         except Exception:
             price_mae_dollars.append(float("nan"))
             price_window_ratio.append(float("nan"))
             price_window_hit_rate.append(float("nan"))
+            majority_direction_acc.append(float("nan"))
+            majority_direction_samples.append(0)
+            majority_direction_ties.append(0)
         try:
             active_fraction.append(float(np.mean(np.asarray(gate_test_mask, dtype=bool))))
         except Exception:
@@ -1959,4 +1977,7 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
         "price_mae_dollars": price_mae_dollars,
         "price_window_ratio": price_window_ratio,
         "price_window_hit_rate": price_window_hit_rate,
+        "majority_direction_acc": majority_direction_acc,
+        "majority_direction_samples": majority_direction_samples,
+        "majority_direction_ties": majority_direction_ties,
     }

@@ -60,7 +60,13 @@ from features import build_features_for_training, build_next_session_dataset, bu
 from horizon_overlay import load_horizon_overlay
 from model_trainers import walk_forward_validate
 from model_utils import _models_dir_signature, load_models, predict_horizon
-from accuracy_windows import price_window_threshold_dollars, summarize_price_window_errors, min_window_hit_rate, window_ratio_score
+from accuracy_windows import (
+    majority_direction_vote,
+    price_window_threshold_dollars,
+    summarize_price_window_errors,
+    min_window_hit_rate,
+    window_ratio_score,
+)
 
 
 def _history_path(instrument_key: str) -> str:
@@ -564,8 +570,8 @@ def _horizon_backtest_errors(df: pd.DataFrame, instrument_key: str, wf: dict | N
 
             backfill_horizon_accuracy(
                 instrument_key,
-                max_daily_targets=max(16, int(READINESS_MIN_DAILY_SAMPLES) * 3),
-                max_week_targets=max(8, int(READINESS_MIN_WEEKEND_SAMPLES) * 4),
+                max_daily_targets=max(48, int(READINESS_MIN_DAILY_SAMPLES) * 6),
+                max_week_targets=max(32, int(READINESS_MIN_WEEKEND_SAMPLES) * 8),
             )
             cached = _cached_horizon_backtest_errors(instrument_key)
         except Exception:
@@ -709,16 +715,36 @@ def _preferred_pred_price(block: dict) -> float | None:
     return float(np.mean(vals))
 
 
-def _horizon_replay_errors(df: pd.DataFrame, instrument_key: str, max_daily_samples: int = 10, max_week_samples: int = 20) -> dict:
+def _model_pred_prices(block: dict) -> list[float]:
+    if not isinstance(block, dict):
+        return []
+    vals = []
+    for model_key in ("base", "forest", "boost", "extra_trees"):
+        v = block.get(model_key)
+        if not isinstance(v, dict):
+            continue
+        pv = _safe_float(v.get("pred_price"))
+        if pv is not None:
+            vals.append(float(pv))
+    return vals
+
+
+def _horizon_replay_errors(df: pd.DataFrame, instrument_key: str, max_daily_samples: int = 64, max_week_samples: int = 64) -> dict:
     out = {
         "daily_mae_dollars": None,
         "daily_window_ratio": None,
         "daily_window_hit_rate": None,
         "daily_samples": 0,
+        "daily_directional_acc": None,
+        "daily_directional_samples": 0,
+        "daily_directional_ties": 0,
         "weekend_mae_dollars": None,
         "weekend_window_ratio": None,
         "weekend_window_hit_rate": None,
         "weekend_samples": 0,
+        "weekend_directional_acc": None,
+        "weekend_directional_samples": 0,
+        "weekend_directional_ties": 0,
     }
     if df is None or df.empty:
         return out
@@ -737,6 +763,8 @@ def _horizon_replay_errors(df: pd.DataFrame, instrument_key: str, max_daily_samp
         ds_daily = ds_daily.sort_index().tail(max(2, int(max_daily_samples)))
         errs = []
         actuals = []
+        dir_hits = []
+        dir_ties = 0
         for ts, row in ds_daily.iterrows():
             try:
                 subset = df[df.index <= ts]
@@ -762,10 +790,18 @@ def _horizon_replay_errors(df: pd.DataFrame, instrument_key: str, max_daily_samp
                     act_h = float(close_v * (1.0 + th))
                     errs.append(abs(pred_h - act_h))
                     actuals.append(act_h)
+                    vote_h = majority_direction_vote(_model_pred_prices(res.get("high", {})), close_v)
+                    dir_ties += int(vote_h.get("ties_excluded", 0) or 0)
+                    if vote_h.get("direction") is not None and act_h != close_v:
+                        dir_hits.append(1.0 if vote_h["direction"] == ("UP" if act_h > close_v else "DOWN") else 0.0)
                 if pred_l is not None and tl is not None:
                     act_l = float(close_v * (1.0 + tl))
                     errs.append(abs(pred_l - act_l))
                     actuals.append(act_l)
+                    vote_l = majority_direction_vote(_model_pred_prices(res.get("low", {})), close_v)
+                    dir_ties += int(vote_l.get("ties_excluded", 0) or 0)
+                    if vote_l.get("direction") is not None and act_l != close_v:
+                        dir_hits.append(1.0 if vote_l["direction"] == ("UP" if act_l > close_v else "DOWN") else 0.0)
             except Exception:
                 continue
         if errs:
@@ -774,6 +810,9 @@ def _horizon_replay_errors(df: pd.DataFrame, instrument_key: str, max_daily_samp
             out["daily_window_ratio"] = wm.get("window_ratio_mean")
             out["daily_window_hit_rate"] = wm.get("window_hit_rate")
             out["daily_samples"] = int(len(errs))
+            out["daily_directional_acc"] = float(np.mean(dir_hits)) if dir_hits else None
+            out["daily_directional_samples"] = int(len(dir_hits))
+            out["daily_directional_ties"] = int(dir_ties)
 
     try:
         ds_week = build_weekend_session_dataset(df, instrument_key=instrument_key)
@@ -783,6 +822,8 @@ def _horizon_replay_errors(df: pd.DataFrame, instrument_key: str, max_daily_samp
         ds_week = ds_week.sort_index().tail(max(2, int(max_week_samples)))
         errs_w = []
         actuals_w = []
+        dir_hits_w = []
+        dir_ties_w = 0
         for ts, row in ds_week.iterrows():
             try:
                 subset = df[df.index <= ts]
@@ -805,6 +846,10 @@ def _horizon_replay_errors(df: pd.DataFrame, instrument_key: str, max_daily_samp
                 act_w = float(close_v * (1.0 + tw))
                 errs_w.append(abs(pred_w - act_w))
                 actuals_w.append(act_w)
+                vote_w = majority_direction_vote(_model_pred_prices(res.get("week", {})), close_v)
+                dir_ties_w += int(vote_w.get("ties_excluded", 0) or 0)
+                if vote_w.get("direction") is not None and act_w != close_v:
+                    dir_hits_w.append(1.0 if vote_w["direction"] == ("UP" if act_w > close_v else "DOWN") else 0.0)
             except Exception:
                 continue
         if errs_w:
@@ -813,6 +858,9 @@ def _horizon_replay_errors(df: pd.DataFrame, instrument_key: str, max_daily_samp
             out["weekend_window_ratio"] = wm.get("window_ratio_mean")
             out["weekend_window_hit_rate"] = wm.get("window_hit_rate")
             out["weekend_samples"] = int(len(errs_w))
+            out["weekend_directional_acc"] = float(np.mean(dir_hits_w)) if dir_hits_w else None
+            out["weekend_directional_samples"] = int(len(dir_hits_w))
+            out["weekend_directional_ties"] = int(dir_ties_w)
 
     return out
 
@@ -843,6 +891,9 @@ def evaluate_readiness_metrics(instrument_key: str, online: bool = False) -> dic
             _save_cached_walk_forward(instrument_key, df, wf_splits, wf)
     folds = int(wf.get("folds", 0) or 0)
     mean_dir = _safe_mean(wf.get("directional_acc", []))
+    mean_majority_dir = _safe_mean(wf.get("majority_direction_acc", []))
+    intraday_majority_samples = int(np.nansum(pd.to_numeric(wf.get("majority_direction_samples", []), errors="coerce"))) if isinstance(wf, dict) else 0
+    intraday_majority_ties = int(np.nansum(pd.to_numeric(wf.get("majority_direction_ties", []), errors="coerce"))) if isinstance(wf, dict) else 0
     mean_net = _safe_mean(wf.get("net_returns", []))
     mean_sharpe = _safe_mean(wf.get("sharpe_like", []))
     mean_active = _safe_mean(wf.get("active_fraction", []))
@@ -988,6 +1039,9 @@ def evaluate_readiness_metrics(instrument_key: str, online: bool = False) -> dic
         "metrics": {
             "folds": folds,
             "directional_acc_mean": mean_dir,
+            "intraday_updown_acc": mean_majority_dir,
+            "intraday_updown_samples": intraday_majority_samples,
+            "intraday_updown_ties_excluded": intraday_majority_ties,
             "net_return_mean": mean_net,
             "sharpe_like_mean": mean_sharpe,
             "active_fraction_mean": mean_active,
@@ -999,12 +1053,18 @@ def evaluate_readiness_metrics(instrument_key: str, online: bool = False) -> dic
             "weekend_window_hit_rate": _safe_float(week_block.get("window_hit_rate")),
             "weekend_target_window_dollars": float(weekend_target_window),
             "weekend_success": bool(checks["weekend_window_ok"]),
+            "weekend_updown_acc": _safe_float(week_block.get("directional_acc")),
+            "weekend_updown_samples": int(week_block.get("directional_samples", 0) or 0),
+            "weekend_updown_ties_excluded": int(week_block.get("directional_ties", 0) or 0),
             "daily_mae_dollars": day_mae,
             "daily_avg_discrepancy_dollars": day_mae,
             "daily_window_ratio": _safe_float(daily_block.get("window_ratio_mean")),
             "daily_window_hit_rate": _safe_float(daily_block.get("window_hit_rate")),
             "daily_target_window_dollars": float(daily_target_window),
             "daily_success": bool(checks["daily_window_ok"]),
+            "daily_updown_acc": _safe_float(daily_block.get("directional_acc")),
+            "daily_updown_samples": int(daily_block.get("directional_samples", 0) or 0),
+            "daily_updown_ties_excluded": int(daily_block.get("directional_ties", 0) or 0),
             "intraday_mae_dollars": intr_mae,
             "intraday_avg_discrepancy_dollars": intr_mae,
             "intraday_window_ratio": _safe_float(intr_block.get("window_ratio_mean")),
