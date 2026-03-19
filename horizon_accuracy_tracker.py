@@ -14,6 +14,10 @@ from config import (
     HORIZON_ADAPT_MIN_TOTAL_SAMPLES,
     HORIZON_ADAPT_MIN_SAMPLES_PER_HORIZON,
 )
+from accuracy_windows import summarize_price_window_errors
+from features import build_next_session_dataset, build_weekend_session_dataset
+from horizon_overlay import fit_horizon_overlay, refresh_structural_snapshots
+from model_utils import _models_dir_signature, load_models, predict_horizon
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,18 @@ def _metrics_path(instrument_key: str) -> str:
     return os.path.join(DATA_DIR, f"horizon_accuracy_{instrument_key}.json")
 
 
+def _backfill_history_path(instrument_key: str) -> str:
+    return os.path.join(DATA_DIR, f"horizon_accuracy_backfill_resolved_{instrument_key}.csv")
+
+
+def _backfill_metrics_path(instrument_key: str) -> str:
+    return os.path.join(DATA_DIR, f"horizon_accuracy_backfill_{instrument_key}.json")
+
+
+def _backfill_state_path(instrument_key: str) -> str:
+    return os.path.join(DATA_DIR, f"horizon_accuracy_backfill_state_{instrument_key}.json")
+
+
 def _to_float(v):
     try:
         out = float(v)
@@ -48,6 +64,31 @@ def _to_float(v):
     except Exception:
         pass
     return None
+
+
+def _file_signature(path: str):
+    try:
+        st = os.stat(path)
+        return [int(st.st_mtime_ns), int(st.st_size)]
+    except Exception:
+        return None
+
+
+def _backfill_signature(instrument_key: str) -> dict:
+    root = os.path.dirname(__file__)
+    return {
+        "models": [list(x) for x in _models_dir_signature()],
+        "prices": _file_signature(_prices_path(instrument_key)),
+        "prices_daily_long": _file_signature(os.path.join(DATA_DIR, f"prices_{instrument_key}_daily_long.csv")),
+        "structural_snapshots": _file_signature(os.path.join(DATA_DIR, f"horizon_structural_snapshots_{instrument_key}.csv")),
+        "structural_outcomes": _file_signature(os.path.join(DATA_DIR, f"horizon_structural_outcomes_{instrument_key}.csv")),
+        "overlay": _file_signature(os.path.join(DATA_DIR, f"horizon_overlay_{instrument_key}.json")),
+        "code": {
+            "horizon_accuracy_tracker": _file_signature(__file__),
+            "model_utils": _file_signature(os.path.join(root, "model_utils.py")),
+            "horizon_overlay": _file_signature(os.path.join(root, "horizon_overlay.py")),
+        },
+    }
 
 
 def _load_csv_loose(path: str) -> pd.DataFrame:
@@ -98,6 +139,34 @@ def _save_state(instrument_key: str, state: dict):
         os.replace(tmp, path)
     except Exception:
         logger.exception("Failed writing horizon state")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _load_json_dict(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.exception("Failed reading json %s", path)
+        return {}
+
+
+def _save_json_dict(path: str, payload: dict):
+    tmp = f"{path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
+        logger.exception("Failed writing json %s", path)
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -241,6 +310,18 @@ def _append_history_rows(path: str, rows: list[dict]):
             writer.writerow({k: row.get(k) for k in fieldnames})
 
 
+def _write_history_rows(path: str, rows: list[dict]):
+    fieldnames = sorted(set().union(*(r.keys() for r in rows))) if rows else []
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        if not fieldnames:
+            return
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k) for k in fieldnames})
+
+
 def _load_history(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
@@ -257,7 +338,7 @@ def _load_history(path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _compute_metrics(history: pd.DataFrame) -> dict:
+def _compute_metrics(history: pd.DataFrame, instrument_key: str = None) -> dict:
     if history is None or history.empty:
         return {"by_horizon": {}, "global_drift_flag": False, "sample_summary": {"total_samples": 0, "per_horizon_max_n": {}, "sample_sufficient": False}}
     by_h = {}
@@ -271,6 +352,7 @@ def _compute_metrics(history: pd.DataFrame) -> dict:
             abs_err = pd.to_numeric(vals["abs_error"], errors="coerce").dropna()
             pct_err = pd.to_numeric(vals["pct_error"], errors="coerce").dropna()
             signed = pd.to_numeric(vals["signed_error"], errors="coerce").dropna()
+            actual_price = pd.to_numeric(vals.get("actual_price"), errors="coerce")
             n = int(len(abs_err))
             if n == 0:
                 continue
@@ -281,11 +363,37 @@ def _compute_metrics(history: pd.DataFrame) -> dict:
             recent_n = min(20, n)
             recent_abs = abs_err.tail(recent_n)
             recent_mae = float(recent_abs.mean()) if len(recent_abs) else mae
+            window_metrics = summarize_price_window_errors(
+                abs_err.values,
+                actual_prices=actual_price.values if actual_price is not None else None,
+                horizon=horizon,
+                instrument_key=instrument_key,
+            )
+            recent_window_metrics = summarize_price_window_errors(
+                recent_abs.values,
+                actual_prices=actual_price.tail(recent_n).values if actual_price is not None else None,
+                horizon=horizon,
+                instrument_key=instrument_key,
+            )
+            recent_ratio = _to_float(recent_window_metrics.get("window_ratio_mean"))
+            recent_hit = _to_float(recent_window_metrics.get("window_hit_rate"))
+            overall_ratio = _to_float(window_metrics.get("window_ratio_mean"))
+            min_hit_req = _to_float(window_metrics.get("min_window_hit_rate")) or 0.0
             drift_flag = bool(
                 n >= int(HORIZON_DRIFT_MIN_SAMPLES)
                 and np.isfinite(mae)
                 and np.isfinite(recent_mae)
-                and recent_mae > (mae * 1.25)
+                and (
+                    recent_mae > (mae * 1.15)
+                    or (
+                        recent_ratio is not None
+                        and recent_ratio > max(1.10, (overall_ratio or 1.0) * 1.08)
+                    )
+                    or (
+                        recent_hit is not None
+                        and recent_hit < max(0.0, min_hit_req - 0.10)
+                    )
+                )
             )
             if drift_flag:
                 h_out["drift_flag"] = True
@@ -293,10 +401,18 @@ def _compute_metrics(history: pd.DataFrame) -> dict:
             h_out["models"][model] = {
                 "n": n,
                 "mae": mae,
+                "mae_dollars": window_metrics.get("mae_dollars", mae),
                 "rmse": rmse,
+                "rmse_dollars": window_metrics.get("rmse_dollars", rmse),
                 "mape_pct": mape,
                 "bias": bias,
                 "recent_mae": recent_mae,
+                "recent_window_ratio_mean": recent_ratio,
+                "recent_window_hit_rate": recent_hit,
+                "window_hit_rate": window_metrics.get("window_hit_rate"),
+                "window_ratio_mean": window_metrics.get("window_ratio_mean"),
+                "window_threshold_mean_dollars": window_metrics.get("window_threshold_mean_dollars"),
+                "min_window_hit_rate": window_metrics.get("min_window_hit_rate"),
                 "drift_flag": drift_flag,
             }
         try:
@@ -355,6 +471,212 @@ def _latest_predictions_per_target(preds: pd.DataFrame) -> dict:
     return out
 
 
+def _pred_price_by_model(block: dict, suffix: str = "pred_price") -> dict:
+    out = {}
+    if not isinstance(block, dict):
+        return out
+    for model in _MODEL_KEYS:
+        mv = block.get(model, {})
+        if not isinstance(mv, dict):
+            continue
+        pv = _to_float(mv.get(suffix))
+        if pv is not None:
+            out[model] = pv
+    return out
+
+
+def backfill_horizon_accuracy(instrument_key: str, max_daily_targets: int = 32,
+                              max_week_targets: int = 28, min_history_rows: int = 300) -> dict:
+    prices = _load_prices(instrument_key)
+    if prices is None or prices.empty:
+        return {"error": "missing prices", "instrument": instrument_key}
+    try:
+        models = load_models(include_modes=True, instrument_key=instrument_key)
+    except Exception:
+        models = {}
+    if not isinstance(models, dict) or not models:
+        return {"error": "missing models", "instrument": instrument_key}
+
+    signature = _backfill_signature(instrument_key)
+    state = _load_json_dict(_backfill_state_path(instrument_key))
+    reset_cache = state.get("signature") != signature
+    processed = set(str(x) for x in state.get("processed_keys", []))
+    if reset_cache:
+        processed = set()
+    rows = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        refresh_structural_snapshots(
+            instrument_key,
+            prices=prices,
+            max_daily_targets=max_daily_targets,
+            max_week_targets=max_week_targets,
+        )
+    except Exception:
+        logger.exception("Failed refreshing structural snapshots for %s", instrument_key)
+
+    try:
+        ds_daily = build_next_session_dataset(prices, instrument_key=instrument_key).sort_index().tail(max(2, int(max_daily_targets)))
+    except Exception:
+        ds_daily = pd.DataFrame()
+    for ts, row in ds_daily.iterrows():
+        try:
+            target_key_ts = pd.to_datetime(ts, utc=True, errors="coerce")
+            target_key = target_key_ts.isoformat() if pd.notna(target_key_ts) else str(ts)
+            close_v = _to_float(row.get("close"))
+            th = _to_float(row.get("target_high_ret"))
+            tl = _to_float(row.get("target_low_ret"))
+            need_high = bool(
+                th is not None
+                and any(f"backfill|daily_high|{model}|{target_key}" not in processed for model in _MODEL_KEYS)
+            )
+            need_low = bool(
+                tl is not None
+                and any(f"backfill|daily_low|{model}|{target_key}" not in processed for model in _MODEL_KEYS)
+            )
+            if close_v is None or (not need_high and not need_low):
+                continue
+            subset = prices[prices.index <= ts]
+            if subset is None or subset.empty or len(subset) < int(min_history_rows):
+                continue
+            res = predict_horizon(
+                models,
+                subset,
+                instrument_key=instrument_key,
+                mode="DailyHigh",
+                log_side_effects=False,
+            )
+            if not isinstance(res, dict) or res.get("error"):
+                continue
+            high_prices = _pred_price_by_model(res.get("high", {}))
+            low_prices = _pred_price_by_model(res.get("low", {}))
+            if need_high:
+                act_h = float(close_v * (1.0 + th))
+                for model, pred_price in high_prices.items():
+                    key = f"backfill|daily_high|{model}|{target_key}"
+                    if key in processed:
+                        continue
+                    err = float(pred_price - act_h)
+                    rows.append(
+                        {
+                            "resolved_ts": now_iso,
+                            "instrument": instrument_key,
+                            "horizon": "daily_high",
+                            "model": model,
+                            "target_key": target_key,
+                            "pred_price": pred_price,
+                            "actual_price": act_h,
+                            "signed_error": err,
+                            "abs_error": abs(err),
+                            "pct_error": abs(err) / max(1e-9, abs(act_h)),
+                            "source": "historical_replay",
+                        }
+                    )
+                    processed.add(key)
+            if need_low:
+                act_l = float(close_v * (1.0 + tl))
+                for model, pred_price in low_prices.items():
+                    key = f"backfill|daily_low|{model}|{target_key}"
+                    if key in processed:
+                        continue
+                    err = float(pred_price - act_l)
+                    rows.append(
+                        {
+                            "resolved_ts": now_iso,
+                            "instrument": instrument_key,
+                            "horizon": "daily_low",
+                            "model": model,
+                            "target_key": target_key,
+                            "pred_price": pred_price,
+                            "actual_price": act_l,
+                            "signed_error": err,
+                            "abs_error": abs(err),
+                            "pct_error": abs(err) / max(1e-9, abs(act_l)),
+                            "source": "historical_replay",
+                        }
+                    )
+                    processed.add(key)
+        except Exception:
+            continue
+
+    try:
+        ds_week = build_weekend_session_dataset(prices, instrument_key=instrument_key).sort_index().tail(max(2, int(max_week_targets)))
+    except Exception:
+        ds_week = pd.DataFrame()
+    for ts, row in ds_week.iterrows():
+        try:
+            target_key_ts = pd.to_datetime(ts, utc=True, errors="coerce")
+            target_key = target_key_ts.isoformat() if pd.notna(target_key_ts) else str(ts)
+            close_v = _to_float(row.get("close"))
+            tw = _to_float(row.get("target_weekend_ret"))
+            need_week = bool(
+                close_v is not None
+                and tw is not None
+                and any(f"backfill|weekend|{model}|{target_key}" not in processed for model in _MODEL_KEYS)
+            )
+            if not need_week:
+                continue
+            subset = prices[prices.index <= ts]
+            if subset is None or subset.empty or len(subset) < int(min_history_rows):
+                continue
+            res = predict_horizon(
+                models,
+                subset,
+                instrument_key=instrument_key,
+                mode="WeekEnd",
+                log_side_effects=False,
+            )
+            if not isinstance(res, dict) or res.get("error"):
+                continue
+            act_w = float(close_v * (1.0 + tw))
+            week_prices = _pred_price_by_model(res.get("week", {}))
+            for model, pred_price in week_prices.items():
+                key = f"backfill|weekend|{model}|{target_key}"
+                if key in processed:
+                    continue
+                err = float(pred_price - act_w)
+                rows.append(
+                    {
+                        "resolved_ts": now_iso,
+                        "instrument": instrument_key,
+                        "horizon": "weekend",
+                        "model": model,
+                        "target_key": target_key,
+                        "pred_price": pred_price,
+                        "actual_price": act_w,
+                        "signed_error": err,
+                        "abs_error": abs(err),
+                        "pct_error": abs(err) / max(1e-9, abs(act_w)),
+                        "source": "historical_replay",
+                    }
+                )
+                processed.add(key)
+        except Exception:
+            continue
+
+    history_path = _backfill_history_path(instrument_key)
+    if reset_cache:
+        _write_history_rows(history_path, rows)
+    else:
+        _append_history_rows(history_path, rows)
+    hist_df = _load_history(history_path)
+    metrics = _compute_metrics(hist_df, instrument_key=instrument_key)
+    try:
+        metrics["overlay"] = fit_horizon_overlay(instrument_key, prices=prices)
+    except Exception:
+        logger.exception("Failed fitting horizon overlay for %s", instrument_key)
+    metrics["last_update"] = now_iso
+    metrics["newly_resolved_rows"] = int(len(rows))
+    metrics["source"] = "historical_replay"
+    metrics["signature"] = signature
+    _save_json_dict(_backfill_metrics_path(instrument_key), metrics)
+    _save_json_dict(
+        _backfill_state_path(instrument_key),
+        {"processed_keys": list(sorted(processed))[-20000:], "last_update": now_iso, "signature": signature},
+    )
+    return metrics
+
+
 def update_horizon_accuracy(instrument_key: str) -> dict:
     preds = _load_csv_loose(_predictions_path(instrument_key))
     prices = _load_prices(instrument_key)
@@ -388,6 +710,7 @@ def update_horizon_accuracy(instrument_key: str) -> dict:
                                 "signed_error": err,
                                 "abs_error": abs(err),
                                 "pct_error": abs(err) / max(1e-9, abs(actuals["high"])),
+                                "source": "logged_prediction",
                             }
                         )
                         processed.add(key)
@@ -407,6 +730,7 @@ def update_horizon_accuracy(instrument_key: str) -> dict:
                                 "signed_error": err,
                                 "abs_error": abs(err),
                                 "pct_error": abs(err) / max(1e-9, abs(actuals["low"])),
+                                "source": "logged_prediction",
                             }
                         )
                         processed.add(key)
@@ -434,6 +758,7 @@ def update_horizon_accuracy(instrument_key: str) -> dict:
                         "signed_error": err,
                         "abs_error": abs(err),
                         "pct_error": abs(err) / max(1e-9, abs(actuals["weekend_close"])),
+                        "source": "logged_prediction",
                     }
                 )
                 processed.add(key)
@@ -441,7 +766,11 @@ def update_horizon_accuracy(instrument_key: str) -> dict:
     history_path = _history_path(instrument_key)
     _append_history_rows(history_path, resolved_rows)
     hist_df = _load_history(history_path)
-    metrics = _compute_metrics(hist_df)
+    metrics = _compute_metrics(hist_df, instrument_key=instrument_key)
+    try:
+        metrics["overlay"] = fit_horizon_overlay(instrument_key, prices=prices)
+    except Exception:
+        logger.exception("Failed fitting horizon overlay for %s", instrument_key)
     metrics["last_update"] = now_iso
     metrics["newly_resolved_rows"] = int(len(resolved_rows))
     metrics_path = _metrics_path(instrument_key)

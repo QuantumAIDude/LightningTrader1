@@ -93,6 +93,10 @@ class HorizonAccuracyTrackerTests(unittest.TestCase):
                 out = hat.update_horizon_accuracy(instr)
                 self.assertGreaterEqual(int(out.get("newly_resolved_rows", 0)), 3)
                 self.assertIn("by_horizon", out)
+                daily_models = out["by_horizon"].get("daily_high", {}).get("models", {})
+                self.assertIn("base", daily_models)
+                self.assertIn("window_hit_rate", daily_models["base"])
+                self.assertIn("window_ratio_mean", daily_models["base"])
                 self.assertTrue(os.path.exists(os.path.join(tmp, f"horizon_accuracy_{instr}.json")))
             finally:
                 hat.DATA_DIR = old_data_dir
@@ -102,4 +106,3 @@ class HorizonAccuracyTrackerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

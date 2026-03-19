@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
@@ -33,6 +34,7 @@ from config import (
     AUTO_ONBOARD_COOLDOWN_SEC,
     NEW_INSTRUMENTS_DIR,
     NEW_INSTRUMENTS_PROCESSED_DIR,
+    NEW_INSTRUMENTS_FAILED_DIR,
 )
 
 logger = logging.getLogger(__name__)
@@ -240,10 +242,42 @@ def _archive_staged_file(path: str, symbol: str):
     os.makedirs(NEW_INSTRUMENTS_PROCESSED_DIR, exist_ok=True)
     out = os.path.join(NEW_INSTRUMENTS_PROCESSED_DIR, f"{symbol}_{ts}.csv")
     try:
-        os.replace(path, out)
+        shutil.move(path, out)
     except Exception:
         # Fallback: keep original file if move fails.
         logger.exception("Failed moving staged file to processed folder: %s", path)
+
+
+def _safe_slug(value: str, default: str = "unknown") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raw = default
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+    slug = slug.strip("_.-")
+    return slug[:48] if slug else default
+
+
+def _quarantine_staged_file(path: str, symbol: str | None, reason: str) -> str | None:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    sym = _safe_slug(symbol or os.path.splitext(os.path.basename(path))[0], default="UNKNOWN")
+    reason_slug = _safe_slug(reason, default="failed")
+    os.makedirs(NEW_INSTRUMENTS_FAILED_DIR, exist_ok=True)
+    out = os.path.join(NEW_INSTRUMENTS_FAILED_DIR, f"{sym}_{ts}_{reason_slug}.csv")
+    meta = {
+        "path": path,
+        "symbol": symbol,
+        "reason": reason,
+        "quarantined_at": datetime.now(timezone.utc).isoformat(),
+        "quarantine_path": out,
+    }
+    try:
+        shutil.move(path, out)
+        with open(f"{out}.json", "w") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+        return out
+    except Exception:
+        logger.exception("Failed quarantining staged file: %s", path)
+        return None
 
 
 def _models_exist_for_symbol(symbol: str) -> bool:
@@ -296,6 +330,7 @@ def process_staged_instrument_files(
         full_train = bool(AUTO_ONBOARD_FULL_TRAIN)
     os.makedirs(NEW_INSTRUMENTS_DIR, exist_ok=True)
     os.makedirs(NEW_INSTRUMENTS_PROCESSED_DIR, exist_ok=True)
+    os.makedirs(NEW_INSTRUMENTS_FAILED_DIR, exist_ok=True)
 
     staged = []
     try:
@@ -307,21 +342,30 @@ def process_staged_instrument_files(
     except Exception:
         staged = []
 
-    out = {"processed": [], "errors": []}
+    out = {"processed": [], "errors": [], "quarantined": []}
     for path in staged:
         symbol = _safe_symbol_from_staged_filename(path)
         if not symbol:
+            quarantine_path = _quarantine_staged_file(path, symbol=None, reason="invalid_symbol_filename")
             out["errors"].append({"path": path, "error": "invalid_symbol_filename"})
+            if quarantine_path:
+                out["quarantined"].append({"path": quarantine_path, "reason": "invalid_symbol_filename"})
             continue
         df_new = _read_staged_csv(path)
         if df_new.empty:
+            quarantine_path = _quarantine_staged_file(path, symbol=symbol, reason="invalid_or_empty_csv")
             out["errors"].append({"path": path, "symbol": symbol, "error": "invalid_or_empty_csv"})
+            if quarantine_path:
+                out["quarantined"].append({"path": quarantine_path, "symbol": symbol, "reason": "invalid_or_empty_csv"})
             continue
         data_path = _canonical_price_path(symbol)
         df_old = _read_existing_price_file(data_path)
         df_all = _merge_price_frames(df_old, df_new)
         if df_all.empty:
+            quarantine_path = _quarantine_staged_file(path, symbol=symbol, reason="no_rows_after_merge")
             out["errors"].append({"path": path, "symbol": symbol, "error": "no_rows_after_merge"})
+            if quarantine_path:
+                out["quarantined"].append({"path": quarantine_path, "symbol": symbol, "reason": "no_rows_after_merge"})
             continue
         df_all.to_csv(data_path, date_format="%Y-%m-%dT%H:%M:%SZ")
         added = register_instrument(symbol, persist=True)
@@ -361,4 +405,3 @@ def ensure_runtime_instruments(force: bool = False, auto_onboard: bool = True) -
             onboarded = process_staged_instrument_files(auto_train=True, full_train=AUTO_ONBOARD_FULL_TRAIN)
         _LAST_RUN_TS = now
     return {"discovered": discovered, "onboarded": onboarded, "skipped": False}
-

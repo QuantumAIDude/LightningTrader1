@@ -112,7 +112,7 @@ IB_GATEWAY_PORT = int(os.environ.get("IB_GATEWAY_PORT", "7497"))
 IB_CLIENT_ID = int(os.environ.get("IB_CLIENT_ID", "1"))
 
 # Transaction cost / slippage defaults used by backtests and simulated live trading
-TRANSACTION_COST_PER_TRADE = float(os.environ.get("TRANSACTION_COST_PER_TRADE", "0.0003"))  # fraction (30bp)
+TRANSACTION_COST_PER_TRADE = float(os.environ.get("TRANSACTION_COST_PER_TRADE", "0.0003"))  # fraction (3bp)
 SLIPPAGE_PCT = float(os.environ.get("SLIPPAGE_PCT", "0.0005"))  # fraction
 TARGET_VOL = float(os.environ.get("TARGET_VOL", "0.004"))
 # Backtest/live risk-off threshold: do not trade predictions below this multiple of train target std.
@@ -156,6 +156,12 @@ HORIZON_ADAPT_MIN_SAMPLES_PER_HORIZON = int(os.environ.get("HORIZON_ADAPT_MIN_SA
 NEWS_PIPELINE_ENABLED = os.environ.get("NEWS_PIPELINE_ENABLED", "true").lower() in ("1", "true", "yes")
 NEWS_PIPELINE_SYMBOL = os.environ.get("NEWS_PIPELINE_SYMBOL", "QQQ").upper()
 NEWS_REFRESH_COOLDOWN_SEC = int(os.environ.get("NEWS_REFRESH_COOLDOWN_SEC", "1800"))
+NEWS_ARCHIVE_LOOKBACK_DAYS = int(os.environ.get("NEWS_ARCHIVE_LOOKBACK_DAYS", "90"))
+NEWS_ARCHIVE_CHUNK_DAYS = int(os.environ.get("NEWS_ARCHIVE_CHUNK_DAYS", "7"))
+NEWS_ARCHIVE_MAX_RECORDS_PER_CHUNK = int(os.environ.get("NEWS_ARCHIVE_MAX_RECORDS_PER_CHUNK", "120"))
+NEWS_LONG_HORIZON_MIN_ROWS = int(os.environ.get("NEWS_LONG_HORIZON_MIN_ROWS", "80"))
+NEWS_LONG_HORIZON_MIN_ACTIVE_DAYS = int(os.environ.get("NEWS_LONG_HORIZON_MIN_ACTIVE_DAYS", "30"))
+NEWS_LONG_HORIZON_MIN_COVERAGE = float(os.environ.get("NEWS_LONG_HORIZON_MIN_COVERAGE", "0.35"))
 
 # Daily readiness report + live trade lock
 READINESS_ENFORCE_LIVE_GATE = os.environ.get("READINESS_ENFORCE_LIVE_GATE", "true").lower() in ("1", "true", "yes")
@@ -169,15 +175,26 @@ READINESS_MIN_SHARPE_LIKE = float(os.environ.get("READINESS_MIN_SHARPE_LIKE", "0
 READINESS_MIN_ACTIVE_FRACTION = float(os.environ.get("READINESS_MIN_ACTIVE_FRACTION", "0.03"))
 READINESS_MIN_FOLDS = int(os.environ.get("READINESS_MIN_FOLDS", "3"))
 READINESS_REQUIRE_DIRECTIONAL = os.environ.get("READINESS_REQUIRE_DIRECTIONAL", "false").lower() in ("1", "true", "yes")
-READINESS_REQUIRE_PROFITABILITY = os.environ.get("READINESS_REQUIRE_PROFITABILITY", "false").lower() in ("1", "true", "yes")
-READINESS_REQUIRE_SHARPE = os.environ.get("READINESS_REQUIRE_SHARPE", "false").lower() in ("1", "true", "yes")
-READINESS_REQUIRE_ACTIVE = os.environ.get("READINESS_REQUIRE_ACTIVE", "false").lower() in ("1", "true", "yes")
+READINESS_REQUIRE_PROFITABILITY = os.environ.get("READINESS_REQUIRE_PROFITABILITY", "true").lower() in ("1", "true", "yes")
+READINESS_REQUIRE_SHARPE = os.environ.get("READINESS_REQUIRE_SHARPE", "true").lower() in ("1", "true", "yes")
+READINESS_REQUIRE_ACTIVE = os.environ.get("READINESS_REQUIRE_ACTIVE", "true").lower() in ("1", "true", "yes")
 # Horizon-priority readiness (weekend > daily > 4min) with realistic error windows.
 READINESS_USE_HORIZON_PRIORITY = os.environ.get("READINESS_USE_HORIZON_PRIORITY", "true").lower() in ("1", "true", "yes")
 READINESS_MIN_HORIZON_SCORE = float(os.environ.get("READINESS_MIN_HORIZON_SCORE", "0.55"))
 READINESS_WEIGHT_WEEKEND = float(os.environ.get("READINESS_WEIGHT_WEEKEND", "0.55"))
 READINESS_WEIGHT_DAILY = float(os.environ.get("READINESS_WEIGHT_DAILY", "0.30"))
 READINESS_WEIGHT_INTRADAY = float(os.environ.get("READINESS_WEIGHT_INTRADAY", "0.15"))
+# Price-window readiness thresholds. The absolute floors make the metric interpretable,
+# while the pct components keep it scale-aware across instruments with different prices.
+READINESS_INTRADAY_WINDOW_DOLLARS = float(os.environ.get("READINESS_INTRADAY_WINDOW_DOLLARS", "0.15"))
+READINESS_INTRADAY_WINDOW_PCT = float(os.environ.get("READINESS_INTRADAY_WINDOW_PCT", "0.00035"))
+READINESS_DAILY_WINDOW_DOLLARS = float(os.environ.get("READINESS_DAILY_WINDOW_DOLLARS", "1.25"))
+READINESS_DAILY_WINDOW_PCT = float(os.environ.get("READINESS_DAILY_WINDOW_PCT", "0.0025"))
+READINESS_WEEKEND_WINDOW_DOLLARS = float(os.environ.get("READINESS_WEEKEND_WINDOW_DOLLARS", "2.5"))
+READINESS_WEEKEND_WINDOW_PCT = float(os.environ.get("READINESS_WEEKEND_WINDOW_PCT", "0.0"))
+READINESS_MIN_INTRADAY_WINDOW_HIT_RATE = float(os.environ.get("READINESS_MIN_INTRADAY_WINDOW_HIT_RATE", "0.60"))
+READINESS_MIN_DAILY_WINDOW_HIT_RATE = float(os.environ.get("READINESS_MIN_DAILY_WINDOW_HIT_RATE", "0.58"))
+READINESS_MIN_WEEKEND_WINDOW_HIT_RATE = float(os.environ.get("READINESS_MIN_WEEKEND_WINDOW_HIT_RATE", "0.55"))
 READINESS_MAX_WEEKEND_ERR_PCT = float(os.environ.get("READINESS_MAX_WEEKEND_ERR_PCT", "1.40"))
 READINESS_MAX_DAILY_ERR_PCT = float(os.environ.get("READINESS_MAX_DAILY_ERR_PCT", "0.85"))
 READINESS_MAX_INTRADAY_ERR_BPS = float(os.environ.get("READINESS_MAX_INTRADAY_ERR_BPS", "16.0"))
@@ -202,12 +219,17 @@ NEW_INSTRUMENTS_PROCESSED_DIR = os.environ.get(
     "NEW_INSTRUMENTS_PROCESSED_DIR",
     os.path.join(NEW_INSTRUMENTS_DIR, "processed")
 )
+NEW_INSTRUMENTS_FAILED_DIR = os.environ.get(
+    "NEW_INSTRUMENTS_FAILED_DIR",
+    os.path.join(NEW_INSTRUMENTS_DIR, "failed")
+)
 AUTO_ONBOARD_FROM_STAGING = os.environ.get("AUTO_ONBOARD_FROM_STAGING", "true").lower() in ("1", "true", "yes")
 AUTO_ONBOARD_BOOTSTRAP = os.environ.get("AUTO_ONBOARD_BOOTSTRAP", "true").lower() in ("1", "true", "yes")
 AUTO_ONBOARD_FULL_TRAIN = os.environ.get("AUTO_ONBOARD_FULL_TRAIN", "false").lower() in ("1", "true", "yes")
 AUTO_ONBOARD_COOLDOWN_SEC = int(os.environ.get("AUTO_ONBOARD_COOLDOWN_SEC", "120"))
 Path(NEW_INSTRUMENTS_DIR).mkdir(parents=True, exist_ok=True)
 Path(NEW_INSTRUMENTS_PROCESSED_DIR).mkdir(parents=True, exist_ok=True)
+Path(NEW_INSTRUMENTS_FAILED_DIR).mkdir(parents=True, exist_ok=True)
 
 def _default_equity_meta(symbol: str) -> dict:
     sym = str(symbol or "").upper()

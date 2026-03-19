@@ -16,7 +16,11 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor, ExtraTreesRegressor
 
 from config import DATA_DIR, DEFAULT_INSTRUMENT, MODEL_DIR
-from features import build_features_for_training, build_next_session_dataset, DEFAULT_FEATURES
+from features import (
+    build_features_for_training,
+    build_next_session_dataset,
+    DEFAULT_FEATURES,
+)
 from model_trainers import _ridge_pipeline, _model_path
 from regime_model import train_regime
 

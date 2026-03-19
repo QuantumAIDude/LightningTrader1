@@ -46,7 +46,31 @@ class ReadinessTrackerTests(unittest.TestCase):
             finally:
                 rt.DATA_DIR = old_data_dir
 
+    def test_walk_forward_cache_invalidates_when_model_signature_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_data_dir = rt.DATA_DIR
+            old_model_sig = rt._models_dir_signature
+            try:
+                rt.DATA_DIR = tmp
+                rt._models_dir_signature = lambda: [("model.pkl", 1, 10)]
+                df = pd.DataFrame(
+                    {"close": [100.0, 101.0, 102.0]},
+                    index=pd.to_datetime(
+                        ["2026-03-01T14:30:00Z", "2026-03-01T14:31:00Z", "2026-03-01T14:32:00Z"],
+                        utc=True,
+                    ),
+                )
+                df.to_csv(os.path.join(tmp, "prices_QQQ.csv"))
+                metrics = {"folds": 3, "price_window_ratio": [1.0]}
+                rt._save_cached_walk_forward("QQQ", df, 3, metrics)
+                self.assertEqual(rt._load_cached_walk_forward("QQQ", df, 3), metrics)
+
+                rt._models_dir_signature = lambda: [("model.pkl", 2, 10)]
+                self.assertEqual(rt._load_cached_walk_forward("QQQ", df, 3), {})
+            finally:
+                rt.DATA_DIR = old_data_dir
+                rt._models_dir_signature = old_model_sig
+
 
 if __name__ == "__main__":
     unittest.main()
-

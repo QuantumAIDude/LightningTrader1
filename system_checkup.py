@@ -61,6 +61,9 @@ def _summarize_prediction_block(res_block: dict) -> dict:
             "pred_price": v.get("pred_price"),
             "confidence": v.get("confidence"),
             "note": v.get("note"),
+            "pred_range_80_low": v.get("pred_range_80_low"),
+            "pred_range_80_high": v.get("pred_range_80_high"),
+            "expected_abs_err_bps": v.get("expected_abs_err_bps"),
         }
     return summary
 
@@ -137,6 +140,11 @@ def _load_news_health(instr: str) -> dict:
         out.update({"status": "missing", "rows": 0})
         return out
     rows = int(len(df))
+    try:
+        from news_pipeline import _normalize_news_frame
+        df = _normalize_news_frame(df, default_symbol=str(instr).upper())
+    except Exception:
+        pass
     df["published_at"] = pd.to_datetime(df.get("published_at"), utc=True, errors="coerce")
     df = df.dropna(subset=["published_at"]).copy()
     if df.empty:
@@ -145,6 +153,7 @@ def _load_news_health(instr: str) -> dict:
     now_utc = pd.Timestamp.now(tz="UTC")
     last_ts = df["published_at"].max()
     age_hours = float((now_utc - last_ts).total_seconds() / 3600.0) if pd.notna(last_ts) else None
+    freshness_limit = 96.0 if int(now_utc.dayofweek) >= 5 else 72.0
     day_count = int(df["published_at"].dt.floor("D").nunique())
     sent = pd.to_numeric(df.get("sentiment_score"), errors="coerce").fillna(0.0)
     sent_std = float(sent.std()) if len(sent) else 0.0
@@ -156,7 +165,7 @@ def _load_news_health(instr: str) -> dict:
         relevance_mean = None
     # Signal-ready means the stream is fresh and has non-trivial variation.
     signal_ready = bool(
-        (age_hours is not None and age_hours <= 72.0)
+        (age_hours is not None and age_hours <= freshness_limit)
         and day_count >= 5
         and sent_nonzero_frac > 0.02
         and sent_std > 1e-6
@@ -326,7 +335,7 @@ def _check_instrument(instr: str, quick: bool = False, online: bool = False) -> 
     # Predictions and latency
     report["predictions"] = {}
     t0 = time.perf_counter()
-    res4 = predict_4min(models, df, instrument_key=instr)
+    res4 = predict_4min(models, df, instrument_key=instr, log_side_effects=False)
     report["predictions"]["4min"] = _summarize_prediction_block(res4)
     report["predictions"]["4min_latency_s"] = round(time.perf_counter() - t0, 4)
     try:
@@ -344,12 +353,12 @@ def _check_instrument(instr: str, quick: bool = False, online: bool = False) -> 
 
     if not quick:
         t1 = time.perf_counter()
-        resd = predict_horizon(models, df, instrument_key=instr, mode="DailyHigh")
+        resd = predict_horizon(models, df, instrument_key=instr, mode="DailyHigh", log_side_effects=False)
         report["predictions"]["daily_high_low"] = _summarize_horizon_block(resd, "DailyHigh")
         report["predictions"]["daily_latency_s"] = round(time.perf_counter() - t1, 4)
 
         t2 = time.perf_counter()
-        resw = predict_horizon(models, df, instrument_key=instr, mode="WeekEnd")
+        resw = predict_horizon(models, df, instrument_key=instr, mode="WeekEnd", log_side_effects=False)
         report["predictions"]["weekend"] = _summarize_horizon_block(resw, "WeekEnd")
         report["predictions"]["weekend_latency_s"] = round(time.perf_counter() - t2, 4)
 

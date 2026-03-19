@@ -14,10 +14,21 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from config import INSTRUMENTS, DEFAULT_INSTRUMENT, MODEL_DIR, DATA_DIR
+from config import (
+    INSTRUMENTS,
+    DEFAULT_INSTRUMENT,
+    MODEL_DIR,
+    DATA_DIR,
+    READINESS_MIN_HORIZON_SCORE,
+    READINESS_MIN_INTRADAY_WINDOW_HIT_RATE,
+    READINESS_MIN_DAILY_WINDOW_HIT_RATE,
+    READINESS_MIN_WEEKEND_WINDOW_HIT_RATE,
+)
+from calibration_tracker import update_live_calibration
+from horizon_accuracy_tracker import update_horizon_accuracy
+from readiness_tracker import update_readiness_state
 from system_checkup import _check_instrument
 from data_fetch import update_price_data
-from model_trainers import walk_forward_validate
 
 
 def _ts_now() -> str:
@@ -122,7 +133,49 @@ def main():
         "--min-directional-acc",
         type=float,
         default=0.52,
-        help="Minimum mean directional accuracy on active trades for backtest gate.",
+        help="Legacy directional-accuracy diagnostic threshold. Price-window metrics are now the primary gate.",
+    )
+    parser.add_argument(
+        "--max-intraday-window-ratio",
+        type=float,
+        default=1.0,
+        help="Maximum mean 4-minute price-window ratio for backtest gate.",
+    )
+    parser.add_argument(
+        "--min-intraday-window-hit-rate",
+        type=float,
+        default=float(READINESS_MIN_INTRADAY_WINDOW_HIT_RATE),
+        help="Minimum 4-minute fraction of forecasts landing inside the configured price window.",
+    )
+    parser.add_argument(
+        "--max-daily-window-ratio",
+        type=float,
+        default=1.0,
+        help="Maximum mean daily price-window ratio for backtest gate.",
+    )
+    parser.add_argument(
+        "--min-daily-window-hit-rate",
+        type=float,
+        default=float(READINESS_MIN_DAILY_WINDOW_HIT_RATE),
+        help="Minimum daily fraction of forecasts landing inside the configured price window.",
+    )
+    parser.add_argument(
+        "--max-weekend-window-ratio",
+        type=float,
+        default=1.0,
+        help="Maximum mean weekend price-window ratio for backtest gate.",
+    )
+    parser.add_argument(
+        "--min-weekend-window-hit-rate",
+        type=float,
+        default=float(READINESS_MIN_WEEKEND_WINDOW_HIT_RATE),
+        help="Minimum weekend fraction of forecasts landing inside the configured price window.",
+    )
+    parser.add_argument(
+        "--min-horizon-score",
+        type=float,
+        default=float(READINESS_MIN_HORIZON_SCORE),
+        help="Minimum weighted horizon score after combining 4-minute, daily, and weekend window accuracy.",
     )
     parser.add_argument(
         "--min-net-return",
@@ -152,6 +205,13 @@ def main():
             "max_model_dir_gb": float(args.max_model_dir_gb),
             "max_4min_latency_s": float(args.max_4min_latency_s),
             "allow_warn": bool(args.allow_warn),
+            "max_intraday_window_ratio": float(args.max_intraday_window_ratio),
+            "min_intraday_window_hit_rate": float(args.min_intraday_window_hit_rate),
+            "max_daily_window_ratio": float(args.max_daily_window_ratio),
+            "min_daily_window_hit_rate": float(args.min_daily_window_hit_rate),
+            "max_weekend_window_ratio": float(args.max_weekend_window_ratio),
+            "min_weekend_window_hit_rate": float(args.min_weekend_window_hit_rate),
+            "min_horizon_score": float(args.min_horizon_score),
         },
         "instruments": {},
         "global": {},
@@ -175,7 +235,24 @@ def main():
             out["status"] = "fail"
             continue
 
+        readiness_state = None
+        refresh = {}
+        try:
+            refresh["calibration_update"] = update_live_calibration(instr, horizon_minutes=4)
+        except Exception as e:
+            refresh["calibration_update"] = {"error": str(e)}
+        try:
+            refresh["horizon_accuracy_update"] = update_horizon_accuracy(instr)
+        except Exception as e:
+            refresh["horizon_accuracy_update"] = {"error": str(e)}
+        try:
+            readiness_state = update_readiness_state(instr, online=args.online)
+            refresh["readiness_state"] = readiness_state
+        except Exception as e:
+            refresh["readiness_state"] = {"error": str(e)}
+
         rep = _check_instrument(instr, quick=args.quick, online=args.online)
+        rep["readiness_refresh"] = refresh
         gate_failures = []
 
         status = str(rep.get("status", "fail")).lower()
@@ -214,49 +291,94 @@ def main():
         except Exception:
             pass
 
+        readiness_eval = {}
+        if isinstance(readiness_state, dict):
+            readiness_eval = readiness_state.get("evaluation", {}) if isinstance(readiness_state.get("evaluation"), dict) else {}
+            rep["readiness_state"] = readiness_state
+        if readiness_eval.get("error"):
+            gate_failures.append(f"Readiness evaluation error: {readiness_eval.get('error')}")
+
         rep["gate_failures"] = gate_failures
 
         if args.require_backtest:
             try:
-                if args.online:
-                    df_bt = update_price_data(instr)
+                metrics = readiness_eval.get("metrics", {}) if isinstance(readiness_eval, dict) else {}
+                checks = readiness_eval.get("checks", {}) if isinstance(readiness_eval, dict) else {}
+                h_bt = readiness_eval.get("horizon_backtest", {}) if isinstance(readiness_eval, dict) else {}
+                if not metrics:
+                    gate_failures.append("Backtest gate: missing readiness evaluation metrics")
+                    rep["backtest"] = {"error": "No readiness evaluation metrics"}
                 else:
-                    df_bt = _load_cached_prices(instr)
-                if df_bt is None or df_bt.empty:
-                    gate_failures.append("Backtest gate: missing price data")
-                    rep["backtest"] = {"error": "No data"}
-                else:
-                    wf = walk_forward_validate(
-                        df_bt,
-                        n_splits=max(3, int(args.backtest_splits)),
-                        include_transaction_costs=True,
-                        instrument_key=instr,
-                    )
-                    folds = int(wf.get("folds", 0) or 0)
-                    mean_dir = _safe_mean(wf.get("directional_acc", []))
-                    mean_net = _safe_mean(wf.get("net_returns", []))
-                    mean_sharpe = _safe_mean(wf.get("sharpe_like", []))
-                    mean_active = _safe_mean(wf.get("active_fraction", []))
+                    folds = int(metrics.get("folds", 0) or 0)
+                    mean_active = metrics.get("active_fraction_mean")
+                    intr_mae = metrics.get("intraday_avg_discrepancy_dollars", metrics.get("intraday_mae_dollars"))
+                    intr_ratio = metrics.get("intraday_window_ratio")
+                    intr_hit = metrics.get("intraday_window_hit_rate")
+                    intr_target = metrics.get("intraday_target_window_dollars")
+                    day_mae = metrics.get("daily_avg_discrepancy_dollars", metrics.get("daily_mae_dollars"))
+                    daily_ratio = metrics.get("daily_window_ratio")
+                    daily_hit = metrics.get("daily_window_hit_rate")
+                    daily_target = metrics.get("daily_target_window_dollars")
+                    week_mae = metrics.get("weekend_avg_discrepancy_dollars", metrics.get("weekend_mae_dollars"))
+                    week_ratio = metrics.get("weekend_window_ratio")
+                    week_hit = metrics.get("weekend_window_hit_rate")
+                    week_target = metrics.get("weekend_target_window_dollars")
                     rep["backtest"] = {
                         "folds": folds,
-                        "directional_acc_mean": mean_dir,
-                        "net_return_mean": mean_net,
-                        "sharpe_like_mean": mean_sharpe,
                         "active_fraction_mean": mean_active,
+                        "intraday_avg_discrepancy_dollars": intr_mae,
+                        "intraday_target_window_dollars": intr_target,
+                        "intraday_window_ratio_mean": intr_ratio,
+                        "intraday_window_hit_rate_mean": intr_hit,
+                        "daily_avg_discrepancy_dollars": day_mae,
+                        "daily_target_window_dollars": daily_target,
+                        "daily_window_ratio_mean": daily_ratio,
+                        "daily_window_hit_rate_mean": daily_hit,
+                        "weekend_avg_discrepancy_dollars": week_mae,
+                        "weekend_target_window_dollars": week_target,
+                        "weekend_window_ratio_mean": week_ratio,
+                        "weekend_window_hit_rate_mean": week_hit,
+                        "horizon_weighted_score": metrics.get("horizon_weighted_score"),
+                        "checks": checks,
+                        "horizon_backtest": h_bt,
                     }
                     if folds < 3:
                         gate_failures.append("Backtest gate: insufficient folds")
-                    if mean_dir is None or mean_dir < float(args.min_directional_acc):
+                    if intr_ratio is None or float(intr_ratio) > float(args.max_intraday_window_ratio):
                         gate_failures.append(
-                            f"Backtest gate: directional_acc_mean {mean_dir} < {float(args.min_directional_acc):.3f}"
+                            f"Backtest gate: intraday_window_ratio {intr_ratio} > {float(args.max_intraday_window_ratio):.3f}"
                         )
-                    if mean_net is None or mean_net < float(args.min_net_return):
+                    if intr_hit is None or float(intr_hit) < float(args.min_intraday_window_hit_rate):
                         gate_failures.append(
-                            f"Backtest gate: net_return_mean {mean_net} < {float(args.min_net_return):.6f}"
+                            f"Backtest gate: intraday_window_hit_rate {intr_hit} < {float(args.min_intraday_window_hit_rate):.3f}"
                         )
-                    if mean_sharpe is None or mean_sharpe < float(args.min_sharpe_like):
+                    if daily_ratio is None or float(daily_ratio) > float(args.max_daily_window_ratio):
                         gate_failures.append(
-                            f"Backtest gate: sharpe_like_mean {mean_sharpe} < {float(args.min_sharpe_like):.4f}"
+                            f"Backtest gate: daily_window_ratio {daily_ratio} > {float(args.max_daily_window_ratio):.3f}"
+                        )
+                    if daily_hit is None or float(daily_hit) < float(args.min_daily_window_hit_rate):
+                        gate_failures.append(
+                            f"Backtest gate: daily_window_hit_rate {daily_hit} < {float(args.min_daily_window_hit_rate):.3f}"
+                        )
+                    if week_ratio is None or float(week_ratio) > float(args.max_weekend_window_ratio):
+                        gate_failures.append(
+                            f"Backtest gate: weekend_window_ratio {week_ratio} > {float(args.max_weekend_window_ratio):.3f}"
+                        )
+                    if week_hit is None or float(week_hit) < float(args.min_weekend_window_hit_rate):
+                        gate_failures.append(
+                            f"Backtest gate: weekend_window_hit_rate {week_hit} < {float(args.min_weekend_window_hit_rate):.3f}"
+                        )
+                    if intr_mae is None or intr_target is None or float(intr_mae) > float(intr_target):
+                        gate_failures.append(
+                            f"Backtest gate: intraday_avg_discrepancy {intr_mae} > target {intr_target}"
+                        )
+                    if day_mae is None or daily_target is None or float(day_mae) > float(daily_target):
+                        gate_failures.append(
+                            f"Backtest gate: daily_avg_discrepancy {day_mae} > target {daily_target}"
+                        )
+                    if week_mae is None or week_target is None or float(week_mae) > float(week_target):
+                        gate_failures.append(
+                            f"Backtest gate: weekend_avg_discrepancy {week_mae} > target {week_target}"
                         )
                     if mean_active is None or mean_active < float(args.min_active_fraction):
                         gate_failures.append(

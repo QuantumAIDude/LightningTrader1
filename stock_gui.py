@@ -10,6 +10,7 @@ from config import AUTO_PREDICT_SECONDS, INSTRUMENTS, DEFAULT_INSTRUMENT
 from features import LIVE_MAX_BARS, BAR_MINUTES
 from model_trainers import train_all_models
 from instrument_onboarding import ensure_runtime_instruments, list_runtime_instruments
+from readiness_tracker import evaluate_readiness_metrics
 import datetime
 import time
 import logging
@@ -45,6 +46,8 @@ class LightningGUI:
         self._pred_started_at = None
         self._pred_timeout_sec = 30.0
         self._pred_seq = 0
+        self._acc_lock = threading.Lock()
+        self._acc_in_flight = False
 
         self.executor = ThreadPoolExecutor(max_workers=2)
         self._overview_last_refresh = 0.0
@@ -107,6 +110,9 @@ class LightningGUI:
         self.consensus_var = tk.StringVar(value="Consensus: -")
         self.consensus_label = tk.Label(self.summary_frame, textvariable=self.consensus_var, font=self.big_font, fg="#34d399", bg="#0f1724")
         self.consensus_label.pack(side="left", padx=12)
+        self.accuracy_var = tk.StringVar(value="Avg Discrepancy: loading…")
+        self.accuracy_label = tk.Label(self.summary_frame, textvariable=self.accuracy_var, font=self.small_font, fg="#93c5fd", bg="#0f1724")
+        self.accuracy_label.pack(side="left", padx=12)
         self.data_meta_var = tk.StringVar(value="Data: - | Last Bar: -")
         self.data_meta_label = tk.Label(self.summary_frame, textvariable=self.data_meta_var, font=self.small_font, fg="#cbd5f5", bg="#0f1724")
         self.data_meta_label.pack(side="right", padx=6)
@@ -163,6 +169,15 @@ class LightningGUI:
             width = 420 if col == "note" else 220
             self.tree_high.column(col, anchor=tk.CENTER, width=width)
         self.tree_high.pack(padx=12, pady=(0, 8), fill="both", expand=True)
+        self.week_extremes_var = tk.StringVar(value="Projected Week High/Low: -")
+        self.week_extremes_label = tk.Label(
+            self.horizon_frame,
+            textvariable=self.week_extremes_var,
+            font=self.small_font,
+            fg="#fcd34d",
+            bg="#0f1724",
+        )
+        self.week_extremes_label.pack(anchor="w", padx=12, pady=(0, 6))
 
         self.horizon_low_label = tk.Label(self.horizon_frame, text="Daily Low Forecast", font=self.big_font, fg="#fca5a5", bg="#0f1724")
         self.horizon_low_label.pack(anchor="w", padx=12, pady=(4, 2))
@@ -190,6 +205,7 @@ class LightningGUI:
         self.status("Initializing…")
         self._show_mode_ui()
         self.refresh_overview_threaded()
+        self.refresh_accuracy_summary_threaded()
         self._initial_loader_thread = threading.Thread(target=self._initial_model_waiter, daemon=True)
         self._initial_loader_thread.start()
 
@@ -238,16 +254,66 @@ class LightningGUI:
                 self.horizon_frame.pack(padx=12, pady=8, fill="both", expand=True)
             if mode == "DailyHigh":
                 self.horizon_high_label.config(text="Daily High Forecast")
+                self.week_extremes_label.pack_forget()
                 self.horizon_low_label.pack(anchor="w", padx=12, pady=(4, 2))
                 self.tree_low.pack(padx=12, pady=(0, 8), fill="both", expand=True)
             else:
                 self.horizon_high_label.config(text="Week-End Close Forecast")
+                if not self.week_extremes_label.winfo_ismapped():
+                    self.week_extremes_label.pack(anchor="w", padx=12, pady=(0, 6), before=self.horizon_low_label)
                 self.horizon_low_label.pack_forget()
                 self.tree_low.pack_forget()
 
     def _on_instrument_change(self, event=None):
         self.status(f"Instrument changed to {self.instrument_var.get()}; reloading…")
         self.reload_once_threaded()
+
+    def _format_accuracy_summary(self, report: dict, selected: str) -> str:
+        if not isinstance(report, dict) or report.get("error"):
+            return "Avg Discrepancy: unavailable"
+        metrics = report.get("metrics", {}) if isinstance(report.get("metrics"), dict) else {}
+
+        def _block(label: str, mae_key: str, target_key: str, ok_key: str) -> str:
+            try:
+                mae = metrics.get(mae_key)
+                target = metrics.get(target_key)
+                ok = bool(metrics.get(ok_key))
+                if mae is None or target is None:
+                    return f"{label} -"
+                return f"{label} ${float(mae):.2f}/${float(target):.2f} {'OK' if ok else 'MISS'}"
+            except Exception:
+                return f"{label} -"
+
+        parts = [
+            _block("4m", "intraday_avg_discrepancy_dollars", "intraday_target_window_dollars", "intraday_success"),
+            _block("1D", "daily_avg_discrepancy_dollars", "daily_target_window_dollars", "daily_success"),
+            _block("1W", "weekend_avg_discrepancy_dollars", "weekend_target_window_dollars", "weekend_success"),
+        ]
+        return f"Avg Discrepancy ({selected}): " + " | ".join(parts)
+
+    def refresh_accuracy_summary_threaded(self):
+        with self._acc_lock:
+            if self._acc_in_flight:
+                return
+            self._acc_in_flight = True
+        selected = self.instrument_var.get()
+
+        def _job():
+            try:
+                report = evaluate_readiness_metrics(selected, online=False)
+                text = self._format_accuracy_summary(report, selected)
+            except Exception:
+                logger.exception("Accuracy summary refresh failed")
+                text = f"Avg Discrepancy ({selected}): unavailable"
+            finally:
+                with self._acc_lock:
+                    self._acc_in_flight = False
+            try:
+                self.root.after(0, lambda: self.accuracy_var.set(text))
+            except Exception:
+                pass
+
+        self.executor.submit(_job)
 
     def _refresh_instrument_choices(self):
         try:
@@ -277,6 +343,23 @@ class LightningGUI:
         if isinstance(v, (int, float)):
             return f"${float(v):,.2f}"
         return "-"
+
+    @staticmethod
+    def _append_band_note(note: str, item: dict) -> str:
+        if not isinstance(item, dict):
+            return note or ""
+        parts = []
+        lo = item.get("pred_range_80_low")
+        hi = item.get("pred_range_80_high")
+        err = item.get("expected_abs_err_bps")
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            parts.append(f"80% {float(lo):,.2f}..{float(hi):,.2f}")
+        if isinstance(err, (int, float)):
+            parts.append(f"Err~{float(err):.1f}bps")
+        if not parts:
+            return note or ""
+        suffix = " | ".join(parts)
+        return f"{note} | {suffix}" if note else suffix
 
     def _compute_overview_rows(self):
         rows = []
@@ -394,12 +477,14 @@ class LightningGUI:
                         self.df = self._trim_df_for_ui(update_price_data(selected))
                     self.root.after(0, self.run_prediction_and_refresh_ui)
                     self.root.after(0, self.refresh_overview_threaded)
+                    self.root.after(0, self.refresh_accuracy_summary_threaded)
                     return
                 with self._lock:
                     self.models = models
                     self.df = self._trim_df_for_ui(update_price_data(selected))
                 self.root.after(0, self.run_prediction_and_refresh_ui)
                 self.root.after(0, self.refresh_overview_threaded)
+                self.root.after(0, self.refresh_accuracy_summary_threaded)
                 self.status("Models loaded — predictions available")
                 return
             except Exception as e:
@@ -529,6 +614,7 @@ class LightningGUI:
                 self.df = self._trim_df_for_ui(df2)
             self.root.after(0, self.run_prediction_and_refresh_ui)
             self.root.after(0, self.refresh_overview_threaded)
+            self.root.after(0, self.refresh_accuracy_summary_threaded)
             self.status("Background training complete")
         except Exception:
             logger.exception("Background training failed")
@@ -551,6 +637,7 @@ class LightningGUI:
                     self.df = self._trim_df_for_ui(df)
                 self.root.after(0, self.run_prediction_and_refresh_ui)
                 self.root.after(0, self.refresh_overview_threaded)
+                self.root.after(0, self.refresh_accuracy_summary_threaded)
                 self.status("Reload complete")
             except Exception:
                 logger.exception("Reload failed")
@@ -578,6 +665,7 @@ class LightningGUI:
                     self.df = self._trim_df_for_ui(df2)
                 self.root.after(0, self.run_prediction_and_refresh_ui)
                 self.root.after(0, self.refresh_overview_threaded)
+                self.root.after(0, self.refresh_accuracy_summary_threaded)
                 self.status("Retrain complete")
             except Exception:
                 logger.exception("Retrain failed")
@@ -596,6 +684,7 @@ class LightningGUI:
             "avg_pred": "Avg Prediction: -",
             "consensus": "Consensus: -",
             "data_meta": "Data: - | Last Bar: -",
+            "week_extremes": "Projected Week High/Low: -",
             "regime_text": "Market Regime: Unknown",
             "status_messages": []
         }
@@ -660,6 +749,7 @@ class LightningGUI:
         self.avg_pred_var.set(payload.get("avg_pred", "Avg Prediction: -"))
         self.consensus_var.set(payload.get("consensus", "Consensus: -"))
         self.data_meta_var.set(payload.get("data_meta", "Data: - | Last Bar: -"))
+        self.week_extremes_var.set(payload.get("week_extremes", "Projected Week High/Low: -"))
         self.regime_label.config(text=payload.get("regime_text", "Market Regime: Unknown"))
         for msg in payload.get("status_messages", []):
             self.status(msg)
@@ -724,6 +814,7 @@ class LightningGUI:
                 if isinstance(pred_ret, (float, int)):
                     move_note = f"Move {pred_ret * 10000.0:+.2f} bps"
                     note = f"{note} | {move_note}" if note else move_note
+                note = self._append_band_note(note, item)
                 if item.get("pred_price") is None:
                     payload["tree_4min"].append(((label, "-", "-", "-", note or "Waiting…"), None))
                     continue
@@ -781,6 +872,7 @@ class LightningGUI:
                     if isinstance(pred_ret, (float, int)):
                         move_note = f"Move {pred_ret * 10000.0:+.2f} bps"
                         note = f"{note} | {move_note}" if note else move_note
+                    note = self._append_band_note(note, item)
                     price = item.get("pred_price", "-")
                     conf = item.get("confidence", 0.0)
                     if isinstance(price, (float, int)):
@@ -795,6 +887,7 @@ class LightningGUI:
                     if isinstance(pred_ret_l, (float, int)):
                         move_note_l = f"Move {pred_ret_l * 10000.0:+.2f} bps"
                         note_l = f"{note_l} | {move_note_l}" if note_l else move_note_l
+                    note_l = self._append_band_note(note_l, item_l)
                     price_l = item_l.get("pred_price", "-")
                     conf_l = item_l.get("confidence", 0.0)
                     if isinstance(price_l, (float, int)):
@@ -820,6 +913,8 @@ class LightningGUI:
                 if not week:
                     raise RuntimeError("Missing weekend results")
                 week_prices = []
+                week_highs = []
+                week_lows = []
                 for model_name in model_keys:
                     label = model_name.replace("_", " ").title()
                     item = week.get(model_name, {})
@@ -828,10 +923,17 @@ class LightningGUI:
                     if isinstance(pred_ret, (float, int)):
                         move_note = f"Move {pred_ret * 10000.0:+.2f} bps"
                         note = f"{note} | {move_note}" if note else move_note
+                    note = self._append_band_note(note, item)
                     price = item.get("pred_price", "-")
                     conf = item.get("confidence", 0.0)
                     if isinstance(price, (float, int)):
                         week_prices.append(float(price))
+                    high_price = item.get("pred_high_price")
+                    low_price = item.get("pred_low_price")
+                    if isinstance(high_price, (float, int)):
+                        week_highs.append(float(high_price))
+                    if isinstance(low_price, (float, int)):
+                        week_lows.append(float(low_price))
                     price_str = f"${price:,.2f}" if isinstance(price, (float, int)) else price
                     conf_str = f"{conf:.2f}%" if isinstance(conf, (float, int)) else conf
                     payload["tree_high"].append(((label, price_str, conf_str, note or ""), None))
@@ -840,6 +942,15 @@ class LightningGUI:
                     payload["avg_pred"] = f"Avg Week Close: ${avg_price:,.2f}"
                 else:
                     payload["avg_pred"] = "Avg Prediction: -"
+                if week_highs or week_lows:
+                    high_avg = (sum(week_highs) / len(week_highs)) if week_highs else None
+                    low_avg = (sum(week_lows) / len(week_lows)) if week_lows else None
+                    if high_avg is not None and low_avg is not None:
+                        payload["week_extremes"] = f"Projected Week High: ${high_avg:,.2f} | Projected Week Low: ${low_avg:,.2f}"
+                    elif high_avg is not None:
+                        payload["week_extremes"] = f"Projected Week High: ${high_avg:,.2f}"
+                    elif low_avg is not None:
+                        payload["week_extremes"] = f"Projected Week Low: ${low_avg:,.2f}"
             payload["consensus"] = "Consensus: -"
 
         regime = results.get("regime", {"Neutral": 100.0})

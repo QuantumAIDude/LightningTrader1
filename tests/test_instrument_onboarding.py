@@ -13,12 +13,14 @@ class InstrumentOnboardingTests(unittest.TestCase):
             old_data_dir = io.DATA_DIR
             old_stage_dir = io.NEW_INSTRUMENTS_DIR
             old_processed_dir = io.NEW_INSTRUMENTS_PROCESSED_DIR
+            old_failed_dir = io.NEW_INSTRUMENTS_FAILED_DIR
             old_instruments_file = io.INSTRUMENTS_FILE
             old_instruments = dict(io.INSTRUMENTS)
             try:
                 io.DATA_DIR = tmp
                 io.NEW_INSTRUMENTS_DIR = os.path.join(tmp, "new_instruments")
                 io.NEW_INSTRUMENTS_PROCESSED_DIR = os.path.join(io.NEW_INSTRUMENTS_DIR, "processed")
+                io.NEW_INSTRUMENTS_FAILED_DIR = os.path.join(io.NEW_INSTRUMENTS_DIR, "failed")
                 io.INSTRUMENTS_FILE = os.path.join(tmp, "instruments.json")
                 io.INSTRUMENTS.clear()
                 os.makedirs(io.NEW_INSTRUMENTS_DIR, exist_ok=True)
@@ -45,6 +47,45 @@ class InstrumentOnboardingTests(unittest.TestCase):
                 io.DATA_DIR = old_data_dir
                 io.NEW_INSTRUMENTS_DIR = old_stage_dir
                 io.NEW_INSTRUMENTS_PROCESSED_DIR = old_processed_dir
+                io.NEW_INSTRUMENTS_FAILED_DIR = old_failed_dir
+                io.INSTRUMENTS_FILE = old_instruments_file
+                io.INSTRUMENTS.clear()
+                io.INSTRUMENTS.update(old_instruments)
+
+    def test_invalid_staged_file_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_data_dir = io.DATA_DIR
+            old_stage_dir = io.NEW_INSTRUMENTS_DIR
+            old_processed_dir = io.NEW_INSTRUMENTS_PROCESSED_DIR
+            old_failed_dir = io.NEW_INSTRUMENTS_FAILED_DIR
+            old_instruments_file = io.INSTRUMENTS_FILE
+            old_instruments = dict(io.INSTRUMENTS)
+            try:
+                io.DATA_DIR = tmp
+                io.NEW_INSTRUMENTS_DIR = os.path.join(tmp, "new_instruments")
+                io.NEW_INSTRUMENTS_PROCESSED_DIR = os.path.join(io.NEW_INSTRUMENTS_DIR, "processed")
+                io.NEW_INSTRUMENTS_FAILED_DIR = os.path.join(io.NEW_INSTRUMENTS_DIR, "failed")
+                io.INSTRUMENTS_FILE = os.path.join(tmp, "instruments.json")
+                io.INSTRUMENTS.clear()
+                os.makedirs(io.NEW_INSTRUMENTS_DIR, exist_ok=True)
+
+                staged = os.path.join(io.NEW_INSTRUMENTS_DIR, "BAD.csv")
+                pd.DataFrame({"timestamp": ["bad-ts"], "close": [None]}).to_csv(staged, index=False)
+
+                rep = io.process_staged_instrument_files(auto_train=False, full_train=False)
+                self.assertEqual(len(rep.get("processed", [])), 0)
+                self.assertEqual(len(rep.get("errors", [])), 1)
+                self.assertEqual(len(rep.get("quarantined", [])), 1)
+                self.assertFalse(os.path.exists(staged))
+                failed_dir = io.NEW_INSTRUMENTS_FAILED_DIR
+                failed_files = [x for x in os.listdir(failed_dir) if x.endswith(".csv")]
+                self.assertEqual(len(failed_files), 1)
+                self.assertTrue(os.path.exists(os.path.join(failed_dir, failed_files[0] + ".json")))
+            finally:
+                io.DATA_DIR = old_data_dir
+                io.NEW_INSTRUMENTS_DIR = old_stage_dir
+                io.NEW_INSTRUMENTS_PROCESSED_DIR = old_processed_dir
+                io.NEW_INSTRUMENTS_FAILED_DIR = old_failed_dir
                 io.INSTRUMENTS_FILE = old_instruments_file
                 io.INSTRUMENTS.clear()
                 io.INSTRUMENTS.update(old_instruments)
@@ -52,4 +93,3 @@ class InstrumentOnboardingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

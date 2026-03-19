@@ -34,6 +34,57 @@ def _interval_minutes(interval: str) -> int:
     except Exception:
         return 1
 
+
+def _session_close_summary(df: pd.DataFrame, tz: str = "America/New_York") -> pd.DataFrame:
+    if df is None or df.empty or "close" not in df.columns:
+        return pd.DataFrame()
+    work = df.copy().sort_index()
+    try:
+        idx_utc = pd.to_datetime(work.index, utc=True, errors="coerce")
+    except Exception:
+        idx_utc = pd.to_datetime(work.index, errors="coerce")
+    if len(idx_utc) == 0:
+        return pd.DataFrame()
+    try:
+        idx_local = idx_utc.tz_convert(tz)
+    except Exception:
+        idx_local = idx_utc
+    work = work.loc[~pd.isna(idx_utc)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    idx_local = idx_local[~pd.isna(idx_utc)]
+    work["_session_date"] = pd.Index(idx_local.date).astype(str)
+    if "open" not in work.columns:
+        work["open"] = pd.to_numeric(work["close"], errors="coerce")
+    if "high" not in work.columns:
+        work["high"] = pd.to_numeric(work["close"], errors="coerce")
+    if "low" not in work.columns:
+        work["low"] = pd.to_numeric(work["close"], errors="coerce")
+    if "volume" not in work.columns:
+        work["volume"] = 0.0
+    grouped = work.groupby("_session_date", sort=True)
+    summary = grouped.agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+    if summary.empty:
+        return pd.DataFrame()
+    summary.index = pd.to_datetime(summary.index, errors="coerce")
+    summary = summary.dropna(how="all")
+    return summary.sort_index()
+
+
+def _prepare_regime_input(df: pd.DataFrame, horizon_key: str | None = None) -> tuple[pd.DataFrame, str]:
+    horizon = str(horizon_key or "intraday").strip().lower()
+    if horizon in ("daily", "weekend", "weekly"):
+        session_df = _session_close_summary(df)
+        if session_df is not None and not session_df.empty:
+            return session_df, "session_close"
+    return df.copy(), "intraday_bars"
+
 # Build regime features from price data (keeps same features as before but robustifies missing cols)
 def build_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().sort_index()
@@ -314,7 +365,7 @@ def train_regime(df: pd.DataFrame, lookback_days: int = None):
         "features": list(X.columns),
     }
 
-def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 6):
+def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 6, horizon_key: str | None = None):
     """
     Given a regime payload and a dataframe, returns a dict of regime probabilities percentages.
     The payload is trained on the longer history; for the *current* regime probabilities we focus on a
@@ -334,25 +385,35 @@ def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 6):
         scaler, gmm = extract_regime_pipeline(payload)
         if scaler is None or gmm is None:
             return fallback_regime_probs(df)
-        # compute bars_per_hour from INTERVAL if available
-        try:
-            from config import INTERVAL
-            bars_per_hour = max(1, int(round(60.0 / float(_interval_minutes(INTERVAL)))))
-        except Exception:
-            bars_per_hour = max(1, 60 // 1)
-        recent_bars = int(max(1, recent_look_hours * bars_per_hour))
+        df_input, input_granularity = _prepare_regime_input(df, horizon_key=horizon_key)
+        if df_input is None or df_input.empty:
+            return fallback_regime_probs(df)
+        horizon_norm = str(horizon_key or "intraday").strip().lower()
+        if input_granularity == "session_close":
+            sessions_per_day = 1.0
+            sessions = int(max(2, round(float(recent_look_hours) / 6.5 * sessions_per_day)))
+            recent_bars = max(2, sessions)
+        else:
+            try:
+                from config import INTERVAL
+                bars_per_hour = max(1, int(round(60.0 / float(_interval_minutes(INTERVAL)))))
+            except Exception:
+                bars_per_hour = max(1, 60 // 1)
+            recent_bars = int(max(1, recent_look_hours * bars_per_hour))
 
-        df_recent = df.tail(recent_bars)
+        df_recent = df_input.tail(recent_bars)
         if df_recent is None or df_recent.empty:
-            df_recent = df.copy().tail(24)
+            df_recent = df_input.copy().tail(24)
 
         # Adaptive lookback: respond faster when short-horizon volatility/shift rises.
         try:
             ret_probe = pd.to_numeric(df_recent["close"], errors="coerce").pct_change().fillna(0.0)
-            rv_short = float(ret_probe.tail(max(6, bars_per_hour)).std())
-            rv_long = float(ret_probe.tail(max(24, bars_per_hour * 6)).std())
+            short_window = max(3, min(len(ret_probe), 6 if input_granularity == "session_close" else bars_per_hour))
+            long_window = max(short_window + 1, min(len(ret_probe), 24 if input_granularity == "session_close" else (bars_per_hour * 6)))
+            rv_short = float(ret_probe.tail(short_window).std())
+            rv_long = float(ret_probe.tail(long_window).std())
             if np.isfinite(rv_short) and np.isfinite(rv_long) and rv_short > 1.35 * max(rv_long, 1e-8):
-                df_recent = df.tail(max(8, int(recent_bars * 0.55)))
+                df_recent = df_input.tail(max(4, int(recent_bars * 0.55)))
         except Exception:
             pass
 
@@ -521,6 +582,9 @@ def predict_regime_probs(payload, df: pd.DataFrame, recent_look_hours: int = 6):
         out["dominant_component"] = str(int(dominant_comp))
         out["component_probs"] = [float(p) for p in probs]
         out["recent_window_bars"] = int(len(Xs))
+        out["input_granularity"] = str(input_granularity)
+        out["input_rows"] = int(len(df_input))
+        out["horizon_key"] = "weekend" if horizon_norm in ("weekend", "weekly") else ("daily" if horizon_norm == "daily" else "intraday")
         out["shock_score"] = float(round(shock_score, 4))
         try:
             p = np.clip(probs, 1e-9, 1.0)

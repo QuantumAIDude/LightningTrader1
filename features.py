@@ -43,15 +43,32 @@ DEFAULT_FEATURES = [
     # new features (added/extended)
     "vol_norm_ret", "atr_6", "vol_rolling_skew", "vol_rolling_kurt", "volume_imbalance", "hurst",
     # robustness/realized-volatility
-    "rv_20", "robust_vol_20",
+    "rv_20", "robust_vol_20", "semivar_imbalance_12", "fracdiff_log_close_d04",
     # market structure + event intensity
     "range_1", "body_1", "dollar_vol_z", "roll_max_dist", "roll_min_dist", "cusum_intensity", "event_time_since",
     # normalization and session/futures-specific
     "ret_1_norm", "overnight_gap", "session_volatility", "session_ret_from_open",
     # QQQ news sentiment context (lag-safe daily aggregates)
-    "news_sent_mean_d1", "news_sent_sum_d3", "news_headline_count_d1", "news_pos_ratio_d3", "news_neg_ratio_d3"
+    "news_sent_mean_d1", "news_sent_sum_d3", "news_headline_count_d1", "news_pos_ratio_d3", "news_neg_ratio_d3",
+    "news_sent_ewm_d7", "news_intensity_ewm_d7", "news_entropy_d3", "news_relevance_mean_d3", "news_sent_surprise_d1"
+]
+DAILY_HORIZON_FEATURES = [
+    "ret_1", "ret_6", "mom_6", "mom_12",
+    "overnight_gap", "session_volatility", "session_ret_from_open",
+    "ewm_vol", "trend_strength", "range_1",
+    "roll_max_dist", "roll_min_dist",
+    "news_sent_mean_d1", "news_sent_ewm_d7", "news_intensity_ewm_d7",
+]
+WEEKEND_HORIZON_FEATURES = [
+    "ret_1", "ret_6", "mom_6", "mom_12",
+    "overnight_gap", "session_volatility", "session_ret_from_open",
+    "ewm_vol", "trend_strength", "range_1",
+    "roll_max_dist", "roll_min_dist",
+    "wday", "days_to_week_end",
+    "news_sent_mean_d1", "news_sent_ewm_d7", "news_intensity_ewm_d7",
 ]
 LIVE_MAX_BARS = 2000  # cap live feature generation to keep UI responsive
+_FRACDIFF_WEIGHT_CACHE = {}
 
 def _kalman_trend(series, q=1e-5, r=1e-2):
     import numpy as _np
@@ -121,6 +138,25 @@ def _hurst_exponent(ts, min_window=10, max_window=100):
         return float(slope)
     except Exception:
         return 0.5
+
+
+def _fractional_diff_weights(d: float, max_terms: int = 48, tol: float = 1e-4):
+    key = (round(float(d), 4), int(max_terms), float(tol))
+    cached = _FRACDIFF_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    weights = [1.0]
+    try:
+        for k in range(1, max_terms):
+            nxt = -weights[-1] * ((float(d) - float(k) + 1.0) / float(k))
+            weights.append(float(nxt))
+            if abs(nxt) < float(tol) and k >= 8:
+                break
+    except Exception:
+        weights = [1.0]
+    out = np.asarray(list(reversed(weights)), dtype=float)
+    _FRACDIFF_WEIGHT_CACHE[key] = out
+    return out
 
 def _compute_vwap(series_price, series_vol):
     try:
@@ -231,6 +267,11 @@ def _attach_news_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Da
         "news_headline_count_d1",
         "news_pos_ratio_d3",
         "news_neg_ratio_d3",
+        "news_sent_ewm_d7",
+        "news_intensity_ewm_d7",
+        "news_entropy_d3",
+        "news_relevance_mean_d3",
+        "news_sent_surprise_d1",
     ]
     for c in cols:
         if c not in df.columns:
@@ -484,6 +525,15 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
         df["rv_20"] = 0.0
         df["robust_vol_20"] = 0.0
     try:
+        pos_ret = df["ret_1"].clip(lower=0.0)
+        neg_ret = (-df["ret_1"].clip(upper=0.0)).clip(lower=0.0)
+        up_semivar = (pos_ret ** 2).rolling(12, min_periods=3).mean()
+        down_semivar = (neg_ret ** 2).rolling(12, min_periods=3).mean()
+        den = (up_semivar + down_semivar).replace(0.0, np.nan)
+        df["semivar_imbalance_12"] = ((up_semivar - down_semivar) / den).fillna(0.0)
+    except Exception:
+        df["semivar_imbalance_12"] = 0.0
+    try:
         df["trend_strength"] = (df["ema_spread"].abs() / (df["ewm_vol"] + 1e-9)).fillna(0.0)
     except Exception:
         df["trend_strength"] = 0.0
@@ -561,6 +611,15 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
         df["hurst"] = df["close_shift_1"].rolling(window=window_len, min_periods=32).apply(lambda x: _hurst_exponent(x.values), raw=False).fillna(0.5)
     except Exception:
         df["hurst"] = 0.5
+    try:
+        weights = _fractional_diff_weights(0.40, max_terms=max(24, HOUR_BARS * 6), tol=1e-4)
+        log_px = np.log(df["close_shift_1"].replace(0, np.nan)).ffill()
+        fd = log_px.rolling(len(weights), min_periods=len(weights)).apply(lambda x: float(np.dot(weights, x)), raw=True)
+        fd_mean = fd.rolling(32, min_periods=8).mean()
+        fd_std = fd.rolling(32, min_periods=8).std().replace(0.0, np.nan)
+        df["fracdiff_log_close_d04"] = ((fd - fd_mean) / fd_std).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-6.0, 6.0)
+    except Exception:
+        df["fracdiff_log_close_d04"] = 0.0
 
     # ----- NEW: volatility-normalized 1-bar return (helps short-horizon models avoid absolute-bias) -----
     try:
@@ -643,6 +702,11 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
         df["roll_min_dist"] = df["roll_min_dist"].clip(0.0, 0.2)
         df["cusum_intensity"] = df["cusum_intensity"].clip(0.0, 1.0)
         df["event_time_since"] = np.log1p(df["event_time_since"].clip(0.0, 500.0))
+        df["semivar_imbalance_12"] = df["semivar_imbalance_12"].clip(-1.0, 1.0)
+        df["news_headline_count_d1"] = np.log1p(df["news_headline_count_d1"].clip(lower=0.0))
+        df["news_intensity_ewm_d7"] = np.log1p(df["news_intensity_ewm_d7"].clip(lower=0.0))
+        df["news_relevance_mean_d3"] = df["news_relevance_mean_d3"].clip(0.0, 1.0)
+        df["news_entropy_d3"] = df["news_entropy_d3"].clip(0.0, 1.0)
     except Exception:
         pass
 
@@ -847,6 +911,66 @@ def build_next_session_dataset(df: pd.DataFrame, instrument_key: str = None) -> 
     session_last["target_high_ret_norm"] = session_last["target_high_ret"] / vol_norm
     session_last["target_low_ret_norm"] = session_last["target_low_ret"] / vol_norm
     return session_last.dropna(subset=["target_high_ret_norm", "target_low_ret_norm"])
+
+def build_weekend_session_dataset(df: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
+    """Build one-row-per-session dataset to predict the current week's close from each prior session close."""
+    df_feat = _build_base_features(df, instrument_key=instrument_key)
+    df_feat = df_feat.replace([np.inf, -np.inf], np.nan).dropna()
+    if df_feat.empty:
+        return pd.DataFrame()
+    try:
+        idx_local = pd.to_datetime(df_feat.index, utc=True).tz_convert("America/New_York")
+    except Exception:
+        idx_local = pd.to_datetime(df_feat.index)
+    df_feat = df_feat.copy()
+    df_feat["iso_year"] = idx_local.isocalendar().year
+    df_feat["iso_week"] = idx_local.isocalendar().week
+    df_feat["dow"] = idx_local.weekday
+    if "session_date" not in df_feat.columns:
+        df_feat["session_date"] = pd.to_datetime(idx_local.date)
+    instr_meta = _get_instrument_meta(instrument_key)
+    try:
+        week_end_day = int(instr_meta.get("week_end_day", 4))
+    except Exception:
+        week_end_day = 4
+    session_groups = df_feat.groupby("session_date", sort=True)
+    if len(session_groups) < 2:
+        return pd.DataFrame()
+    session_last = session_groups.tail(1).copy()
+    session_last = session_last.sort_index()
+    if session_last.empty:
+        return pd.DataFrame()
+    try:
+        last_key = (
+            int(pd.to_numeric(session_last["iso_year"], errors="coerce").iloc[-1]),
+            int(pd.to_numeric(session_last["iso_week"], errors="coerce").iloc[-1]),
+        )
+    except Exception:
+        last_key = None
+
+    def _week_close(g):
+        if last_key and tuple(g.name) == last_key:
+            return np.nan
+        g_end = g[g["dow"] == week_end_day]
+        if not g_end.empty:
+            return float(g_end["close"].iloc[-1])
+        return float(g["close"].iloc[-1])
+
+    week_close = session_last.groupby(["iso_year", "iso_week"], sort=True)[["dow", "close"]].apply(_week_close)
+    session_last = session_last.join(week_close.rename("week_end_close"), on=["iso_year", "iso_week"])
+    session_last = session_last.dropna(subset=["week_end_close", "close"])
+    if session_last.empty:
+        return pd.DataFrame()
+    session_last["target_weekend_ret"] = (session_last["week_end_close"] / session_last["close"]) - 1.0
+    session_last["wday"] = pd.to_numeric(session_last["dow"], errors="coerce").fillna(0.0).astype(float)
+    session_last["days_to_week_end"] = (float(week_end_day) - session_last["wday"]).clip(lower=0.0)
+    try:
+        vol_floor = float(instr_meta.get("vol_floor", 0.00025)) if instr_meta else 0.00025
+    except Exception:
+        vol_floor = 0.00025
+    vol_norm = session_last["ewm_vol"].clip(lower=max(1e-6, vol_floor))
+    session_last["target_weekend_ret_norm"] = session_last["target_weekend_ret"] / vol_norm
+    return session_last.dropna(subset=["target_weekend_ret_norm"])
 
 def build_next_week_dataset(df: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
     """Build one-row-per-week dataset to predict next week close from prior week features."""

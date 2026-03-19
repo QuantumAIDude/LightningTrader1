@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 
 from config import DATA_DIR, INTERVAL, CALIBRATION_MAX_AGE_DAYS, LIVE_CALIBRATION, CALIBRATION_HALF_LIFE_DAYS, DRIFT_ACC_THRESHOLD, DRIFT_MIN_SAMPLES
+from accuracy_windows import price_window_threshold_dollars
 
 logger = logging.getLogger(__name__)
 
@@ -78,13 +79,21 @@ def _load_state(instrument_key: str):
             "by_model_stats": {},
             "global": {},
             "recent_outcomes": [],
-            "recent_abs_errors": []
+            "recent_abs_errors": [],
+            "recent_price_abs_errors": [],
+            "recent_price_window_ratios": [],
+            "recent_price_window_hits": [],
+            "recent_price_window_thresholds": [],
         }
     try:
         with open(path, "r") as f:
             state = json.load(f)
         state.setdefault("recent_outcomes", [])
         state.setdefault("recent_abs_errors", [])
+        state.setdefault("recent_price_abs_errors", [])
+        state.setdefault("recent_price_window_ratios", [])
+        state.setdefault("recent_price_window_hits", [])
+        state.setdefault("recent_price_window_thresholds", [])
         return state
     except Exception:
         logger.exception("Failed to read calibration state")
@@ -95,7 +104,11 @@ def _load_state(instrument_key: str):
             "by_model_stats": {},
             "global": {},
             "recent_outcomes": [],
-            "recent_abs_errors": []
+            "recent_abs_errors": [],
+            "recent_price_abs_errors": [],
+            "recent_price_window_ratios": [],
+            "recent_price_window_hits": [],
+            "recent_price_window_thresholds": [],
         }
 
 def _save_state(instrument_key: str, state: dict):
@@ -118,6 +131,36 @@ def _bucket_from_sig(sig):
     if sig in ("Weak", "Medium", "Strong"):
         return sig
     return "Medium"
+
+
+def _is_flat_prediction_row(row, model_keys, eps: float = 1e-9) -> bool:
+    """
+    Skip abstentions/no-trade snapshots from live calibration.
+    We want calibration on meaningful emitted signals, not flat guard rows.
+    """
+    try:
+        consensus_dir = str(row.get("consensus_dir", "") or "").strip()
+    except Exception:
+        consensus_dir = ""
+    try:
+        consensus_pred = row.get("consensus_pred_ret")
+        consensus_pred = None if consensus_pred is None or pd.isna(consensus_pred) else float(consensus_pred)
+    except Exception:
+        consensus_pred = None
+    if consensus_dir in ("UP", "DOWN"):
+        return False
+    if consensus_pred is not None and abs(consensus_pred) > float(eps):
+        return False
+    for k in model_keys:
+        try:
+            pred = row.get(f"{k}_pred_ret")
+            if pred is None or pd.isna(pred):
+                continue
+            if abs(float(pred)) > float(eps):
+                return False
+        except Exception:
+            continue
+    return True
 
 def _apply_decay(state: dict, now: datetime):
     try:
@@ -191,6 +234,7 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
         return {"updated": 0, "skipped": 0}
 
     model_keys = ["base", "forest", "boost", "extra_trees", "meta", "consensus"]
+    gui_model_keys = {"base", "forest", "boost", "extra_trees"}
     updated = 0
     skipped = 0
     processed_timestamps = []
@@ -199,6 +243,9 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
     state.setdefault("global", {}).setdefault("total", 0.0)
     state.setdefault("by_model_stats", {})
     for _, row in preds.iterrows():
+        if _is_flat_prediction_row(row, model_keys):
+            skipped += 1
+            continue
         ts = row.get("timestamp")
         if pd.isna(ts):
             skipped += 1
@@ -222,6 +269,7 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
 
         row_used = False
         row_preds = []
+        row_gui_preds = []
         for k in model_keys:
             pred_ret = row.get(f"{k}_pred_ret")
             sig = row.get(f"{k}_sig_bucket")
@@ -233,6 +281,8 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
                 continue
             correct = (pred_ret >= 0) == (actual_ret >= 0)
             row_preds.append(pred_ret)
+            if k in gui_model_keys:
+                row_gui_preds.append(pred_ret)
             bucket = _bucket_from_sig(sig)
             state.setdefault("by_model", {}).setdefault(k, {}).setdefault(bucket, {"wins": 0, "total": 0})
             state["by_model"][k][bucket]["wins"] += int(correct)
@@ -251,18 +301,23 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
             row_used = True
         if row_used:
             # Keep a short, row-level correctness history for faster drift reaction.
-            # Prefer consensus if present; otherwise use mean model sign.
+            # Track the same equal-weight model average the GUI displays.
             row_correct = None
             try:
-                c_pred = row.get("consensus_pred_ret")
-                if c_pred is not None and not pd.isna(c_pred):
-                    c_pred = float(c_pred)
-                    row_correct = int((c_pred >= 0) == (actual_ret >= 0))
+                if row_gui_preds:
+                    row_mean_pred = float(np.mean(row_gui_preds))
+                    row_correct = int((row_mean_pred >= 0) == (actual_ret >= 0))
+                elif row_preds:
+                    row_mean_pred = float(np.mean(row_preds))
+                    row_correct = int((row_mean_pred >= 0) == (actual_ret >= 0))
             except Exception:
                 row_correct = None
-            if row_correct is None and row_preds:
+            if row_correct is None:
                 try:
-                    row_correct = int((float(np.mean(row_preds)) >= 0) == (actual_ret >= 0))
+                    c_pred = row.get("consensus_pred_ret")
+                    if c_pred is not None and not pd.isna(c_pred):
+                        c_pred = float(c_pred)
+                        row_correct = int((c_pred >= 0) == (actual_ret >= 0))
                 except Exception:
                     row_correct = None
             if row_correct is not None:
@@ -271,15 +326,62 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
                 if len(recent) > 500:
                     state["recent_outcomes"] = recent[-500:]
             try:
-                c_pred = row.get("consensus_pred_ret")
-                if c_pred is not None and not pd.isna(c_pred):
-                    c_pred = float(c_pred)
-                    abs_err = abs(float(actual_ret - c_pred))
+                row_price_pred = None
+                if row_gui_preds:
+                    row_mean_pred = float(np.mean(row_gui_preds))
+                    abs_err = abs(float(actual_ret - row_mean_pred))
                     if np.isfinite(abs_err):
                         errs = state.setdefault("recent_abs_errors", [])
                         errs.append(float(abs_err))
                         if len(errs) > 1000:
                             state["recent_abs_errors"] = errs[-1000:]
+                    row_price_pred = float(last_price * (1.0 + row_mean_pred))
+                elif row_preds:
+                    row_mean_pred = float(np.mean(row_preds))
+                    abs_err = abs(float(actual_ret - row_mean_pred))
+                    if np.isfinite(abs_err):
+                        errs = state.setdefault("recent_abs_errors", [])
+                        errs.append(float(abs_err))
+                        if len(errs) > 1000:
+                            state["recent_abs_errors"] = errs[-1000:]
+                    row_price_pred = float(last_price * (1.0 + row_mean_pred))
+                else:
+                    c_pred = row.get("consensus_pred_ret")
+                    if c_pred is not None and not pd.isna(c_pred):
+                        c_pred = float(c_pred)
+                        abs_err = abs(float(actual_ret - c_pred))
+                        if np.isfinite(abs_err):
+                            errs = state.setdefault("recent_abs_errors", [])
+                            errs.append(float(abs_err))
+                            if len(errs) > 1000:
+                                state["recent_abs_errors"] = errs[-1000:]
+                        row_price_pred = float(last_price * (1.0 + c_pred))
+                if row_price_pred is not None:
+                    pred_price = float(row_price_pred)
+                    price_abs_err = abs(float(actual_price - pred_price))
+                    if np.isfinite(price_abs_err):
+                        window_thr = price_window_threshold_dollars(
+                            "intraday",
+                            instrument_key=instrument_key,
+                            reference_price=actual_price,
+                        )
+                        window_ratio = float(price_abs_err / max(1e-9, window_thr))
+                        price_errs = state.setdefault("recent_price_abs_errors", [])
+                        price_errs.append(float(price_abs_err))
+                        if len(price_errs) > 1000:
+                            state["recent_price_abs_errors"] = price_errs[-1000:]
+                        ratios = state.setdefault("recent_price_window_ratios", [])
+                        ratios.append(window_ratio)
+                        if len(ratios) > 1000:
+                            state["recent_price_window_ratios"] = ratios[-1000:]
+                        hits = state.setdefault("recent_price_window_hits", [])
+                        hits.append(int(price_abs_err <= window_thr))
+                        if len(hits) > 1000:
+                            state["recent_price_window_hits"] = hits[-1000:]
+                        thresholds = state.setdefault("recent_price_window_thresholds", [])
+                        thresholds.append(float(window_thr))
+                        if len(thresholds) > 1000:
+                            state["recent_price_window_thresholds"] = thresholds[-1000:]
             except Exception:
                 pass
             updated += 1
@@ -312,12 +414,21 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
         # Slightly stricter threshold for recent window so we react earlier to sharp degradation.
         recent_thresh = min(0.55, float(DRIFT_ACC_THRESHOLD) + 0.05)
         recent_drift = bool(recent_total >= recent_min and recent_acc < recent_thresh)
+        recent_hits = [int(x) for x in state.get("recent_price_window_hits", []) if str(x) in ("0", "1")]
+        recent_hit_slice = recent_hits[-recent_window:] if recent_hits else []
+        recent_hit_total = len(recent_hit_slice)
+        recent_hit_rate = float(np.mean(recent_hit_slice)) if recent_hit_total > 0 else 1.0
+        price_drift = bool(recent_hit_total >= recent_min and recent_hit_rate < 0.52)
         state["recent_acc"] = float(recent_acc)
         state["recent_total"] = int(recent_total)
         state["recent_drift_flag"] = bool(recent_drift)
-        state["drift_flag"] = bool(global_drift or recent_drift)
+        state["recent_price_window_hit_rate"] = float(recent_hit_rate)
+        state["recent_price_window_total"] = int(recent_hit_total)
+        state["recent_price_drift_flag"] = bool(price_drift)
+        state["drift_flag"] = bool(global_drift or recent_drift or price_drift)
     except Exception:
         state["drift_flag"] = False
         state["recent_drift_flag"] = False
+        state["recent_price_drift_flag"] = False
     _save_state(instrument_key, state)
     return {"updated": updated, "skipped": skipped}
