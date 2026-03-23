@@ -40,6 +40,16 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_float(value):
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(out):
+        return None
+    return float(out)
+
 _POS_WORDS = {
     "beat", "beats", "surge", "surges", "record", "gain", "gains", "upgrade", "upgrades",
     "strong", "growth", "rally", "rallies", "bullish", "outperform", "innovate", "innovation",
@@ -941,3 +951,31 @@ def load_news_features_for_index(
         if c not in aligned.columns:
             aligned[c] = 0.0
     return aligned[cols]
+
+
+def load_recent_headlines(symbol: str = "QQQ", limit: int = 8) -> list[dict]:
+    path = _news_path(symbol.upper())
+    if not os.path.exists(path):
+        return []
+    try:
+        df = _normalize_news_frame(pd.read_csv(path), default_symbol=symbol.upper())
+    except Exception:
+        logger.debug("Failed to read news store for recent headlines", exc_info=True)
+        return []
+    if df is None or df.empty:
+        return []
+    df = df.sort_values("published_at", ascending=False).head(max(1, int(limit))).copy()
+    rows = []
+    for _, row in df.iterrows():
+        rows.append(
+            {
+                "published_at": row.get("published_at"),
+                "headline": str(row.get("headline") or "").strip(),
+                "score": _safe_float(row.get("sentiment_score")),
+                "label": str(row.get("sentiment_label") or "").strip(),
+                "relevance": _safe_float(row.get("relevance_score")),
+                "source": str(row.get("source") or "").strip(),
+                "url": str(row.get("url") or "").strip(),
+            }
+        )
+    return rows

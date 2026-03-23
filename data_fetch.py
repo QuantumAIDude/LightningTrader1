@@ -14,6 +14,7 @@ from config import (
     YFINANCE_LOOKBACK_DAYS, YFINANCE_REFRESH_BUFFER_DAYS, NEWS_PIPELINE_SYMBOL
 )
 from instrument_onboarding import ensure_runtime_instruments
+from market_context import maybe_refresh_context_data
 from news_pipeline import maybe_refresh_news
 
 logger = logging.getLogger(__name__)
@@ -483,6 +484,10 @@ def update_price_data(instr_key: str = None):
                 maybe_refresh_news(symbol=instr_key)
         except Exception:
             logger.debug("News refresh failed", exc_info=True)
+        try:
+            maybe_refresh_context_data(instr_key)
+        except Exception:
+            logger.debug("Context refresh failed", exc_info=True)
 
         instr = INSTRUMENTS.get(instr_key, {})
         instr_type = instr.get("type", "equity")

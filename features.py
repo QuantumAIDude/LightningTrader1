@@ -27,6 +27,11 @@ try:
 except Exception:
     load_news_features_for_index = None
 
+try:
+    from market_context import add_context_features
+except Exception:
+    add_context_features = None
+
 # ===== CONFIG =====
 # We'll target a 4-minute prediction horizon by default; compute bars from INTERVAL
 PREDICT_MINUTES = 4  # target horizon in minutes (explicit)
@@ -50,7 +55,9 @@ DEFAULT_FEATURES = [
     "ret_1_norm", "overnight_gap", "session_volatility", "session_ret_from_open",
     # QQQ news sentiment context (lag-safe daily aggregates)
     "news_sent_mean_d1", "news_sent_sum_d3", "news_headline_count_d1", "news_pos_ratio_d3", "news_neg_ratio_d3",
-    "news_sent_ewm_d7", "news_intensity_ewm_d7", "news_entropy_d3", "news_relevance_mean_d3", "news_sent_surprise_d1"
+    "news_sent_ewm_d7", "news_intensity_ewm_d7", "news_entropy_d3", "news_relevance_mean_d3", "news_sent_surprise_d1",
+    # low-capacity cross-asset context
+    "ctx_market_ret_1", "ctx_sector_rel_1", "ctx_vol_level_z", "ctx_lead_lag_spread_1", "ctx_rates_risk_spread_1",
 ]
 DAILY_HORIZON_FEATURES = [
     "ret_1", "ret_6", "mom_6", "mom_12",
@@ -58,6 +65,7 @@ DAILY_HORIZON_FEATURES = [
     "ewm_vol", "trend_strength", "range_1",
     "roll_max_dist", "roll_min_dist",
     "news_sent_mean_d1", "news_sent_ewm_d7", "news_intensity_ewm_d7",
+    "ctx_market_ret_1", "ctx_market_ret_5", "ctx_vol_level_z", "ctx_sector_rel_1",
 ]
 WEEKEND_HORIZON_FEATURES = [
     "ret_1", "ret_6", "mom_6", "mom_12",
@@ -66,6 +74,7 @@ WEEKEND_HORIZON_FEATURES = [
     "roll_max_dist", "roll_min_dist",
     "wday", "days_to_week_end",
     "news_sent_mean_d1", "news_sent_ewm_d7", "news_intensity_ewm_d7",
+    "ctx_market_ret_1", "ctx_market_ret_5", "ctx_vol_level_z", "ctx_lead_lag_spread_1",
 ]
 LIVE_MAX_BARS = 2000  # cap live feature generation to keep UI responsive
 _FRACDIFF_WEIGHT_CACHE = {}
@@ -89,7 +98,7 @@ def _kalman_trend(series, q=1e-5, r=1e-2):
         x = F.dot(x)
         P = F.dot(P).dot(F.T) + Q
         y_pred = float(H.dot(x)[0])
-        S = float(H.dot(P).dot(H.T) + R)
+        S = float((H.dot(P).dot(H.T) + R)[0, 0])
         if S <= 0:
             K = _np.zeros((2,1))
         else:
@@ -692,6 +701,9 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
 
     # News-driven context (QQQ only). Values remain zero for other symbols.
     df = _attach_news_features(df, instrument_key=instrument_key)
+    if add_context_features is not None:
+        # Intraday forecasts only get prior daily context, never same-day close information.
+        df = add_context_features(df, instrument_key=instrument_key, shift_days=1)
 
     # Clip extreme feature values to stabilize training
     try:
@@ -740,6 +752,8 @@ def build_features_for_training(
     instr_meta = _get_instrument_meta(instrument_key)
     df = _filter_extreme_moves(df, instr_meta=instr_meta)
     df = _build_base_features(df, instrument_key=instrument_key)
+    if (daily_horizon or weekend_horizon) and add_context_features is not None:
+        df = add_context_features(df, instrument_key=instrument_key, shift_days=0)
     if daily_horizon:
         try:
             has_ohlc_mask = df.get("_has_ohlc", pd.Series([False] * len(df), index=df.index)).astype(bool)
@@ -900,6 +914,8 @@ def build_next_session_dataset(df: pd.DataFrame, instrument_key: str = None) -> 
     session_last = session_last.dropna(subset=["next_high", "next_low", "close"])
     if session_last.empty:
         return pd.DataFrame()
+    if add_context_features is not None:
+        session_last = add_context_features(session_last, instrument_key=instrument_key, shift_days=0)
     session_last["target_high_ret"] = (session_last["next_high"] / session_last["close"]) - 1.0
     session_last["target_low_ret"] = (session_last["next_low"] / session_last["close"]) - 1.0
     instr_meta = _get_instrument_meta(instrument_key)
@@ -961,6 +977,8 @@ def build_weekend_session_dataset(df: pd.DataFrame, instrument_key: str = None) 
     session_last = session_last.dropna(subset=["week_end_close", "close"])
     if session_last.empty:
         return pd.DataFrame()
+    if add_context_features is not None:
+        session_last = add_context_features(session_last, instrument_key=instrument_key, shift_days=0)
     session_last["target_weekend_ret"] = (session_last["week_end_close"] / session_last["close"]) - 1.0
     session_last["wday"] = pd.to_numeric(session_last["dow"], errors="coerce").fillna(0.0).astype(float)
     session_last["days_to_week_end"] = (float(week_end_day) - session_last["wday"]).clip(lower=0.0)
@@ -1007,6 +1025,8 @@ def build_next_week_dataset(df: pd.DataFrame, instrument_key: str = None) -> pd.
     week_last = week_last.dropna(subset=["next_week_close", "close"])
     if week_last.empty:
         return pd.DataFrame()
+    if add_context_features is not None:
+        week_last = add_context_features(week_last, instrument_key=instrument_key, shift_days=0)
     week_last["target_weekend_ret"] = (week_last["next_week_close"] / week_last["close"]) - 1.0
     try:
         vol_floor = float(instr_meta.get("vol_floor", 0.00025)) if instr_meta else 0.00025

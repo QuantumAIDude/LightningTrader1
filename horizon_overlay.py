@@ -12,6 +12,10 @@ from features import _build_base_features, build_next_session_dataset, build_wee
 from accuracy_windows import min_window_hit_rate, summarize_price_window_errors
 from forecast_calibration import apply_return_calibration, fit_return_calibration, score_return_forecast
 try:
+    from market_context import add_context_features
+except Exception:
+    add_context_features = None
+try:
     from news_pipeline import load_news_features_for_index, news_archive_coverage
 except Exception:
     load_news_features_for_index = None
@@ -29,8 +33,23 @@ _CURRENT_HEURISTIC_CACHE: dict[tuple, float | None] = {}
 _SNAPSHOT_CACHE: dict[str, pd.DataFrame] = {}
 _OUTCOME_CACHE: dict[str, pd.DataFrame] = {}
 
-_STRUCTURAL_DAILY_CENTER_FEATURES = ("ret_1", "ema_spread", "vol_20", "close_loc", "wday")
-_STRUCTURAL_DAILY_RANGE_FEATURES = ("range_1", "atr_5", "vol_20", "wday")
+_STRUCTURAL_DAILY_CENTER_FEATURES = (
+    "ret_1",
+    "ema_spread",
+    "vol_20",
+    "close_loc",
+    "wday",
+    "ctx_market_ret_1",
+    "ctx_vol_level_z",
+)
+_STRUCTURAL_DAILY_RANGE_FEATURES = (
+    "range_1",
+    "atr_5",
+    "vol_20",
+    "wday",
+    "ctx_vol_level_z",
+    "ctx_market_vol_20",
+)
 _STRUCTURAL_WEEKEND_FEATURES = (
     "days_to_week_end",
     "week_ret_sofar",
@@ -38,6 +57,8 @@ _STRUCTURAL_WEEKEND_FEATURES = (
     "prev_week_ret",
     "prev_week_range",
     "gap_1",
+    "ctx_market_ret_5",
+    "ctx_vol_level_z",
 )
 _STRUCTURAL_WEEKEND_SESSION_FEATURES = (
     "days_to_week_end",
@@ -48,12 +69,22 @@ _STRUCTURAL_WEEKEND_SESSION_FEATURES = (
     "session_range",
     "prev_week_ret",
     "prev_week_range",
+    "ctx_market_ret_1",
+    "ctx_vol_level_z",
 )
 _LONG_HORIZON_NEWS_FEATURES = (
     "news_sent_ewm_d7",
     "news_intensity_ewm_d7",
     "news_relevance_mean_d3",
 )
+
+
+def _clean_numeric_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    num_cols = out.select_dtypes(include=[np.number]).columns
+    if len(num_cols):
+        out.loc[:, num_cols] = out.loc[:, num_cols].replace([np.inf, -np.inf], np.nan)
+    return out.infer_objects(copy=False)
 
 _HORIZON_SPECS = {
     "daily_high": {
@@ -439,7 +470,7 @@ def _search_price_blend(base_prices, direct_prices, actual_prices, horizon: str,
     }
 
 
-def _daily_long_feature_frame(daily_df: pd.DataFrame) -> pd.DataFrame:
+def _daily_long_feature_frame(daily_df: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
     df = _normalize_daily_history(daily_df)
     if df.empty:
         return pd.DataFrame()
@@ -462,12 +493,14 @@ def _daily_long_feature_frame(daily_df: pd.DataFrame) -> pd.DataFrame:
     out["ema_20"] = out["close"].ewm(span=20, adjust=False).mean()
     out["ema_spread"] = (out["ema_5"] / out["ema_20"]) - 1.0
     out["close_loc"] = ((out["close"] - out["low"]) / (out["high"] - out["low"]).replace(0.0, np.nan)).clip(0.0, 1.0)
+    if add_context_features is not None:
+        out = add_context_features(out, instrument_key=instrument_key, shift_days=0)
     out = out.replace([np.inf, -np.inf], np.nan)
     return out
 
 
-def _build_structural_daily_pair_dataset(daily_df: pd.DataFrame) -> pd.DataFrame:
-    feat = _daily_long_feature_frame(daily_df)
+def _build_structural_daily_pair_dataset(daily_df: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
+    feat = _daily_long_feature_frame(daily_df, instrument_key=instrument_key)
     if feat.empty:
         return pd.DataFrame()
     out = feat.copy()
@@ -478,8 +511,8 @@ def _build_structural_daily_pair_dataset(daily_df: pd.DataFrame) -> pd.DataFrame
     return out.dropna(subset=["target_center_ret", "target_range_ret"] + list(_STRUCTURAL_DAILY_CENTER_FEATURES) + list(_STRUCTURAL_DAILY_RANGE_FEATURES))
 
 
-def _build_structural_weekend_dataset(daily_df: pd.DataFrame) -> pd.DataFrame:
-    feat = _daily_long_feature_frame(daily_df)
+def _build_structural_weekend_dataset(daily_df: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
+    feat = _daily_long_feature_frame(daily_df, instrument_key=instrument_key)
     if feat.empty:
         return pd.DataFrame()
     out = feat.copy()
@@ -671,6 +704,8 @@ def _build_weekly_session_close_dataset(prices: pd.DataFrame, instrument_key: st
     session_last["target_weekend_ret"] = (session_last["week_end_close"] / session_last["session_close"]) - 1.0
     session_last["target_week_high_ret"] = (session_last["week_end_high"] / session_last["session_close"]) - 1.0
     session_last["target_week_low_ret"] = (session_last["week_end_low"] / session_last["session_close"]) - 1.0
+    if add_context_features is not None:
+        session_last = add_context_features(session_last, instrument_key=instrument_key, shift_days=0)
     keep_cols = [
         "target_key",
         "date_key",
@@ -690,6 +725,10 @@ def _build_weekly_session_close_dataset(prices: pd.DataFrame, instrument_key: st
         "overnight_gap",
         "ret_6",
         "mom_12",
+        "ctx_market_ret_1",
+        "ctx_market_ret_5",
+        "ctx_market_vol_20",
+        "ctx_vol_level_z",
         "prev_week_ret",
         "prev_week_range",
         "target_weekend_ret",
@@ -708,9 +747,32 @@ def refresh_structural_snapshots(instrument_key: str, prices: pd.DataFrame | Non
     if price_df is None or price_df.empty:
         return pd.DataFrame()
     daily_long = _load_long_daily_history(instrument)
-    daily_struct = _build_structural_daily_pair_dataset(daily_long)
+    daily_struct = _build_structural_daily_pair_dataset(daily_long, instrument_key=instrument)
     if not daily_struct.empty:
-        daily_struct = daily_struct[["date_key", "close", "target_high_ret", "target_low_ret", "target_center_ret", "target_range_ret", "ret_1", "ret_5", "vol_5", "vol_20", "range_1", "body_1", "gap_1", "atr_5", "ema_spread", "close_loc"]].drop_duplicates(subset=["date_key"], keep="last")
+        daily_struct = daily_struct[
+            [
+                "date_key",
+                "close",
+                "target_high_ret",
+                "target_low_ret",
+                "target_center_ret",
+                "target_range_ret",
+                "ret_1",
+                "ret_5",
+                "vol_5",
+                "vol_20",
+                "range_1",
+                "body_1",
+                "gap_1",
+                "atr_5",
+                "ema_spread",
+                "close_loc",
+                "ctx_market_ret_1",
+                "ctx_market_ret_5",
+                "ctx_market_vol_20",
+                "ctx_vol_level_z",
+            ]
+        ].drop_duplicates(subset=["date_key"], keep="last")
     daily_targets = _daily_training_frame(price_df, instrument).tail(max(2, int(max_daily_targets))).copy()
     daily_rows = []
     if not daily_targets.empty:
@@ -724,7 +786,18 @@ def refresh_structural_snapshots(instrument_key: str, prices: pd.DataFrame | Non
     weekly_targets = _build_weekly_session_close_dataset(price_df, instrument, include_incomplete_last_week=False).tail(max(2, int(max_week_targets))).copy()
     if not weekly_targets.empty:
         if not daily_struct.empty:
-            merge_cols = ["date_key", "vol_20", "atr_5", "ema_spread", "close_loc", "gap_1"]
+            merge_cols = [
+                "date_key",
+                "vol_20",
+                "atr_5",
+                "ema_spread",
+                "close_loc",
+                "gap_1",
+                "ctx_market_ret_1",
+                "ctx_market_ret_5",
+                "ctx_market_vol_20",
+                "ctx_vol_level_z",
+            ]
             weekly_targets = weekly_targets.merge(daily_struct[merge_cols], on="date_key", how="left")
         weekly_targets["snapshot_type"] = "weekend_session"
         weekly_targets, coverage = _attach_snapshot_news(weekly_targets, instrument)
@@ -858,7 +931,7 @@ def _run_daily_candidate_outcomes(dataset: pd.DataFrame, spec: dict) -> list[dic
         ]
     else:
         frame["bucket_key"] = "global"
-    frame = frame.replace([np.inf, -np.inf], np.nan).infer_objects(copy=False).sort_values("target_key")
+    frame = _clean_numeric_frame(frame).sort_values("target_key")
     frame = frame.dropna(subset=["target_key", "close", "target_center_ret", "target_range_ret"] + list(spec.get("center_features", ())) + list(spec.get("range_features", ())))
     rows = []
     min_train = max(8, len(spec.get("center_features", ())) + 3, len(spec.get("range_features", ())) + 3)
@@ -911,7 +984,7 @@ def _run_weekend_candidate_outcomes(dataset: pd.DataFrame, spec: dict) -> list[d
         frame["bucket_key"] = [_week_bucket_label(v, coarse=True) for v in pd.to_numeric(frame.get("wday"), errors="coerce").fillna(-1)]
     else:
         frame["bucket_key"] = "global"
-    frame = frame.replace([np.inf, -np.inf], np.nan).infer_objects(copy=False).sort_values("target_key")
+    frame = _clean_numeric_frame(frame).sort_values("target_key")
     frame = frame.dropna(subset=["target_key", "close", "target_weekend_ret"] + list(spec.get("features", ())))
     rows = []
     min_train = max(5, len(spec.get("features", ())) + 2)
@@ -1099,6 +1172,8 @@ def _daily_current_row(prices: pd.DataFrame, instrument_key: str) -> pd.DataFram
     current = feat.groupby("session_date", sort=True).tail(1).tail(1).copy()
     if current.empty:
         return pd.DataFrame()
+    if add_context_features is not None:
+        current = add_context_features(current, instrument_key=instrument_key, shift_days=0)
     current["wday"] = _local_wday(current.index)
     return current
 
@@ -1118,6 +1193,8 @@ def _week_current_row(prices: pd.DataFrame, instrument_key: str) -> pd.DataFrame
     feat["wday"] = np.asarray(idx_local.weekday, dtype=float)
     feat["days_to_week_end"] = (4.0 - feat["wday"]).clip(lower=0.0)
     current = feat.groupby(["iso_year", "iso_week"], sort=True).tail(1).tail(1).copy()
+    if add_context_features is not None and not current.empty:
+        current = add_context_features(current, instrument_key=instrument_key, shift_days=0)
     return current if not current.empty else pd.DataFrame()
 
 

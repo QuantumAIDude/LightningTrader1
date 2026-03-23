@@ -207,6 +207,13 @@ REGIME_LOOK_HOURS_DAILY = int(os.environ.get("REGIME_LOOK_HOURS_DAILY", "48"))
 REGIME_LOOK_HOURS_WEEKEND = int(os.environ.get("REGIME_LOOK_HOURS_WEEKEND", "120"))
 # Daily/weekly horizon fetch (disable remote to keep UI fast/offline)
 ALLOW_REMOTE_DAILY = os.environ.get("ALLOW_REMOTE_DAILY", "false").lower() in ("1", "true", "yes")
+# Low-capacity cross-asset context inputs (broad market, vol, rates, lead futures).
+CONTEXT_PIPELINE_ENABLED = os.environ.get("CONTEXT_PIPELINE_ENABLED", "true").lower() in ("1", "true", "yes")
+CONTEXT_REFRESH_MAX_AGE_HOURS = float(os.environ.get("CONTEXT_REFRESH_MAX_AGE_HOURS", "18"))
+ALLOW_REMOTE_CONTEXT_DAILY = os.environ.get("ALLOW_REMOTE_CONTEXT_DAILY", "true").lower() in ("1", "true", "yes")
+OPTIONS_PANEL_ENABLED = os.environ.get("OPTIONS_PANEL_ENABLED", "true").lower() in ("1", "true", "yes")
+ALLOW_REMOTE_OPTIONS = os.environ.get("ALLOW_REMOTE_OPTIONS", "true").lower() in ("1", "true", "yes")
+OPTIONS_REFRESH_COOLDOWN_SEC = int(os.environ.get("OPTIONS_REFRESH_COOLDOWN_SEC", "900"))
 
 # Retrain schedule (strings: 'daily', 'weekly', 'monthly', or integer days)
 RETRAIN_SHORT = os.environ.get("RETRAIN_SHORT", "1")   # daily
@@ -231,6 +238,25 @@ Path(NEW_INSTRUMENTS_DIR).mkdir(parents=True, exist_ok=True)
 Path(NEW_INSTRUMENTS_PROCESSED_DIR).mkdir(parents=True, exist_ok=True)
 Path(NEW_INSTRUMENTS_FAILED_DIR).mkdir(parents=True, exist_ok=True)
 
+def _default_context_daily_symbols(symbol: str) -> dict:
+    sym = str(symbol or "").upper()
+    base = {
+        "market": "SPY",
+        "vol": "^VIX",
+        "lead_fut": "ES=F",
+        "rates": "TLT",
+    }
+    if sym == "QQQ":
+        base.update(
+            {
+                "sector": "XLK",
+                "vol": "^VXN",
+                "lead_fut": "NQ=F",
+            }
+        )
+    return {str(k): str(v) for k, v in base.items() if v}
+
+
 def _default_equity_meta(symbol: str) -> dict:
     sym = str(symbol or "").upper()
     return {
@@ -246,6 +272,7 @@ def _default_equity_meta(symbol: str) -> dict:
         "stale_multiplier": 3.5,
         "closed_max_stale_hours": 80.0,
         "target_vol": 0.004,
+        "context_daily_symbols": _default_context_daily_symbols(sym),
     }
 
 def _load_external_instruments(path: str) -> dict:

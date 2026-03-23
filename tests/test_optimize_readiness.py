@@ -37,14 +37,12 @@ class OptimizeReadinessTests(unittest.TestCase):
             ["4min", "daily_high", "daily_low", "weekend"],
         )
 
-    def test_profitability_failure_retrains_intraday(self):
+    def test_active_failure_retrains_intraday(self):
         checks = {
             "weekend_window_ok": True,
             "daily_window_ok": True,
             "intraday_window_ok": True,
-            "net_ok": False,
-            "sharpe_ok": True,
-            "active_ok": True,
+            "active_ok": False,
             "horizon_score_ok": True,
             "folds_ok": True,
         }

@@ -45,6 +45,25 @@ _PROVIDER_SUFFIXES = {"alpaca", "yfinance", "auto", "ibkr"}
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9\.\-]{0,19}$")
 
 
+def _default_context_daily_symbols(symbol: str) -> dict:
+    sym = str(symbol or "").upper()
+    base = {
+        "market": "SPY",
+        "vol": "^VIX",
+        "lead_fut": "ES=F",
+        "rates": "TLT",
+    }
+    if sym == "QQQ":
+        base.update(
+            {
+                "sector": "XLK",
+                "vol": "^VXN",
+                "lead_fut": "NQ=F",
+            }
+        )
+    return {str(k): str(v) for k, v in base.items() if v}
+
+
 def _default_equity_meta(symbol: str) -> dict:
     sym = str(symbol or "").upper()
     return {
@@ -60,6 +79,7 @@ def _default_equity_meta(symbol: str) -> dict:
         "stale_multiplier": 3.5,
         "closed_max_stale_hours": 80.0,
         "target_vol": 0.004,
+        "context_daily_symbols": _default_context_daily_symbols(sym),
     }
 
 
