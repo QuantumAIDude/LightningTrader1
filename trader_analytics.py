@@ -6,10 +6,22 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from advisory_engine import build_advisory_snapshot
+from alert_engine import get_alert_snapshot
+from breadth_analytics import get_breadth_snapshot
+from catalyst_providers import get_catalyst_provider_snapshot
 from config import DATA_DIR, DEFAULT_INSTRUMENT, INSTRUMENTS
+from execution_engine import get_execution_dashboard_snapshot
+from event_analytics import get_event_snapshot
+from liquidity_analytics import get_liquidity_snapshot
 from market_context import load_context_daily_history
-from news_pipeline import load_recent_headlines
+from macro_events import get_macro_event_snapshot
+from news_pipeline import load_recent_headlines, news_archive_coverage
 from options_analytics import get_options_snapshot
+from opportunity_scanner import get_opportunity_scan
+from performance_analytics import get_performance_snapshot
+from replay_engine import get_replay_dashboard_snapshot
+from trader_profiles import get_trader_profile
 
 
 def _safe_float(value):
@@ -183,6 +195,108 @@ def _market_context_rows(instrument_key: str) -> list[tuple[str, str, str]]:
     return rows
 
 
+def _signal_rows(df: pd.DataFrame, instrument_key: str, options_snapshot: dict | None = None) -> list[tuple[str, str, str]]:
+    rows = []
+    daily_long = _load_long_daily_history(instrument_key)
+    if daily_long is None or daily_long.empty or "close" not in daily_long.columns:
+        return rows
+    close = pd.to_numeric(daily_long["close"], errors="coerce").dropna()
+    if len(close) < 5:
+        return rows
+    ret = close.pct_change().dropna()
+    mapping = _instrument_meta(instrument_key).get("context_daily_symbols", {})
+    market_hist = load_context_daily_history(str(instrument_key).upper(), "market", allow_remote=False)
+    if market_hist is not None and not market_hist.empty and "close" in market_hist.columns:
+        m_close = pd.to_numeric(market_hist["close"], errors="coerce").dropna()
+        joined = pd.concat([ret.rename("asset"), m_close.pct_change().rename("market")], axis=1).dropna()
+        if len(joined) >= 5:
+            beta20 = None
+            tail = joined.tail(20)
+            if len(tail) >= 8 and float(tail["market"].var()) > 1e-12:
+                beta20 = _safe_float(tail["asset"].cov(tail["market"]) / tail["market"].var())
+            rs20 = _safe_float((1.0 + tail["asset"]).prod() - (1.0 + tail["market"]).prod())
+            rows.append((f"RS vs {mapping.get('market', 'Mkt')}", _fmt_pct(rs20), f"Beta20 {beta20:.2f}" if beta20 is not None else "Beta20 -"))
+    sector_hist = load_context_daily_history(str(instrument_key).upper(), "sector", allow_remote=False)
+    if sector_hist is not None and not sector_hist.empty and "close" in sector_hist.columns:
+        s_close = pd.to_numeric(sector_hist["close"], errors="coerce").dropna()
+        joined = pd.concat([ret.rename("asset"), s_close.pct_change().rename("sector")], axis=1).dropna()
+        if len(joined) >= 5:
+            tail = joined.tail(20)
+            rs20 = _safe_float((1.0 + tail["asset"]).prod() - (1.0 + tail["sector"]).prod())
+            rows.append((f"RS vs {mapping.get('sector', 'Sector')}", _fmt_pct(rs20), f"20D {_fmt_pct(((1.0 + tail['asset']).prod() - 1.0))}"))
+    high = pd.to_numeric(daily_long["high"], errors="coerce") if "high" in daily_long.columns else None
+    low = pd.to_numeric(daily_long["low"], errors="coerce") if "low" in daily_long.columns else None
+    atr14 = None
+    if isinstance(high, pd.Series) and isinstance(low, pd.Series):
+        prev_close = close.shift(1)
+        tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        atr14 = _safe_float(tr.rolling(14, min_periods=5).mean().iloc[-1]) if len(tr) else None
+    exp_move = _safe_float((options_snapshot or {}).get("expected_move_dollars"))
+    if atr14 is not None or exp_move is not None:
+        ratio = float(exp_move / atr14) if exp_move is not None and atr14 not in (None, 0.0) else None
+        rows.append(("Move Budget", f"ATR {_fmt_dollar(atr14)}", f"Opt/ATR {ratio:.2f}x" if ratio is not None else f"Opt {_fmt_dollar(exp_move)}"))
+    ret20 = _safe_float((1.0 + ret.tail(20)).prod() - 1.0) if len(ret) >= 2 else None
+    rv20 = _safe_float(ret.tail(20).std() * np.sqrt(252.0)) if len(ret) >= 5 else None
+    rows.append(("Trend / RV", _fmt_pct(ret20), f"RV20 {_fmt_pct(rv20)}"))
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta.clip(upper=0.0))
+    rs = gain.rolling(14, min_periods=5).mean() / loss.rolling(14, min_periods=5).mean().replace(0.0, np.nan)
+    rsi14 = _safe_float(100.0 - (100.0 / (1.0 + rs.iloc[-1]))) if len(rs) else None
+    state = "Neutral"
+    if rsi14 is not None and rsi14 >= 70.0:
+        state = "Overbought"
+    elif rsi14 is not None and rsi14 <= 30.0:
+        state = "Oversold"
+    rows.append(("RSI(14)", f"{rsi14:.1f}" if rsi14 is not None else "-", state))
+    return rows[:6]
+
+
+def _stack_rows(df: pd.DataFrame, instrument_key: str, options_snapshot: dict | None = None, event_snapshot: dict | None = None) -> list[tuple[str, str, str]]:
+    symbol = str(instrument_key or "").upper()
+    rows = []
+    intraday_rows = int(len(df)) if df is not None else 0
+    long_daily = _load_long_daily_history(instrument_key)
+    long_rows = int(len(long_daily)) if long_daily is not None else 0
+    rows.append(("History", f"{intraday_rows} bars", f"{long_rows} daily"))
+    try:
+        coverage = news_archive_coverage(symbol)
+    except Exception:
+        coverage = {}
+    if isinstance(coverage, dict):
+        cov_ratio = _safe_float(coverage.get("coverage_ratio"))
+        active = coverage.get("active_days")
+        relevant = coverage.get("relevant_rows")
+        rows.append(("News Depth", f"{active or 0} days", f"Cov {_fmt_pct(cov_ratio)} | Rows {relevant or 0}"))
+    meta = _instrument_meta(instrument_key)
+    ctx_symbols = meta.get("context_daily_symbols", {}) if isinstance(meta, dict) else {}
+    ctx_available = 0
+    ctx_total = 0
+    for role in ("market", "sector", "vol", "lead_fut", "rates"):
+        if role not in ctx_symbols:
+            continue
+        ctx_total += 1
+        hist = load_context_daily_history(symbol, role, allow_remote=False)
+        if hist is not None and not hist.empty:
+            ctx_available += 1
+    rows.append(("Context Feeds", f"{ctx_available}/{max(1, ctx_total)}", "Ready" if ctx_available == ctx_total and ctx_total > 0 else "Partial"))
+    opt_status = str((options_snapshot or {}).get("status") or "unavailable")
+    opt_source = str((options_snapshot or {}).get("source") or "-")
+    rows.append(("Options Feed", opt_status, opt_source))
+    event = event_snapshot if isinstance(event_snapshot, dict) else get_event_snapshot(symbol)
+    evt_ts = event.get("next_earnings") if isinstance(event, dict) else None
+    evt_dte = _safe_float((event or {}).get("days_to_earnings")) if isinstance(event, dict) else None
+    if evt_ts:
+        try:
+            evt_label = pd.Timestamp(evt_ts).strftime("%Y-%m-%d")
+        except Exception:
+            evt_label = str(evt_ts)
+        rows.append(("Next Earnings", evt_label, f"{evt_dte:.1f}d" if evt_dte is not None else str(event.get("source", "-"))))
+    aliases = meta.get("news_aliases", []) if isinstance(meta, dict) else []
+    rows.append(("News Query", str(len(aliases)) if isinstance(aliases, list) else "1", str(aliases[0])[:20] if aliases else symbol))
+    return rows[:6]
+
+
 def _levels_rows(df: pd.DataFrame, instrument_key: str) -> list[tuple[str, str, str]]:
     if df is None or df.empty:
         return []
@@ -198,6 +312,7 @@ def _levels_rows(df: pd.DataFrame, instrument_key: str) -> list[tuple[str, str, 
     rows: list[tuple[str, str, str]] = []
 
     current_session = frame[frame["session_date"] == frame["session_date"].iloc[-1]].copy()
+    current_week = frame[frame["session_date"].dt.strftime("%G-W%V") == frame["session_date"].iloc[-1].strftime("%G-W%V")].copy()
     prior_sessions = frame["session_date"].drop_duplicates()
     prev_session = None
     if len(prior_sessions) >= 2:
@@ -215,6 +330,14 @@ def _levels_rows(df: pd.DataFrame, instrument_key: str) -> list[tuple[str, str, 
             sess_hi = _safe_float(pd.to_numeric(current_session["high"], errors="coerce").max())
             sess_lo = _safe_float(pd.to_numeric(current_session["low"], errors="coerce").min())
             rows.append(("Today H/L", f"{_fmt_dollar(sess_hi)} / {_fmt_dollar(sess_lo)}", f"Range {_fmt_pct((sess_hi / sess_lo) - 1.0) if sess_hi and sess_lo else None}"))
+        except Exception:
+            pass
+        try:
+            premarket = current_session[(idx_local[-len(current_session):].hour * 60 + idx_local[-len(current_session):].minute) < session_open].copy()
+            if not premarket.empty:
+                pm_hi = _safe_float(pd.to_numeric(premarket["high"], errors="coerce").max())
+                pm_lo = _safe_float(pd.to_numeric(premarket["low"], errors="coerce").min())
+                rows.append(("Premarket H/L", f"{_fmt_dollar(pm_hi)} / {_fmt_dollar(pm_lo)}", "Pre-open reference"))
         except Exception:
             pass
         try:
@@ -240,6 +363,13 @@ def _levels_rows(df: pd.DataFrame, instrument_key: str) -> list[tuple[str, str, 
             rows.append(("Volume Pace", f"{pace:.2f}x" if pace is not None else "-", f"Today {vol_today:,.0f}" if vol_today is not None else "-"))
         except Exception:
             pass
+        if current_week is not None and not current_week.empty:
+            try:
+                week_hi = _safe_float(pd.to_numeric(current_week["high"], errors="coerce").max())
+                week_lo = _safe_float(pd.to_numeric(current_week["low"], errors="coerce").min())
+                rows.append(("Week So Far", f"{_fmt_dollar(week_hi)} / {_fmt_dollar(week_lo)}", "Current trading week range"))
+            except Exception:
+                pass
 
     if prev_session is not None:
         prev = frame[frame["session_date"] == prev_session].copy()
@@ -253,36 +383,91 @@ def _levels_rows(df: pd.DataFrame, instrument_key: str) -> list[tuple[str, str, 
                 state = "Below prior low"
             rows.append(("Prior Session", f"{_fmt_dollar(prev_hi)} / {_fmt_dollar(prev_lo)}", state))
 
+    try:
+        if frame is not None and not frame.empty and "close" in frame.columns and "volume" in frame.columns:
+            recent = frame.tail(min(len(frame), 3000)).copy()
+            tp = (
+                pd.to_numeric(recent.get("high"), errors="coerce").fillna(pd.to_numeric(recent.get("close"), errors="coerce"))
+                + pd.to_numeric(recent.get("low"), errors="coerce").fillna(pd.to_numeric(recent.get("close"), errors="coerce"))
+                + pd.to_numeric(recent.get("close"), errors="coerce")
+            ) / 3.0
+            vol = pd.to_numeric(recent.get("volume"), errors="coerce").fillna(0.0)
+            if tp.notna().sum() >= 20 and float(vol.sum()) > 0:
+                bins = np.linspace(float(tp.min()), float(tp.max()), 16)
+                if len(np.unique(bins)) >= 4:
+                    bucket = pd.cut(tp, bins=bins, include_lowest=True)
+                    prof = vol.groupby(bucket, observed=False).sum()
+                    if not prof.empty:
+                        hvn_bin = prof.idxmax()
+                        hvn = _safe_float((hvn_bin.left + hvn_bin.right) * 0.5)
+                        rows.append(("Comp HVN", _fmt_dollar(hvn), "Approx volume node from loaded intraday bars"))
+                        total_vol = float(prof.sum())
+                        order = prof.sort_values(ascending=False)
+                        keep = order.cumsum() <= (0.70 * total_vol)
+                        kept = order[keep]
+                        if kept.empty:
+                            kept = order.head(1)
+                        va_low = _safe_float(min(iv.left for iv in kept.index))
+                        va_high = _safe_float(max(iv.right for iv in kept.index))
+                        rows.append(("Value Area", f"{_fmt_dollar(va_low)} / {_fmt_dollar(va_high)}", "Approx 70% volume area"))
+    except Exception:
+        pass
+
     daily_long = _load_long_daily_history(instrument_key)
     if daily_long is not None and not daily_long.empty and "close" in daily_long.columns:
         close = pd.to_numeric(daily_long["close"], errors="coerce")
-        high = pd.to_numeric(daily_long.get("high"), errors="coerce")
-        low = pd.to_numeric(daily_long.get("low"), errors="coerce")
-        prev_close = close.shift(1)
-        tr = pd.concat(
-            [
-                (high - low).abs(),
-                (high - prev_close).abs(),
-                (low - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        atr14 = _safe_float(tr.rolling(14, min_periods=5).mean().iloc[-1]) if len(tr) else None
-        hi20 = _safe_float(high.rolling(20, min_periods=5).max().iloc[-1]) if len(high) else None
-        lo20 = _safe_float(low.rolling(20, min_periods=5).min().iloc[-1]) if len(low) else None
-        rows.append(
-            (
-                "ATR(14)",
-                _fmt_dollar(atr14),
-                f"1D ±{_fmt_dollar(atr14)} | 1W ±{_fmt_dollar((atr14 * np.sqrt(5.0)) if atr14 is not None else None)}",
+        high = pd.to_numeric(daily_long["high"], errors="coerce") if "high" in daily_long.columns else None
+        low = pd.to_numeric(daily_long["low"], errors="coerce") if "low" in daily_long.columns else None
+        atr14 = None
+        hi20 = None
+        lo20 = None
+        if isinstance(high, pd.Series) and isinstance(low, pd.Series):
+            prev_close = close.shift(1)
+            tr = pd.concat(
+                [
+                    (high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            atr14 = _safe_float(tr.rolling(14, min_periods=5).mean().iloc[-1]) if len(tr) else None
+            hi20 = _safe_float(high.rolling(20, min_periods=5).max().iloc[-1]) if len(high) else None
+            lo20 = _safe_float(low.rolling(20, min_periods=5).min().iloc[-1]) if len(low) else None
+        sma20 = _safe_float(close.rolling(20, min_periods=5).mean().iloc[-1]) if len(close) else None
+        sma50 = _safe_float(close.rolling(50, min_periods=10).mean().iloc[-1]) if len(close) else None
+        if atr14 is not None:
+            rows.append(
+                (
+                    "ATR(14)",
+                    _fmt_dollar(atr14),
+                    f"1D ±{_fmt_dollar(atr14)} | 1W ±{_fmt_dollar((atr14 * np.sqrt(5.0)) if atr14 is not None else None)}",
+                )
             )
-        )
+        if sma20 is not None or sma50 is not None:
+            rows.append(("20D / 50D SMA", f"{_fmt_dollar(sma20)} / {_fmt_dollar(sma50)}", "Trend anchors"))
         if hi20 is not None or lo20 is not None:
             dist = None
             if current_price is not None and hi20 is not None:
                 dist = (current_price / hi20) - 1.0
             rows.append(("20D Breakout", f"{_fmt_dollar(hi20)} / {_fmt_dollar(lo20)}", f"Vs 20D high {_fmt_pct(dist)}" if dist is not None else "-"))
-    return rows[:8]
+        try:
+            recent = daily_long.tail(20).copy()
+            if not recent.empty:
+                px = pd.to_numeric(recent["close"], errors="coerce").ffill()
+                vol20 = pd.to_numeric(recent["volume"], errors="coerce").fillna(0.0)
+                if px.notna().sum() >= 5 and vol20.sum() > 0:
+                    bins = np.linspace(float(px.min()), float(px.max()), 9)
+                    if len(np.unique(bins)) >= 3:
+                        bucket = pd.cut(px, bins=bins, include_lowest=True)
+                        grouped = vol20.groupby(bucket, observed=False).sum()
+                        if not grouped.empty:
+                            top_bin = grouped.idxmax()
+                            hvn = _safe_float((top_bin.left + top_bin.right) * 0.5)
+                            rows.append(("HVN 20D", _fmt_dollar(hvn), "Highest recent volume node"))
+        except Exception:
+            pass
+    return rows[:14]
 
 
 def _options_rows(symbol: str, spot_price: float | None) -> tuple[dict, list[tuple[str, str, str]], str]:
@@ -298,10 +483,11 @@ def _options_rows(symbol: str, spot_price: float | None) -> tuple[dict, list[tup
         exp_pct = snap.get("expected_move_pct")
         pcr_oi = snap.get("put_call_oi_ratio")
         card = f"Options {exp} | ±{_fmt_dollar(exp_move)} ({_fmt_pct(exp_pct)})" if exp_move is not None else f"Options {exp}"
-        rows.append(("Nearest Expiry", f"{exp} ({dte}d)" if dte is not None else exp, str(snap.get("source", "-"))))
+        rows.append(("Nearest Expiry", f"{exp} ({dte}d)" if dte is not None else exp, f"{str(snap.get('source_kind') or snap.get('source') or '-')}"))
         rows.append(("ATM Expected Move", f"±{_fmt_dollar(exp_move)}", _fmt_pct(exp_pct)))
         rows.append(("Put/Call OI", f"{pcr_oi:.2f}" if _safe_float(pcr_oi) is not None else "-", f"Vol {snap.get('put_call_volume_ratio'):.2f}" if _safe_float(snap.get("put_call_volume_ratio")) is not None else "-"))
         rows.append(("IV Skew", _fmt_pct(snap.get("iv_skew_put_minus_call")), "Put IV - Call IV"))
+        rows.append(("IV Rank / Pctl", f"{_fmt_pct(snap.get('iv_rank'))} / {_fmt_pct(snap.get('iv_percentile'))}", f"IV/RV20 {(_safe_float(snap.get('iv_vs_rv20')) or 0.0):.2f}x | hist {int(_safe_float(snap.get('history_points')) or 0)}"))
         rows.append(("Call / Put Wall", f"{_fmt_dollar(snap.get('call_wall_oi'))} / {_fmt_dollar(snap.get('put_wall_oi'))}", f"Max pain {_fmt_dollar(snap.get('max_pain'))}"))
     else:
         reason = str(snap.get("reason") or snap.get("status") or "unavailable")
@@ -309,17 +495,18 @@ def _options_rows(symbol: str, spot_price: float | None) -> tuple[dict, list[tup
             reason = "Remote feed unavailable"
         elif len(reason) > 48:
             reason = reason[:45] + "..."
-        rows.append(("Options", "-", reason))
+        rows.append(("Options", "-", f"{reason} | {str(snap.get('source_kind') or snap.get('source') or 'unavailable')}"))
     return snap, rows, card
 
 
-def _news_rows(symbol: str) -> tuple[list[tuple[str, str, str]], str]:
-    headlines = load_recent_headlines(symbol, limit=6)
+def _news_rows(symbol: str, headlines: list[dict] | None = None) -> tuple[list[tuple[str, str, str]], str]:
+    headlines = headlines if headlines is not None else load_recent_headlines(symbol, limit=6)
     rows = []
     if not headlines:
         return rows, "News: unavailable"
     scores = []
     fresh_hours = []
+    political = []
     for item in headlines:
         ts = item.get("published_at")
         age = _age_text(ts)
@@ -331,6 +518,7 @@ def _news_rows(symbol: str) -> tuple[list[tuple[str, str, str]], str]:
         sc = _safe_float(item.get("score"))
         if sc is not None:
             scores.append(sc)
+        political.append(1.0 if (_safe_float(item.get("political_relevance")) or 0.0) >= 0.25 else 0.0)
         try:
             tsv = pd.Timestamp(ts)
             if tsv.tzinfo is None:
@@ -340,11 +528,15 @@ def _news_rows(symbol: str) -> tuple[list[tuple[str, str, str]], str]:
             pass
     sent_mean = float(np.mean(scores)) if scores else None
     fresh = min(fresh_hours) if fresh_hours else None
-    meta = f"News {len(rows)} items | Sent {_fmt_pct(sent_mean)} | Fresh {fresh:.1f}h" if fresh is not None else f"News {len(rows)} items"
+    pol_share = float(np.mean(political)) if political else None
+    if fresh is not None:
+        meta = f"News {len(rows)} | Sent {_fmt_pct(sent_mean)} | Pol {_fmt_pct(pol_share)} | Fresh {fresh:.1f}h"
+    else:
+        meta = f"News {len(rows)} items"
     return rows, meta
 
 
-def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: dict | None = None) -> dict:
+def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: dict | None = None, profile_name: str | None = None) -> dict:
     if df is None or df.empty:
         return {
             "setup_card": "Alignment: unavailable",
@@ -354,16 +546,77 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
             "options_card": "Options: unavailable",
             "news_card": "News: unavailable",
             "market_rows": [],
+            "breadth_rows": [],
+            "macro_rows": [],
+            "liquidity_rows": [],
+            "catalyst_rows": [],
+            "signal_rows": [],
+            "stack_rows": [],
             "levels_rows": [],
             "options_rows": [],
             "news_rows": [],
+            "action_card": "Action: unavailable",
+            "action_detail": "No data",
+            "quality_card": "Quality: unavailable",
+            "quality_detail": "No data",
+            "probability_rows": [],
+            "quality_rows": [],
+            "setup_rows": [],
+            "scenario_rows": [],
+            "invalidation_rows": [],
+            "reliability_rows": [],
+            "execution_rows": [],
+            "portfolio_rows": [],
+            "performance_rows": [],
+            "replay_rows": [],
+            "alerts_rows": [],
+            "opportunity_rows": [],
+            "profile_card": "Profile: unavailable",
+            "profile_detail": "No data",
+            "broker_card": "Broker: unavailable",
+            "broker_detail": "No data",
+            "replay_card": "Replay: unavailable",
+            "replay_detail": "No data",
+            "advisory_meta": {},
+            "execution_meta": {},
+            "performance_meta": {},
+            "replay_meta": {},
+            "alerts_meta": {},
+            "scan_meta": {},
         }
     price = _safe_float(df["close"].iloc[-1]) if "close" in df.columns else None
     align_head, align_detail = _prediction_alignment(price, predictions or {})
     levels = _levels_rows(df, instrument_key)
     market = _market_context_rows(instrument_key)
-    opt_snap, opt_rows, opt_card = _options_rows(str(instrument_key).upper(), spot_price=price)
-    news_rows, news_card = _news_rows(str(instrument_key).upper())
+    symbol = str(instrument_key).upper()
+    profile = get_trader_profile(profile_name)
+    breadth_snapshot = get_breadth_snapshot(symbol)
+    macro_snapshot = get_macro_event_snapshot()
+    catalyst_snapshot = get_catalyst_provider_snapshot(symbol)
+    opt_snap, opt_rows, opt_card = _options_rows(symbol, spot_price=price)
+    liquidity_snapshot = get_liquidity_snapshot(df, symbol)
+    event_snapshot = get_event_snapshot(symbol)
+    news_items = load_recent_headlines(symbol, limit=6)
+    news_rows, news_card = _news_rows(symbol, headlines=news_items)
+    signal_rows = _signal_rows(df, instrument_key, options_snapshot=opt_snap)
+    stack_rows = _stack_rows(df, instrument_key, options_snapshot=opt_snap, event_snapshot=event_snapshot)
+    advisory = build_advisory_snapshot(
+        df,
+        instrument_key,
+        predictions=predictions or {},
+        options_snapshot=opt_snap,
+        event_snapshot=event_snapshot,
+        news_items=news_items,
+        macro_snapshot=macro_snapshot,
+        breadth_snapshot=breadth_snapshot,
+        liquidity_snapshot=liquidity_snapshot,
+        catalyst_snapshot=catalyst_snapshot,
+    )
+    execution_snapshot = get_execution_dashboard_snapshot(symbol, current_price=price, advisory=advisory, profile_name=profile.get("key"))
+    performance_snapshot = get_performance_snapshot()
+    replay_snapshot = get_replay_dashboard_snapshot(symbol)
+    alerts_snapshot = get_alert_snapshot(symbol, current_price=price, advisory=advisory, profile_name=profile.get("key"), persist=True)
+    scan_snapshot = get_opportunity_scan(profile_name=profile.get("key"))
 
     atr_row = next((r for r in levels if r[0] == "ATR(14)"), None)
     vol_card = f"Volatility: {atr_row[1]}" if atr_row else "Volatility: unavailable"
@@ -371,6 +624,24 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
     if market:
         first_market = market[0]
         vol_detail = f"{vol_detail} | {first_market[0]} {first_market[1]}"
+
+    diagnostics = dict(execution_snapshot.get("diagnostics") or {})
+    verification = dict(execution_snapshot.get("verification") or {})
+    verify_status = str(verification.get("status") or "").replace("_", " ").strip()
+    broker_detail = str((execution_snapshot.get("runtime") or {}).get("detail") or execution_snapshot.get("live_detail") or performance_snapshot.get("summary", "No closed paper trades yet"))
+    operator_hint = str(diagnostics.get("operator_hint") or "").strip()
+    checked_at = str(diagnostics.get("checked_at") or "")
+    credentials_source = str(diagnostics.get("credentials_source") or "").strip()
+    if checked_at:
+        broker_detail = f"{broker_detail} | checked {checked_at}"
+    if verify_status:
+        broker_detail = f"{broker_detail} | verify {verify_status}"
+    if credentials_source == "local_store":
+        broker_detail = f"{broker_detail} | saved on this computer"
+    elif credentials_source == "env":
+        broker_detail = f"{broker_detail} | using runtime environment"
+    if operator_hint:
+        broker_detail = f"{broker_detail} | {operator_hint}"
 
     return {
         "setup_card": align_head,
@@ -380,8 +651,42 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
         "options_card": opt_card,
         "news_card": news_card,
         "market_rows": market,
+        "breadth_rows": advisory.get("breadth_rows", []),
+        "macro_rows": advisory.get("macro_rows", []),
+        "liquidity_rows": advisory.get("liquidity_rows", []),
+        "catalyst_rows": advisory.get("catalyst_rows", []),
+        "signal_rows": signal_rows,
+        "stack_rows": stack_rows,
         "levels_rows": levels,
         "options_rows": opt_rows,
         "news_rows": news_rows,
         "options_snapshot": opt_snap,
+        "action_card": advisory.get("action_card", "Action: unavailable"),
+        "action_detail": advisory.get("action_detail", "-"),
+        "quality_card": advisory.get("quality_card", "Quality: unavailable"),
+        "quality_detail": advisory.get("quality_detail", "-"),
+        "probability_rows": advisory.get("probability_rows", []),
+        "quality_rows": advisory.get("quality_rows", []),
+        "setup_rows": advisory.get("setup_rows", []),
+        "scenario_rows": advisory.get("scenario_rows", []),
+        "invalidation_rows": advisory.get("invalidation_rows", []),
+        "reliability_rows": advisory.get("reliability_rows", []),
+        "execution_rows": execution_snapshot.get("rows", []),
+        "portfolio_rows": execution_snapshot.get("portfolio_rows", []),
+        "performance_rows": performance_snapshot.get("rows", []),
+        "replay_rows": replay_snapshot.get("rows", []),
+        "alerts_rows": alerts_snapshot.get("rows", []),
+        "opportunity_rows": scan_snapshot.get("rows", []),
+        "profile_card": f"Profile: {profile.get('label', 'Balanced')}",
+        "profile_detail": f"Risk/trade {100.0 * float(profile.get('risk_per_trade') or 0.0):.2f}% | gross cap {100.0 * float(profile.get('max_gross_exposure') or 0.0):.0f}%",
+        "broker_card": f"Broker: {str((execution_snapshot.get('runtime') or {}).get('route_label') or execution_snapshot.get('broker_mode') or 'paper')}",
+        "broker_detail": broker_detail,
+        "replay_card": replay_snapshot.get("card", "Replay: unavailable"),
+        "replay_detail": replay_snapshot.get("detail", "No replay session"),
+        "advisory_meta": advisory,
+        "execution_meta": execution_snapshot,
+        "performance_meta": performance_snapshot,
+        "replay_meta": replay_snapshot,
+        "alerts_meta": alerts_snapshot,
+        "scan_meta": scan_snapshot,
     }

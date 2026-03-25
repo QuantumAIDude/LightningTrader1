@@ -66,6 +66,44 @@ class OptionsAnalyticsTests(unittest.TestCase):
                 oa.DATA_DIR = old_data_dir
                 oa._fetch_remote_snapshot = old_fetch
 
+    def test_get_options_snapshot_computes_iv_history_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_data_dir = oa.DATA_DIR
+            try:
+                oa.DATA_DIR = tmp
+                hist = pd.DataFrame(
+                    {
+                        "fetched_at": pd.date_range("2026-01-01", periods=5, freq="7D", tz="UTC"),
+                        "atm_iv_mid": [0.18, 0.20, 0.24, 0.26, 0.30],
+                        "expected_move_pct": [0.01, 0.011, 0.012, 0.013, 0.014],
+                    }
+                )
+                hist.to_csv(os.path.join(tmp, "options_snapshot_history_QQQ.csv"), index=False)
+                daily = pd.DataFrame(
+                    {"close": [100, 101, 100, 102, 103, 104, 103, 105, 106, 107, 108]},
+                    index=pd.date_range("2026-01-01", periods=11, freq="B"),
+                )
+                daily.to_csv(os.path.join(tmp, "prices_QQQ_daily_long.csv"))
+                payload = {
+                    "status": "ok",
+                    "symbol": "QQQ",
+                    "expiry": "2026-03-27",
+                    "expected_move_dollars": 8.5,
+                    "expected_move_pct": 0.012,
+                    "atm_call_iv": 0.28,
+                    "atm_put_iv": 0.32,
+                    "fetched_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                }
+                with open(os.path.join(tmp, "options_snapshot_QQQ.json"), "w") as f:
+                    json.dump(payload, f)
+                snap = oa.get_options_snapshot("QQQ", spot_price=500.0, max_age_sec=3600)
+                self.assertEqual(snap.get("source_kind"), "cache")
+                self.assertIsNotNone(snap.get("iv_rank"))
+                self.assertIsNotNone(snap.get("iv_percentile"))
+                self.assertIsNotNone(snap.get("iv_vs_rv20"))
+            finally:
+                oa.DATA_DIR = old_data_dir
+
 
 if __name__ == "__main__":
     unittest.main()

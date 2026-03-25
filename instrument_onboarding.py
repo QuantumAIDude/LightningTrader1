@@ -66,10 +66,16 @@ def _default_context_daily_symbols(symbol: str) -> dict:
 
 def _default_equity_meta(symbol: str) -> dict:
     sym = str(symbol or "").upper()
+    aliases = [sym]
+    if sym == "QQQ":
+        aliases.extend(["Invesco QQQ", "Nasdaq 100", "Nasdaq-100"])
     return {
         "type": "equity",
         "alpaca": sym,
         "yahoo": sym,
+        "display_name": sym,
+        "news_enabled": True,
+        "news_aliases": aliases,
         "tz": "America/New_York",
         "session_open_minute": 9 * 60 + 30,
         "session_close_minute": 16 * 60,
@@ -116,6 +122,16 @@ def register_instrument(symbol: str, meta: dict | None = None, persist: bool = T
     entry = _default_equity_meta(sym)
     if isinstance(meta, dict):
         entry.update(meta)
+    aliases = entry.get("news_aliases")
+    if isinstance(aliases, (list, tuple, set)):
+        clean_aliases = []
+        for item in aliases:
+            text = str(item or "").strip()
+            if text:
+                clean_aliases.append(text)
+        entry["news_aliases"] = clean_aliases or [sym]
+    else:
+        entry["news_aliases"] = [sym]
     added = sym not in INSTRUMENTS
     INSTRUMENTS[sym] = entry
     if persist:
@@ -227,10 +243,42 @@ def _read_staged_csv(path: str) -> pd.DataFrame:
 
 def _safe_symbol_from_staged_filename(path: str) -> str | None:
     base = os.path.splitext(os.path.basename(path))[0]
+    if base.lower().endswith("_news"):
+        base = base[:-5]
+    if base.lower().endswith(".meta"):
+        base = base[:-5]
     symbol = str(base).upper().strip()
     if _SYMBOL_PATTERN.match(symbol):
         return symbol
     return None
+
+
+def _load_staged_meta(symbol: str) -> dict:
+    candidates = [
+        os.path.join(NEW_INSTRUMENTS_DIR, f"{symbol}.meta.json"),
+        os.path.join(NEW_INSTRUMENTS_DIR, f"{symbol}.json"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            logger.exception("Failed reading staged meta for %s", symbol)
+    return {}
+
+
+def _staged_news_files(symbol: str) -> list[str]:
+    candidates = [
+        os.path.join(NEW_INSTRUMENTS_DIR, f"{symbol}_news.csv"),
+        os.path.join(NEW_INSTRUMENTS_DIR, f"{symbol}_news.jsonl"),
+        os.path.join(NEW_INSTRUMENTS_DIR, f"news_{symbol}.csv"),
+        os.path.join(NEW_INSTRUMENTS_DIR, f"news_{symbol}.jsonl"),
+    ]
+    return [path for path in candidates if os.path.exists(path)]
 
 
 def _merge_price_frames(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
@@ -260,7 +308,9 @@ def _read_existing_price_file(path: str) -> pd.DataFrame:
 def _archive_staged_file(path: str, symbol: str):
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     os.makedirs(NEW_INSTRUMENTS_PROCESSED_DIR, exist_ok=True)
-    out = os.path.join(NEW_INSTRUMENTS_PROCESSED_DIR, f"{symbol}_{ts}.csv")
+    ext = os.path.splitext(path)[1] or ".dat"
+    base = os.path.splitext(os.path.basename(path))[0]
+    out = os.path.join(NEW_INSTRUMENTS_PROCESSED_DIR, f"{base}_{ts}{ext}")
     try:
         shutil.move(path, out)
     except Exception:
@@ -358,6 +408,8 @@ def process_staged_instrument_files(
             os.path.join(NEW_INSTRUMENTS_DIR, n)
             for n in sorted(os.listdir(NEW_INSTRUMENTS_DIR))
             if n.lower().endswith(".csv")
+            and not n.lower().endswith("_news.csv")
+            and not n.lower().startswith("news_")
         ]
     except Exception:
         staged = []
@@ -388,7 +440,35 @@ def process_staged_instrument_files(
                 out["quarantined"].append({"path": quarantine_path, "symbol": symbol, "reason": "no_rows_after_merge"})
             continue
         df_all.to_csv(data_path, date_format="%Y-%m-%dT%H:%M:%SZ")
-        added = register_instrument(symbol, persist=True)
+        meta = _load_staged_meta(symbol)
+        added = register_instrument(symbol, meta=meta, persist=True)
+        imported_news = None
+        try:
+            from news_pipeline import import_local_historical_news
+
+            extra_news = _staged_news_files(symbol)
+            if extra_news:
+                imported_news = import_local_historical_news(symbol, extra_paths=extra_news)
+                for news_path in extra_news:
+                    _archive_staged_file(news_path, symbol)
+        except Exception:
+            logger.exception("Staged news import failed for %s", symbol)
+        try:
+            meta_path = next(
+                (
+                    p
+                    for p in [
+                        os.path.join(NEW_INSTRUMENTS_DIR, f"{symbol}.meta.json"),
+                        os.path.join(NEW_INSTRUMENTS_DIR, f"{symbol}.json"),
+                    ]
+                    if os.path.exists(p)
+                ),
+                None,
+            )
+            if meta_path:
+                _archive_staged_file(meta_path, symbol)
+        except Exception:
+            logger.exception("Failed archiving staged meta for %s", symbol)
         trained = False
         if auto_train:
             try:
@@ -404,6 +484,7 @@ def process_staged_instrument_files(
                 "registered": bool(added),
                 "trained": bool(trained),
                 "path": data_path,
+                "news_import": imported_news,
             }
         )
     return out

@@ -11,6 +11,7 @@ import pandas as pd
 from config import (
     ALLOW_REMOTE_OPTIONS,
     DATA_DIR,
+    OPTIONS_IV_HISTORY_LOOKBACK,
     OPTIONS_PANEL_ENABLED,
     OPTIONS_REFRESH_COOLDOWN_SEC,
 )
@@ -33,6 +34,10 @@ def _safe_float(value):
 
 def _cache_path(symbol: str) -> str:
     return os.path.join(DATA_DIR, f"options_snapshot_{str(symbol or '').upper()}.json")
+
+
+def _history_path(symbol: str) -> str:
+    return os.path.join(DATA_DIR, f"options_snapshot_history_{str(symbol or '').upper()}.csv")
 
 
 def _json_default(obj):
@@ -64,6 +69,119 @@ def _save_cached_snapshot(symbol: str, payload: dict):
             json.dump(payload, f, default=_json_default, indent=2, sort_keys=True)
     except Exception:
         pass
+
+
+def _load_history(symbol: str) -> pd.DataFrame:
+    path = _history_path(symbol)
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+        if df.empty:
+            return df
+        if "fetched_at" in df.columns:
+            df["fetched_at"] = pd.to_datetime(df["fetched_at"], utc=True, errors="coerce")
+        return df.sort_values("fetched_at")
+    except Exception:
+        return pd.DataFrame()
+
+
+def _append_history(symbol: str, payload: dict):
+    current_iv = _safe_float(payload.get("atm_iv_mid"))
+    exp_pct = _safe_float(payload.get("expected_move_pct"))
+    fetched_at = payload.get("fetched_at")
+    if current_iv is None or fetched_at is None:
+        return
+    row = pd.DataFrame(
+        [
+            {
+                "fetched_at": pd.Timestamp(fetched_at).isoformat(),
+                "atm_iv_mid": current_iv,
+                "expected_move_pct": exp_pct,
+                "source": payload.get("source"),
+            }
+        ]
+    )
+    hist = _load_history(symbol)
+    try:
+        if not hist.empty:
+            if "fetched_at" in hist.columns:
+                hist["fetched_at"] = pd.to_datetime(hist["fetched_at"], utc=True, errors="coerce")
+            row_ts = pd.Timestamp(fetched_at)
+            if row_ts.tzinfo is None:
+                row_ts = row_ts.tz_localize("UTC")
+            hist = hist[hist["fetched_at"] != row_ts]
+            hist = pd.concat([hist, row], ignore_index=True)
+        else:
+            hist = row
+        hist = hist.sort_values("fetched_at").tail(max(30, int(OPTIONS_IV_HISTORY_LOOKBACK)))
+        hist.to_csv(_history_path(symbol), index=False)
+    except Exception:
+        pass
+
+
+def _load_long_daily_history(symbol: str) -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, f"prices_{str(symbol or '').upper()}_daily_long.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df.columns = [str(c).lower() for c in df.columns]
+        return df.sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _realized_vol20(symbol: str) -> float | None:
+    df = _load_long_daily_history(symbol)
+    if df.empty or "close" not in df.columns:
+        return None
+    close = pd.to_numeric(df["close"], errors="coerce").dropna()
+    ret = close.pct_change().dropna()
+    if len(ret) < 10:
+        return None
+    return _safe_float(ret.tail(20).std(ddof=0) * np.sqrt(252.0))
+
+
+def _enrich_history_metrics(symbol: str, payload: dict) -> dict:
+    out = dict(payload or {})
+    call_iv = _safe_float(out.get("atm_call_iv"))
+    put_iv = _safe_float(out.get("atm_put_iv"))
+    atm_iv_mid = None
+    if call_iv is not None and put_iv is not None:
+        atm_iv_mid = float(0.5 * (call_iv + put_iv))
+    elif call_iv is not None:
+        atm_iv_mid = call_iv
+    elif put_iv is not None:
+        atm_iv_mid = put_iv
+    out["atm_iv_mid"] = atm_iv_mid
+    if out.get("status") == "ok":
+        _append_history(symbol, out)
+    hist = _load_history(symbol)
+    if not hist.empty and "atm_iv_mid" in hist.columns and atm_iv_mid is not None:
+        vals = pd.to_numeric(hist["atm_iv_mid"], errors="coerce").dropna().tail(max(30, int(OPTIONS_IV_HISTORY_LOOKBACK)))
+        if len(vals) >= 5:
+            vmin = float(vals.min())
+            vmax = float(vals.max())
+            vrange = max(1e-9, vmax - vmin)
+            out["iv_rank"] = float(max(0.0, min(1.0, (atm_iv_mid - vmin) / vrange)))
+            out["iv_percentile"] = float((vals <= atm_iv_mid).mean())
+            out["history_points"] = int(len(vals))
+    rv20 = _realized_vol20(symbol)
+    out["rv20"] = rv20
+    if rv20 not in (None, 0.0) and atm_iv_mid is not None:
+        out["iv_vs_rv20"] = float(atm_iv_mid / rv20)
+    source = str(out.get("source") or out.get("status") or "unavailable").lower()
+    if source == "remote":
+        out["source_kind"] = "live"
+    elif source in {"cache", "stale_cache"}:
+        out["source_kind"] = "cache"
+    elif source == "disabled":
+        out["source_kind"] = "placeholder"
+    else:
+        out["source_kind"] = source if source else "unavailable"
+    return out
 
 
 def _chain_frame(df: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -234,7 +352,7 @@ def get_options_snapshot(symbol: str, spot_price: float | None = None, max_age_s
         if age_sec is not None and age_sec <= float(age_limit):
             cached = dict(cached)
             cached["source"] = "cache" if cached.get("status") == "ok" else "cache_failure"
-            return cached
+            return _enrich_history_metrics(symbol, cached)
     try:
         remote = _fetch_remote_snapshot(symbol, spot_price=spot_price)
     except Exception as exc:
@@ -242,7 +360,7 @@ def get_options_snapshot(symbol: str, spot_price: float | None = None, max_age_s
     if isinstance(remote, dict) and remote.get("status") == "ok":
         remote["source"] = "remote"
         _save_cached_snapshot(symbol, remote)
-        return remote
+        return _enrich_history_metrics(symbol, remote)
     if isinstance(remote, dict):
         remote = dict(remote)
         remote.setdefault("fetched_at", datetime.now(timezone.utc).isoformat())
@@ -252,5 +370,5 @@ def get_options_snapshot(symbol: str, spot_price: float | None = None, max_age_s
         cached["source"] = "stale_cache"
         if isinstance(remote, dict) and remote.get("reason"):
             cached["refresh_error"] = remote.get("reason")
-        return cached
-    return remote if isinstance(remote, dict) else {"status": "unavailable"}
+        return _enrich_history_metrics(symbol, cached)
+    return _enrich_history_metrics(symbol, remote if isinstance(remote, dict) else {"status": "unavailable"})

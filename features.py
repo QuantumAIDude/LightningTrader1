@@ -56,6 +56,8 @@ DEFAULT_FEATURES = [
     # QQQ news sentiment context (lag-safe daily aggregates)
     "news_sent_mean_d1", "news_sent_sum_d3", "news_headline_count_d1", "news_pos_ratio_d3", "news_neg_ratio_d3",
     "news_sent_ewm_d7", "news_intensity_ewm_d7", "news_entropy_d3", "news_relevance_mean_d3", "news_sent_surprise_d1",
+    "news_political_count_d3", "news_political_sent_d3", "news_political_relevance_d3",
+    "news_adaptive_weight_d7", "news_weighted_sent_d7", "news_weighted_political_d7",
     # low-capacity cross-asset context
     "ctx_market_ret_1", "ctx_sector_rel_1", "ctx_vol_level_z", "ctx_lead_lag_spread_1", "ctx_rates_risk_spread_1",
 ]
@@ -65,6 +67,7 @@ DAILY_HORIZON_FEATURES = [
     "ewm_vol", "trend_strength", "range_1",
     "roll_max_dist", "roll_min_dist",
     "news_sent_mean_d1", "news_sent_ewm_d7", "news_intensity_ewm_d7",
+    "news_adaptive_weight_d7", "news_weighted_sent_d7", "news_weighted_political_d7",
     "ctx_market_ret_1", "ctx_market_ret_5", "ctx_vol_level_z", "ctx_sector_rel_1",
 ]
 WEEKEND_HORIZON_FEATURES = [
@@ -74,6 +77,7 @@ WEEKEND_HORIZON_FEATURES = [
     "roll_max_dist", "roll_min_dist",
     "wday", "days_to_week_end",
     "news_sent_mean_d1", "news_sent_ewm_d7", "news_intensity_ewm_d7",
+    "news_adaptive_weight_d7", "news_weighted_sent_d7", "news_weighted_political_d7",
     "ctx_market_ret_1", "ctx_market_ret_5", "ctx_vol_level_z", "ctx_lead_lag_spread_1",
 ]
 LIVE_MAX_BARS = 2000  # cap live feature generation to keep UI responsive
@@ -281,6 +285,12 @@ def _attach_news_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Da
         "news_entropy_d3",
         "news_relevance_mean_d3",
         "news_sent_surprise_d1",
+        "news_political_count_d3",
+        "news_political_sent_d3",
+        "news_political_relevance_d3",
+        "news_adaptive_weight_d7",
+        "news_weighted_sent_d7",
+        "news_weighted_political_d7",
     ]
     for c in cols:
         if c not in df.columns:
@@ -288,7 +298,8 @@ def _attach_news_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Da
     if not NEWS_PIPELINE_ENABLED:
         return df
     symbol = str(instrument_key or DEFAULT_INSTRUMENT or "").upper()
-    if symbol != str(NEWS_PIPELINE_SYMBOL).upper():
+    meta = _get_instrument_meta(instrument_key)
+    if not symbol or not bool(meta.get("news_enabled", True)):
         return df
     if load_news_features_for_index is None:
         return df
@@ -719,6 +730,9 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
         df["news_intensity_ewm_d7"] = np.log1p(df["news_intensity_ewm_d7"].clip(lower=0.0))
         df["news_relevance_mean_d3"] = df["news_relevance_mean_d3"].clip(0.0, 1.0)
         df["news_entropy_d3"] = df["news_entropy_d3"].clip(0.0, 1.0)
+        df["news_political_count_d3"] = np.log1p(df["news_political_count_d3"].clip(lower=0.0))
+        df["news_political_relevance_d3"] = df["news_political_relevance_d3"].clip(0.0, 1.0)
+        df["news_adaptive_weight_d7"] = df["news_adaptive_weight_d7"].clip(0.0, 2.0)
     except Exception:
         pass
 

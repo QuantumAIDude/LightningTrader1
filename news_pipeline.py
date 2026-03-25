@@ -27,6 +27,7 @@ except Exception:
 from config import (
     DATA_DIR,
     INSTRUMENTS,
+    NEW_INSTRUMENTS_DIR,
     NEWS_ARCHIVE_CHUNK_DAYS,
     NEWS_ARCHIVE_LOOKBACK_DAYS,
     NEWS_ARCHIVE_MAX_RECORDS_PER_CHUNK,
@@ -83,6 +84,19 @@ _MACRO_KEYWORDS = {
     "cpi", "inflation", "fed", "rate", "rates", "yield", "yields", "treasury", "treasuries",
     "employment", "jobs", "oil",
 }
+_POLITICAL_KEYWORDS = {
+    "administration", "antitrust", "ban", "bans", "bill", "budget", "ceasefire", "china", "congress",
+    "conflict", "crackdown", "debt", "defense", "doj", "election", "embargo", "eu", "europe",
+    "executive", "export", "exports", "ftc", "geopolitical", "government", "house", "lawmakers",
+    "ministry", "president", "regulation", "regulator", "regulators", "sanction", "sanctions",
+    "sec", "senate", "shutdown", "stimulus", "subsidy", "tariff", "tariffs", "tax", "trade",
+    "treasury", "war", "white", "whitehouse",
+}
+_POLITICAL_ENTITIES = {
+    "white house", "u.s. senate", "u.s. house", "department of justice", "federal trade commission",
+    "securities and exchange commission", "commerce department", "treasury department",
+    "european union", "prime minister", "president", "congress", "senate", "house republicans",
+}
 _DIRECT_QQQ_PHRASES = {
     "qqq", "invesco qqq", "nasdaq 100", "nasdaq-100",
 }
@@ -114,6 +128,45 @@ _NEG_PHRASES = {
     "forget qqq": -1.00,
     "sector weakness": -0.65,
     "outperforming tech": -0.80,
+    "export controls": -1.05,
+    "trade war": -1.10,
+    "government shutdown": -1.10,
+    "debt ceiling": -0.90,
+    "new tariffs": -1.00,
+    "tariff threat": -0.90,
+    "regulatory crackdown": -1.00,
+    "geopolitical tension": -0.85,
+    "chip restrictions": -0.95,
+    "antitrust suit": -1.00,
+    "sanctions risk": -0.90,
+    "policy uncertainty": -0.75,
+}
+_POLITICAL_POS_PHRASES = {
+    "tariff relief": 1.00,
+    "trade deal": 0.95,
+    "ceasefire talks": 0.75,
+    "funding bill": 0.55,
+    "budget deal": 0.75,
+    "tax relief": 0.70,
+    "regulatory approval": 0.90,
+    "subsidy support": 0.75,
+    "policy support": 0.65,
+}
+_POLITICAL_NEG_PHRASES = {
+    "export ban": -1.10,
+    "export curb": -1.00,
+    "export controls": -1.05,
+    "tariff hike": -1.05,
+    "new tariffs": -1.00,
+    "trade restriction": -0.95,
+    "trade war": -1.10,
+    "government shutdown": -1.10,
+    "debt ceiling standoff": -1.00,
+    "antitrust probe": -1.05,
+    "regulatory crackdown": -1.00,
+    "sanctions escalation": -1.00,
+    "geopolitical escalation": -0.95,
+    "war escalation": -1.10,
 }
 
 
@@ -127,9 +180,24 @@ def _state_path(symbol: str) -> str:
 
 def _archive_query(symbol: str) -> str:
     sym = str(symbol or "").upper()
+    meta = INSTRUMENTS.get(sym, {}) if isinstance(INSTRUMENTS, dict) else {}
+    aliases = []
+    for raw in [sym, meta.get("display_name"), meta.get("company_name")] + list(meta.get("news_aliases", []) or []):
+        text = str(raw or "").strip()
+        if text:
+            aliases.append(text)
+    deduped = []
+    seen = set()
+    for item in aliases:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
     if sym == "QQQ":
         return '("invesco qqq" OR "nasdaq 100" OR "nasdaq-100" OR qqq OR nvidia OR microsoft OR apple OR amazon OR alphabet OR meta OR semiconductor OR ai)'
-    return f'"{sym}"'
+    terms = [f'"{item}"' if " " in item else item for item in deduped[:8]]
+    return "(" + " OR ".join(terms or [f'"{sym}"']) + ")"
 
 
 def _archive_timestamp(raw_ts) -> pd.Timestamp:
@@ -202,13 +270,181 @@ def _tech_relevance(headline: str, toks: list[str], instrument_symbol: str | Non
     return float(max(0.0, min(1.0, base)))
 
 
+def _political_relevance(headline: str, toks: list[str], instrument_symbol: str | None = None) -> float:
+    text = str(headline or "").lower()
+    text_norm = " ".join(toks)
+    policy_hits = sum(1 for t in toks if t in _POLITICAL_KEYWORDS)
+    entity_hits = sum(1 for e in _POLITICAL_ENTITIES if e in text)
+    tech_hits = sum(1 for t in toks if t in _TECH_KEYWORDS or t in _TECH_ENTITIES)
+    macro_hits = sum(1 for t in toks if t in _MACRO_KEYWORDS)
+    market_hits = sum(1 for t in toks if t in _MARKET_KEYWORDS)
+    phrase_hits = sum(1 for p in set(_POLITICAL_POS_PHRASES) | set(_POLITICAL_NEG_PHRASES) if p in text_norm)
+    base = 0.0
+    if policy_hits > 0 or entity_hits > 0 or phrase_hits > 0:
+        base = 0.16 * float(policy_hits) + 0.22 * float(entity_hits) + 0.16 * float(phrase_hits)
+    if tech_hits > 0:
+        base += 0.14 * min(2.0, float(tech_hits))
+    if market_hits > 0:
+        base += 0.08 * min(2.0, float(market_hits))
+    if macro_hits > 0:
+        base += 0.06 * min(2.0, float(macro_hits))
+    if str(instrument_symbol or "").upper() == "QQQ" and (tech_hits > 0 or any(p in text for p in _DIRECT_QQQ_PHRASES)):
+        base += 0.10
+    return float(max(0.0, min(1.0, base)))
+
+
+def _price_path(symbol: str) -> str:
+    return os.path.join(DATA_DIR, f"prices_{str(symbol or '').upper()}.csv")
+
+
+def _price_daily_long_path(symbol: str) -> str:
+    return os.path.join(DATA_DIR, f"prices_{str(symbol or '').upper()}_daily_long.csv")
+
+
+def _load_daily_price_history(symbol: str, tz: str = "America/New_York") -> pd.DataFrame:
+    symbol = str(symbol or "").upper()
+    frames = []
+    long_path = _price_daily_long_path(symbol)
+    if os.path.exists(long_path):
+        try:
+            daily_long = pd.read_csv(long_path, index_col=0, parse_dates=True)
+            daily_long.index = pd.to_datetime(daily_long.index, errors="coerce")
+            daily_long.columns = [str(c).lower() for c in daily_long.columns]
+            daily_long = daily_long.rename(columns={"adj close": "adj_close"})
+            daily_long = daily_long[[c for c in ("open", "high", "low", "close", "volume") if c in daily_long.columns]].copy()
+            daily_long = daily_long.dropna(subset=["close"]).sort_index()
+            if not daily_long.empty:
+                daily_long.index = pd.DatetimeIndex(pd.to_datetime(daily_long.index.date))
+                daily_long["source"] = "daily_long"
+                frames.append(daily_long)
+        except Exception:
+            logger.debug("Failed reading long daily history for %s", symbol, exc_info=True)
+    path = _price_path(symbol)
+    if os.path.exists(path):
+        try:
+            intraday = pd.read_csv(path)
+            if "Datetime" in intraday.columns:
+                idx = pd.to_datetime(intraday["Datetime"], utc=True, errors="coerce")
+            else:
+                idx = pd.to_datetime(intraday.iloc[:, 0], utc=True, errors="coerce")
+            intraday.index = idx
+            intraday.columns = [str(c).lower() for c in intraday.columns]
+            intraday = intraday.dropna(subset=["close"]).sort_index()
+            if not intraday.empty:
+                local_idx = intraday.index.tz_convert(tz)
+                intraday["session_date"] = pd.to_datetime(local_idx.date)
+                grouped = intraday.groupby("session_date", sort=True)
+                daily = pd.DataFrame(index=grouped.size().index)
+                for col in ("open", "high", "low", "close", "volume"):
+                    if col not in intraday.columns:
+                        continue
+                    series = pd.to_numeric(intraday[col], errors="coerce")
+                    if col == "open":
+                        daily[col] = grouped[col].first()
+                    elif col == "high":
+                        daily[col] = grouped[col].max()
+                    elif col == "low":
+                        daily[col] = grouped[col].min()
+                    elif col == "close":
+                        daily[col] = grouped[col].last()
+                    elif col == "volume":
+                        daily[col] = grouped[col].sum()
+                daily = daily.dropna(subset=["close"]).sort_index()
+                if not daily.empty:
+                    daily["source"] = "intraday"
+                    frames.append(daily)
+        except Exception:
+            logger.debug("Failed reading intraday price history for %s", symbol, exc_info=True)
+    if not frames:
+        return pd.DataFrame()
+    merged = pd.concat(frames, axis=0, sort=False)
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    return merged
+
+
+def _rolling_corr_strength(x: pd.Series, y: pd.Series, lookback: int = 90, min_obs: int = 12) -> pd.Series:
+    if not isinstance(x, pd.Series) or not isinstance(y, pd.Series):
+        return pd.Series(dtype=float)
+    x = pd.to_numeric(x, errors="coerce")
+    y = pd.to_numeric(y, errors="coerce")
+    out = np.zeros(len(x), dtype=float)
+    for i in range(len(x)):
+        start = max(0, i - int(max(10, lookback)))
+        xs = x.iloc[start:i]
+        ys = y.iloc[start:i]
+        valid = xs.notna() & ys.notna() & np.isfinite(xs) & np.isfinite(ys)
+        if int(valid.sum()) < int(min_obs):
+            out[i] = 0.0
+            continue
+        xv = xs[valid].to_numpy(dtype=float)
+        yv = ys[valid].to_numpy(dtype=float)
+        if np.nanstd(xv) < 1e-12 or np.nanstd(yv) < 1e-12:
+            out[i] = 0.0
+            continue
+        corr = np.corrcoef(xv, yv)[0, 1]
+        out[i] = float(abs(corr)) if np.isfinite(corr) else 0.0
+    return pd.Series(out, index=x.index, dtype=float)
+
+
+def _historical_news_weight_frame(daily_news: pd.DataFrame, symbol: str, tz: str = "America/New_York") -> pd.DataFrame:
+    idx = pd.DatetimeIndex(daily_news.index)
+    out = pd.DataFrame(index=idx)
+    out["adaptive_weight"] = 1.0
+    out["political_weight"] = 1.0
+    prices = _load_daily_price_history(symbol, tz=tz)
+    if prices.empty or "close" not in prices.columns:
+        return out
+    prices = prices.sort_index().copy()
+    close = pd.to_numeric(prices.get("close"), errors="coerce")
+    high = pd.to_numeric(prices.get("high"), errors="coerce")
+    low = pd.to_numeric(prices.get("low"), errors="coerce")
+    price_daily = pd.DataFrame(index=prices.index)
+    price_daily["next_close_ret"] = (close.shift(-1) / close) - 1.0
+    price_daily["next_abs_ret"] = price_daily["next_close_ret"].abs()
+    if high is not None and low is not None:
+        price_daily["next_range_ret"] = ((high.shift(-1) - low.shift(-1)) / close).replace([np.inf, -np.inf], np.nan)
+    joined = daily_news.join(price_daily, how="left")
+    if joined[["next_close_ret", "next_abs_ret"]].dropna(how="all").empty:
+        return out
+    dir_strength = _rolling_corr_strength(joined.get("score_sum"), joined.get("next_close_ret"))
+    impact_strength = pd.concat(
+        [
+            _rolling_corr_strength(joined.get("hawkes_close"), joined.get("next_abs_ret")),
+            _rolling_corr_strength(joined.get("count"), joined.get("next_abs_ret")),
+            _rolling_corr_strength(joined.get("relevance_mean"), joined.get("next_range_ret")),
+        ],
+        axis=1,
+    ).max(axis=1).fillna(0.0)
+    political_strength = pd.concat(
+        [
+            _rolling_corr_strength(joined.get("political_score_sum"), joined.get("next_close_ret")),
+            _rolling_corr_strength(joined.get("political_count"), joined.get("next_abs_ret")),
+            _rolling_corr_strength(joined.get("political_relevance_mean"), joined.get("next_range_ret")),
+        ],
+        axis=1,
+    ).max(axis=1).fillna(0.0)
+    adaptive_strength = ((0.45 * dir_strength) + (0.35 * impact_strength) + (0.20 * political_strength)).clip(0.0, 1.0)
+    out["adaptive_weight"] = (0.35 + (1.65 * adaptive_strength)).clip(0.25, 2.0).reindex(idx).fillna(1.0)
+    out["political_weight"] = (0.25 + (1.75 * political_strength.clip(0.0, 1.0))).clip(0.15, 2.0).reindex(idx).fillna(1.0)
+    return out
+
+
 def _headline_sentiment_detail(headline: str, instrument_symbol: str | None = None) -> dict:
     toks = _tokenize(headline)
     if not toks:
-        return {"score": 0.0, "label": "neutral", "relevance": 0.0, "tech_relevant": False}
+        return {
+            "score": 0.0,
+            "label": "neutral",
+            "relevance": 0.0,
+            "tech_relevant": False,
+            "political_relevance": 0.0,
+            "political_relevant": False,
+        }
 
     text_norm = " ".join(toks)
     score_raw = _phrase_score(text_norm)
+    score_raw += sum(float(w) for phrase, w in _POLITICAL_POS_PHRASES.items() if phrase in text_norm)
+    score_raw += sum(float(w) for phrase, w in _POLITICAL_NEG_PHRASES.items() if phrase in text_norm)
     for i, tok in enumerate(toks):
         weight = 0.0
         if tok in _POS_WORDS:
@@ -227,7 +463,9 @@ def _headline_sentiment_detail(headline: str, instrument_symbol: str | None = No
 
     norm = max(2.0, float(len(toks)) ** 0.65)
     score = float(score_raw / norm)
-    relevance = _tech_relevance(headline, toks, instrument_symbol=instrument_symbol)
+    tech_relevance = _tech_relevance(headline, toks, instrument_symbol=instrument_symbol)
+    political_relevance = _political_relevance(headline, toks, instrument_symbol=instrument_symbol)
+    relevance = float(max(tech_relevance, (0.85 * political_relevance) + (0.15 * tech_relevance)))
     if relevance <= 0.0:
         score = 0.0
     else:
@@ -244,7 +482,9 @@ def _headline_sentiment_detail(headline: str, instrument_symbol: str | None = No
         "score": float(score),
         "label": label,
         "relevance": float(relevance),
-        "tech_relevant": bool(relevance >= 0.25),
+        "tech_relevant": bool(tech_relevance >= 0.25),
+        "political_relevance": float(political_relevance),
+        "political_relevant": bool(political_relevance >= 0.25),
     }
 
 
@@ -305,6 +545,14 @@ def _normalize_news_frame(df: pd.DataFrame, default_symbol: str | None = None) -
     else:
         out["relevance_score"] = rel_existing.clip(0.0, 1.0)
         out["tech_relevant"] = pd.to_numeric(out.get("tech_relevant"), errors="coerce").fillna(0).astype(int)
+    out["political_relevance_score"] = pd.to_numeric(
+        det_df.get("political_relevance", out.get("political_relevance_score")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["political_relevant"] = pd.to_numeric(
+        det_df.get("political_relevant", out.get("political_relevant")),
+        errors="coerce",
+    ).fillna(0).astype(int)
     return out
 
 
@@ -357,6 +605,8 @@ def _parse_item(item: dict, symbol: str) -> dict | None:
         "sentiment_label": str(sent["label"]),
         "relevance_score": float(sent["relevance"]),
         "tech_relevant": int(1 if sent["tech_relevant"] else 0),
+        "political_relevance_score": float(sent.get("political_relevance", 0.0)),
+        "political_relevant": int(1 if sent.get("political_relevant") else 0),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -386,8 +636,14 @@ def _local_archive_candidate_paths(symbol: str) -> list[str]:
         f"news_archive_{sym}.csv",
         f"news_history_{sym}.jsonl",
         f"news_archive_{sym}.jsonl",
+        f"{sym}_news.csv",
+        f"{sym}_news.jsonl",
+        f"news_{sym}.csv",
+        f"news_{sym}.jsonl",
     ]
-    return [os.path.join(DATA_DIR, name) for name in names]
+    out = [os.path.join(DATA_DIR, name) for name in names]
+    out.extend([os.path.join(NEW_INSTRUMENTS_DIR, name) for name in names])
+    return out
 
 
 def _read_local_archive_frame(path: str, symbol: str) -> pd.DataFrame:
@@ -457,13 +713,17 @@ def _read_local_archive_frame(path: str, symbol: str) -> pd.DataFrame:
     return _normalize_news_frame(frame, default_symbol=str(symbol or "").upper())
 
 
-def import_local_historical_news(symbol: str = "QQQ") -> dict:
+def import_local_historical_news(symbol: str = "QQQ", extra_paths: list[str] | None = None) -> dict:
     symbol = str(symbol or "QQQ").upper()
     path = _news_path(symbol)
     current = _load_existing_news(path)
     imported_frames = []
     imported_files = []
-    for candidate in _local_archive_candidate_paths(symbol):
+    candidates = list(_local_archive_candidate_paths(symbol))
+    for candidate in list(extra_paths or []):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
         frame = _read_local_archive_frame(candidate, symbol)
         if frame.empty:
             continue
@@ -518,6 +778,8 @@ def _parse_archive_item(item: dict, symbol: str) -> dict | None:
         "sentiment_label": str(sent["label"]),
         "relevance_score": float(sent["relevance"]),
         "tech_relevant": int(1 if sent["tech_relevant"] else 0),
+        "political_relevance_score": float(sent.get("political_relevance", 0.0)),
+        "political_relevant": int(1 if sent.get("political_relevant") else 0),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -754,7 +1016,12 @@ def news_archive_coverage(symbol: str = "QQQ", trading_dates=None, tz: str = "Am
         }
     df["relevance_score"] = pd.to_numeric(df.get("relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
     df["tech_relevant"] = pd.to_numeric(df.get("tech_relevant"), errors="coerce").fillna(0).astype(int)
-    relevant = df[(df["tech_relevant"] > 0) | (df["relevance_score"] >= 0.25)].copy()
+    df["political_relevant"] = pd.to_numeric(df.get("political_relevant"), errors="coerce").fillna(0).astype(int)
+    relevant = df[
+        (df["tech_relevant"] > 0)
+        | (df["political_relevant"] > 0)
+        | (df["relevance_score"] >= 0.25)
+    ].copy()
     if relevant.empty:
         return {
             "symbol": symbol,
@@ -869,6 +1136,12 @@ def load_news_features_for_index(
         "news_entropy_d3",
         "news_relevance_mean_d3",
         "news_sent_surprise_d1",
+        "news_political_count_d3",
+        "news_political_sent_d3",
+        "news_political_relevance_d3",
+        "news_adaptive_weight_d7",
+        "news_weighted_sent_d7",
+        "news_weighted_political_d7",
     ]
     if index_utc is None or len(index_utc) == 0:
         return pd.DataFrame(columns=cols, index=index_utc)
@@ -890,13 +1163,24 @@ def load_news_features_for_index(
     df["sentiment_label"] = df.get("sentiment_label", "neutral").astype(str).str.lower()
     df["relevance_score"] = pd.to_numeric(df.get("relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
     df["tech_relevant"] = pd.to_numeric(df.get("tech_relevant"), errors="coerce").fillna(0).astype(int)
+    df["political_relevance_score"] = pd.to_numeric(df.get("political_relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["political_relevant"] = pd.to_numeric(df.get("political_relevant"), errors="coerce").fillna(0).astype(int)
     # Keep only relevant stories for QQQ signal extraction.
-    df = df[(df["tech_relevant"] > 0) | (df["relevance_score"] >= 0.25)].copy()
+    df = df[
+        (df["tech_relevant"] > 0)
+        | (df["political_relevant"] > 0)
+        | (df["relevance_score"] >= 0.25)
+    ].copy()
     if df.empty:
         return pd.DataFrame(0.0, index=index_utc, columns=cols)
     # Relevance-weighted score reduces noise from loosely related articles.
     df["sentiment_score"] = df["sentiment_score"] * (0.5 + 0.5 * df["relevance_score"])
-    df["event_weight"] = (0.5 + 0.5 * df["relevance_score"]) * (1.0 + df["sentiment_score"].abs())
+    df["political_sentiment_score"] = df["sentiment_score"] * df["political_relevance_score"]
+    df["event_weight"] = (
+        (0.45 + 0.55 * df["relevance_score"])
+        * (1.0 + df["sentiment_score"].abs())
+        * (1.0 + (0.35 * df["political_relevance_score"]))
+    )
     ts_ns = df["published_at"].astype("int64", copy=False).to_numpy()
     df["hawkes_intensity"] = _hawkes_intensity(ts_ns, df["event_weight"].to_numpy(dtype=float), half_life_hours=6.0)
     local_dt = df["published_at"].dt.tz_convert(tz)
@@ -910,6 +1194,9 @@ def load_news_features_for_index(
     daily["neg_count"] = grouped["sentiment_label"].apply(lambda s: float((s == "negative").sum()))
     daily["neutral_count"] = grouped["sentiment_label"].apply(lambda s: float((s == "neutral").sum()))
     daily["relevance_mean"] = grouped["relevance_score"].mean()
+    daily["political_count"] = grouped["political_relevant"].sum().astype(float)
+    daily["political_score_sum"] = grouped["political_sentiment_score"].sum()
+    daily["political_relevance_mean"] = grouped["political_relevance_score"].mean()
     daily["hawkes_close"] = grouped["hawkes_intensity"].last()
     daily = daily.sort_index()
     # Expand to a full daily calendar so lag features remain valid on no-news days.
@@ -924,6 +1211,11 @@ def load_news_features_for_index(
         daily = daily.reindex(full_dates).fillna(0.0)
     except Exception:
         pass
+    weights = _historical_news_weight_frame(daily, symbol=symbol, tz=tz)
+    daily["adaptive_weight"] = pd.to_numeric(weights.get("adaptive_weight"), errors="coerce").reindex(daily.index).fillna(1.0)
+    daily["political_weight"] = pd.to_numeric(weights.get("political_weight"), errors="coerce").reindex(daily.index).fillna(1.0)
+    daily["weighted_score_sum"] = daily["score_sum"] * daily["adaptive_weight"]
+    daily["weighted_political_score_sum"] = daily["political_score_sum"] * daily["political_weight"]
     # Lag all features by one day to avoid peeking at same-day headlines in training labels.
     lag = pd.DataFrame(index=daily.index)
     lag["news_sent_mean_d1"] = daily["score_mean"].shift(1).fillna(0.0)
@@ -942,6 +1234,12 @@ def load_news_features_for_index(
     lag["news_relevance_mean_d3"] = daily["relevance_mean"].rolling(3, min_periods=1).mean().shift(1).fillna(0.0)
     long_mean = daily["score_sum"].ewm(halflife=10.0, adjust=False, min_periods=3).mean()
     lag["news_sent_surprise_d1"] = (daily["score_sum"] - long_mean).shift(1).fillna(0.0)
+    lag["news_political_count_d3"] = daily["political_count"].rolling(3, min_periods=1).sum().shift(1).fillna(0.0)
+    lag["news_political_sent_d3"] = daily["political_score_sum"].rolling(3, min_periods=1).sum().shift(1).fillna(0.0)
+    lag["news_political_relevance_d3"] = daily["political_relevance_mean"].rolling(3, min_periods=1).mean().shift(1).fillna(0.0)
+    lag["news_adaptive_weight_d7"] = daily["adaptive_weight"].ewm(halflife=5.0, adjust=False, min_periods=1).mean().shift(1).fillna(1.0)
+    lag["news_weighted_sent_d7"] = daily["weighted_score_sum"].ewm(halflife=3.0, adjust=False, min_periods=1).mean().shift(1).fillna(0.0)
+    lag["news_weighted_political_d7"] = daily["weighted_political_score_sum"].ewm(halflife=3.0, adjust=False, min_periods=1).mean().shift(1).fillna(0.0)
 
     idx_local = pd.to_datetime(index_utc, utc=True, errors="coerce").tz_convert(tz)
     idx_dates = pd.to_datetime(idx_local.date)
@@ -974,6 +1272,7 @@ def load_recent_headlines(symbol: str = "QQQ", limit: int = 8) -> list[dict]:
                 "score": _safe_float(row.get("sentiment_score")),
                 "label": str(row.get("sentiment_label") or "").strip(),
                 "relevance": _safe_float(row.get("relevance_score")),
+                "political_relevance": _safe_float(row.get("political_relevance_score")),
                 "source": str(row.get("source") or "").strip(),
                 "url": str(row.get("url") or "").strip(),
             }

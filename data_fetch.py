@@ -7,14 +7,16 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
+from credential_store import get_runtime_broker_settings
 from config import (
     DATA_DIR, SYMBOL, INTERVAL, MAX_HISTORY_DAYS,
-    ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER, DATA_PROVIDER,
+    DATA_PROVIDER,
     IB_GATEWAY_HOST, IB_GATEWAY_PORT, IB_CLIENT_ID, INSTRUMENTS,
     YFINANCE_LOOKBACK_DAYS, YFINANCE_REFRESH_BUFFER_DAYS, NEWS_PIPELINE_SYMBOL
 )
 from instrument_onboarding import ensure_runtime_instruments
 from market_context import maybe_refresh_context_data
+from macro_events import maybe_refresh_macro_events
 from news_pipeline import maybe_refresh_news
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,10 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO)
 
 _DATA_LOCK = threading.RLock()
+
+
+def _alpaca_settings() -> dict:
+    return dict(get_runtime_broker_settings())
 
 def _ensure_utc_index(df: pd.DataFrame, tz: str = "America/New_York") -> pd.DataFrame:
     if df is None or df.empty:
@@ -246,14 +252,21 @@ def _try_fetch_latest_quotes_alpaca(client, symbol):
 def fetch_recent_intraday_alpaca(symbol: str, retries=2):
     if not _ALPACA_AVAILABLE:
         return pd.DataFrame()
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+    settings = _alpaca_settings()
+    if not settings.get("credentials_present"):
         return pd.DataFrame()
     try:
-        client = StockHistoricalDataClient(api_key=ALPACA_API_KEY, secret_key=ALPACA_SECRET_KEY)
+        client = StockHistoricalDataClient(
+            api_key=settings.get("api_key"),
+            secret_key=settings.get("secret_key"),
+        )
     except Exception:
         logger.exception("Alpaca client init failed")
         try:
-            client = StockHistoricalDataClient(api_key=ALPACA_API_KEY, secret_key=ALPACA_SECRET_KEY)
+            client = StockHistoricalDataClient(
+                api_key=settings.get("api_key"),
+                secret_key=settings.get("secret_key"),
+            )
         except Exception:
             logger.exception("Alpaca client retry failed")
             return pd.DataFrame()
@@ -480,7 +493,8 @@ def update_price_data(instr_key: str = None):
         if instr_key is None:
             instr_key = SYMBOL
         try:
-            if str(instr_key).upper() == str(NEWS_PIPELINE_SYMBOL).upper():
+            instr_meta = INSTRUMENTS.get(str(instr_key).upper(), {})
+            if bool(instr_meta.get("news_enabled", True)):
                 maybe_refresh_news(symbol=instr_key)
         except Exception:
             logger.debug("News refresh failed", exc_info=True)
@@ -488,6 +502,10 @@ def update_price_data(instr_key: str = None):
             maybe_refresh_context_data(instr_key)
         except Exception:
             logger.debug("Context refresh failed", exc_info=True)
+        try:
+            maybe_refresh_macro_events()
+        except Exception:
+            logger.debug("Macro refresh failed", exc_info=True)
 
         instr = INSTRUMENTS.get(instr_key, {})
         instr_type = instr.get("type", "equity")

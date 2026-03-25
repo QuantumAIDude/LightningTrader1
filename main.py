@@ -1,6 +1,6 @@
-#main.py
-from stock_gui import launch_gui
+from desktop_app import main
+
 
 if __name__ == "__main__":
-    launch_gui()
+    raise SystemExit(main())
  

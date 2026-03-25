@@ -73,9 +73,9 @@ _STRUCTURAL_WEEKEND_SESSION_FEATURES = (
     "ctx_vol_level_z",
 )
 _LONG_HORIZON_NEWS_FEATURES = (
-    "news_sent_ewm_d7",
-    "news_intensity_ewm_d7",
-    "news_relevance_mean_d3",
+    "news_adaptive_weight_d7",
+    "news_weighted_sent_d7",
+    "news_weighted_political_d7",
 )
 
 
@@ -858,8 +858,8 @@ def _daily_outcome_specs(dataset: pd.DataFrame) -> list[dict]:
             {
                 "candidate_key": "daily_long_news_prior",
                 "variant": "global_news",
-                "center_features": tuple(list(_STRUCTURAL_DAILY_CENTER_FEATURES) + ["news_sent_ewm_d7", "news_intensity_ewm_d7"]),
-                "range_features": tuple(list(_STRUCTURAL_DAILY_RANGE_FEATURES) + ["news_intensity_ewm_d7"]),
+                "center_features": tuple(list(_STRUCTURAL_DAILY_CENTER_FEATURES) + ["news_weighted_sent_d7", "news_weighted_political_d7"]),
+                "range_features": tuple(list(_STRUCTURAL_DAILY_RANGE_FEATURES) + ["news_adaptive_weight_d7", "news_weighted_sent_d7"]),
                 "bucket_mode": None,
             }
         )
@@ -902,7 +902,7 @@ def _weekend_outcome_specs(dataset: pd.DataFrame) -> list[dict]:
             {
                 "candidate_key": "weekend_session_coarse3_news",
                 "variant": "session_close_coarse3_news",
-                "features": tuple(list(_STRUCTURAL_WEEKEND_SESSION_FEATURES) + ["news_sent_ewm_d7", "news_intensity_ewm_d7"]),
+                "features": tuple(list(_STRUCTURAL_WEEKEND_SESSION_FEATURES) + ["news_adaptive_weight_d7", "news_weighted_sent_d7", "news_weighted_political_d7"]),
                 "bucket_mode": "coarse3",
             }
         )
@@ -1263,8 +1263,8 @@ def _daily_candidate_features(candidate_key: str) -> tuple[tuple[str, ...], tupl
     key = str(candidate_key or "")
     if key == "daily_long_news_prior":
         return (
-            tuple(list(_STRUCTURAL_DAILY_CENTER_FEATURES) + ["news_sent_ewm_d7", "news_intensity_ewm_d7"]),
-            tuple(list(_STRUCTURAL_DAILY_RANGE_FEATURES) + ["news_intensity_ewm_d7"]),
+            tuple(list(_STRUCTURAL_DAILY_CENTER_FEATURES) + ["news_weighted_sent_d7", "news_weighted_political_d7"]),
+            tuple(list(_STRUCTURAL_DAILY_RANGE_FEATURES) + ["news_adaptive_weight_d7", "news_weighted_sent_d7"]),
             None,
         )
     if key == "daily_long_regime_2x2":
@@ -1279,7 +1279,7 @@ def _weekend_candidate_features(candidate_key: str) -> tuple[tuple[str, ...], st
     if key in ("weekend_session_coarse3", "weekend_session_coarse3_news"):
         feats = list(_STRUCTURAL_WEEKEND_SESSION_FEATURES)
         if key.endswith("_news"):
-            feats.extend(["news_sent_ewm_d7", "news_intensity_ewm_d7"])
+            feats.extend(["news_adaptive_weight_d7", "news_weighted_sent_d7", "news_weighted_political_d7"])
         return tuple(feats), "coarse3"
     return tuple(_STRUCTURAL_WEEKEND_FEATURES), None
 
@@ -1698,14 +1698,14 @@ def _fit_structural_daily_pair_overlay(resolved: pd.DataFrame, daily_df: pd.Data
                 }
             )
     news_ok = all(col in dataset.columns for col in _LONG_HORIZON_NEWS_FEATURES) and bool(
-        float(pd.to_numeric(dataset["news_intensity_ewm_d7"], errors="coerce").abs().sum()) > 0.0
+        float(pd.to_numeric(dataset["news_weighted_sent_d7"], errors="coerce").abs().sum()) > 0.0
     )
     if news_ok:
         candidates.append(
             {
                 "label": "daily_long_news_prior",
-                "center_features": tuple(list(_STRUCTURAL_DAILY_CENTER_FEATURES) + ["news_sent_ewm_d7", "news_intensity_ewm_d7"]),
-                "range_features": tuple(list(_STRUCTURAL_DAILY_RANGE_FEATURES) + ["news_intensity_ewm_d7"]),
+                "center_features": tuple(list(_STRUCTURAL_DAILY_CENTER_FEATURES) + ["news_weighted_sent_d7", "news_weighted_political_d7"]),
+                "range_features": tuple(list(_STRUCTURAL_DAILY_RANGE_FEATURES) + ["news_adaptive_weight_d7", "news_weighted_sent_d7"]),
                 "bucket_edges": [],
             }
         )
@@ -1907,10 +1907,12 @@ def _fit_structural_weekend_overlay(resolved: pd.DataFrame, daily_df: pd.DataFra
         if session_fit is not None:
             candidates.append(session_fit)
         news_ok = all(col in dataset.columns for col in _LONG_HORIZON_NEWS_FEATURES) and bool(
-            float(pd.to_numeric(dataset["news_intensity_ewm_d7"], errors="coerce").abs().sum()) > 0.0
+            float(pd.to_numeric(dataset["news_weighted_sent_d7"], errors="coerce").abs().sum()) > 0.0
         )
         if news_ok:
-            session_news_fit = _evaluate_session_bucketed(tuple(list(_STRUCTURAL_WEEKEND_SESSION_FEATURES) + ["news_sent_ewm_d7", "news_intensity_ewm_d7"]))
+            session_news_fit = _evaluate_session_bucketed(
+                tuple(list(_STRUCTURAL_WEEKEND_SESSION_FEATURES) + ["news_adaptive_weight_d7", "news_weighted_sent_d7", "news_weighted_political_d7"])
+            )
             if session_news_fit is not None:
                 candidates.append(session_news_fit)
     if not candidates:

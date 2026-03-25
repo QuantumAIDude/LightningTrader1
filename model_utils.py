@@ -1856,6 +1856,40 @@ def _prediction_band(last_price: float, pred_ret: float, std_ret: float, instr_m
     return float(round(min(lo, hi), 4)), float(round(max(lo, hi), 4)), exp_abs_err_bps
 
 
+def _prediction_bands(last_price: float, pred_ret: float, std_ret: float, instr_meta: dict | None = None) -> dict:
+    lo70, hi70, _ = _prediction_band(last_price, pred_ret, std_ret, instr_meta=instr_meta, z_mult=1.0364333894937898)
+    lo80, hi80, err_bps = _prediction_band(last_price, pred_ret, std_ret, instr_meta=instr_meta, z_mult=1.281551565545)
+    lo95, hi95, _ = _prediction_band(last_price, pred_ret, std_ret, instr_meta=instr_meta, z_mult=1.959963984540054)
+    return {
+        "pred_range_70_low": lo70,
+        "pred_range_70_high": hi70,
+        "pred_range_80_low": lo80,
+        "pred_range_80_high": hi80,
+        "pred_range_95_low": lo95,
+        "pred_range_95_high": hi95,
+        "expected_abs_err_bps": err_bps,
+    }
+
+
+def _direction_prob_fields(direction: str, confidence_pct: float | None) -> dict:
+    try:
+        conf = max(0.01, min(0.99, float(confidence_pct) / 100.0))
+    except Exception:
+        conf = 0.5
+    direction = str(direction or "-").upper()
+    if direction == "UP":
+        p_up = conf
+    elif direction == "DOWN":
+        p_up = 1.0 - conf
+    else:
+        p_up = 0.5
+    p_up = max(0.001, min(0.999, float(p_up)))
+    return {
+        "p_up": round(float(p_up), 6),
+        "p_down": round(float(1.0 - p_up), 6),
+    }
+
+
 def _effective_model_count(weights) -> float:
     try:
         arr = np.asarray(list(weights), dtype=float)
@@ -2312,23 +2346,23 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             std_ret = float(pred_std_norm * current_vol) if target_normed else float(pred_std_norm)
         except Exception:
             std_ret = 0.0
-        band_lo, band_hi, exp_err_bps = _prediction_band(last_price, pred_ret_adj, std_ret, instr_meta=instr_meta)
+        band_fields = _prediction_bands(last_price, pred_ret_adj, std_ret, instr_meta=instr_meta)
         try:
             model_uncertainty_rets.append(abs(float(std_ret)))
         except Exception:
             pass
+        conf_pct = round(float(conf * 100.0), 2)
         results_out[key] = {
             "direction": direction,
             "pred_price": float(round(pred_price, 4)),
-            "confidence": round(float(conf * 100.0), 2),
+            "confidence": conf_pct,
             "note": note,
             "pred_ret": float(pred_ret_adj),
             "pred_norm": float(pred_norm_adj),
             "pred_std_norm": float(pred_std_norm),
-            "pred_range_80_low": band_lo,
-            "pred_range_80_high": band_hi,
-            "expected_abs_err_bps": exp_err_bps,
-            "sig_bucket": "Strong" if (abs(pred_norm_adj) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm_adj) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak"
+            "sig_bucket": "Strong" if (abs(pred_norm_adj) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm_adj) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak",
+            **band_fields,
+            **_direction_prob_fields(direction, conf_pct),
         }
         model_preds.append((key, pred_ret_adj))
         # derive model weight from blended window performance
@@ -2447,7 +2481,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
                 meta_std_ret = float(meta_resid * meta_ewm_vol) if meta_normed else float(meta_resid)
             except Exception:
                 meta_std_ret = 0.0
-            meta_lo, meta_hi, meta_err_bps = _prediction_band(last_price, meta_ret, meta_std_ret, instr_meta=instr_meta)
+            meta_band_fields = _prediction_bands(last_price, meta_ret, meta_std_ret, instr_meta=instr_meta)
             try:
                 model_uncertainty_rets.append(abs(float(meta_std_ret)))
             except Exception:
@@ -2461,18 +2495,18 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
                 meta_direction = "-"
                 conf_meta = min(conf_meta, 0.35)
                 meta_note += " | Outside 4min predictability gate"
+            meta_conf_pct = round(float(conf_meta * 100.0), 2)
             results_out["meta"] = {
                 "direction": meta_direction,
                 "pred_price": float(round(meta_price, 4)),
-                "confidence": round(float(conf_meta * 100.0), 2),
+                "confidence": meta_conf_pct,
                 "note": meta_note,
                 "pred_ret": float(meta_ret),
                 "pred_norm": float(pred_meta_norm),
                 "pred_std_norm": float(meta_resid),
-                "pred_range_80_low": meta_lo,
-                "pred_range_80_high": meta_hi,
-                "expected_abs_err_bps": meta_err_bps,
-                "sig_bucket": "Strong" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 1.5 else "Medium" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 0.5 else "Weak"
+                "sig_bucket": "Strong" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 1.5 else "Medium" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 0.5 else "Weak",
+                **meta_band_fields,
+                **_direction_prob_fields(meta_direction, meta_conf_pct),
             }
             model_preds.append(("meta", meta_ret))
             meta_w = 1.0 / (meta_resid + 1e-6)
@@ -2708,18 +2742,16 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         cons_std_ret = float(combined_uncertainty)
     except Exception:
         cons_std_ret = 0.0
-    cons_lo, cons_hi, cons_err_bps = _prediction_band(last_price, consensus_ret, cons_std_ret, instr_meta=instr_meta)
+    cons_band_fields = _prediction_bands(last_price, consensus_ret, cons_std_ret, instr_meta=instr_meta)
+    consensus_conf_pct = round(float(consensus_conf), 2)
 
     results_out["consensus"] = {
         "direction": consensus_dir,
         "pred_price": float(round(combined_price, 4)),
-        "confidence": round(float(consensus_conf), 2),
+        "confidence": consensus_conf_pct,
         "note": consensus_note,
         "position_size": round(float(position_size), 3),
         "pred_ret": float(consensus_ret),
-        "pred_range_80_low": cons_lo,
-        "pred_range_80_high": cons_hi,
-        "expected_abs_err_bps": cons_err_bps,
         "edge_bps": round(float(edge_ret * 10000.0), 3),
         "cost_bps_est": round(float(cost_ret_est * 10000.0), 3),
         "disagreement_bps": round(float(disagreement * 10000.0), 3),
@@ -2730,6 +2762,8 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         "conformal_band_bps": round(float(conformal_band * 10000.0), 3) if conformal_band is not None else None,
         "live_abs_err_bps": round(float(live_abs_err_ret * 10000.0), 3) if live_abs_err_ret is not None else None,
         "sig_bucket": "Strong" if (abs(consensus_ret) / (combined_uncertainty + 1e-9)) >= 1.5 else "Medium" if (abs(consensus_ret) / (combined_uncertainty + 1e-9)) >= 0.5 else "Weak",
+        **cons_band_fields,
+        **_direction_prob_fields(consensus_dir, consensus_conf_pct),
     }
 
     # Degenerate-output guard: near-identical model outputs are usually low-information snapshots.
@@ -3490,19 +3524,20 @@ def _predict_mode_group(models_group, df_latest, instrument_key, rp, dominant_re
             std_ret = float(pred_std_norm * current_vol) if target_normed else float(pred_std_norm)
         except Exception:
             std_ret = 0.0
-        band_lo, band_hi, exp_err_bps = _prediction_band(last_price, pred_ret, std_ret, instr_meta=instr_meta)
+        band_fields = _prediction_bands(last_price, pred_ret, std_ret, instr_meta=instr_meta)
+        conf_pct = round(float(conf * 100.0), 2)
         out[key] = {
             "direction": direction,
             "pred_price": float(round(pred_price, 4)),
-            "confidence": round(float(conf * 100.0), 2),
+            "confidence": conf_pct,
             "note": " | ".join(note_parts),
             "pred_ret": float(pred_ret),
             "pred_norm": float(pred_norm),
             "pred_std_norm": float(pred_std_norm),
-            "pred_range_80_low": band_lo,
-            "pred_range_80_high": band_hi,
-            "expected_abs_err_bps": exp_err_bps,
-            "sig_bucket": "Strong" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak"
+            "sig_bucket": "Strong" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak",
+            **band_fields,
+            "p_up": round(float(p_up), 6),
+            "p_down": round(float(1.0 - p_up), 6),
         }
     return out
 

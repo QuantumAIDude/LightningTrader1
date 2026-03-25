@@ -214,6 +214,34 @@ ALLOW_REMOTE_CONTEXT_DAILY = os.environ.get("ALLOW_REMOTE_CONTEXT_DAILY", "true"
 OPTIONS_PANEL_ENABLED = os.environ.get("OPTIONS_PANEL_ENABLED", "true").lower() in ("1", "true", "yes")
 ALLOW_REMOTE_OPTIONS = os.environ.get("ALLOW_REMOTE_OPTIONS", "true").lower() in ("1", "true", "yes")
 OPTIONS_REFRESH_COOLDOWN_SEC = int(os.environ.get("OPTIONS_REFRESH_COOLDOWN_SEC", "900"))
+ALLOW_REMOTE_EVENTS = os.environ.get("ALLOW_REMOTE_EVENTS", "true").lower() in ("1", "true", "yes")
+EVENTS_REFRESH_COOLDOWN_SEC = int(os.environ.get("EVENTS_REFRESH_COOLDOWN_SEC", "21600"))
+ALLOW_REMOTE_MACRO_EVENTS = os.environ.get(
+    "ALLOW_REMOTE_MACRO_EVENTS",
+    os.environ.get("ALLOW_REMOTE_EVENTS", "true"),
+).lower() in ("1", "true", "yes")
+MACRO_EVENTS_REFRESH_COOLDOWN_SEC = int(os.environ.get("MACRO_EVENTS_REFRESH_COOLDOWN_SEC", "3600"))
+TRADING_ECONOMICS_CALENDAR_KEY = os.environ.get("TRADING_ECONOMICS_CALENDAR_KEY", "guest:guest")
+TRADING_ECONOMICS_CALENDAR_COUNTRY = os.environ.get("TRADING_ECONOMICS_CALENDAR_COUNTRY", "united states")
+ALLOW_REMOTE_BREADTH = os.environ.get("ALLOW_REMOTE_BREADTH", "true").lower() in ("1", "true", "yes")
+BREADTH_REFRESH_COOLDOWN_SEC = int(os.environ.get("BREADTH_REFRESH_COOLDOWN_SEC", "900"))
+ALLOW_REMOTE_CATALYSTS = os.environ.get("ALLOW_REMOTE_CATALYSTS", "true").lower() in ("1", "true", "yes")
+CATALYST_REFRESH_COOLDOWN_SEC = int(os.environ.get("CATALYST_REFRESH_COOLDOWN_SEC", "1800"))
+SEC_API_USER_AGENT = os.environ.get(
+    "SEC_API_USER_AGENT",
+    "LightningTrader4000/1.0 support@example.com",
+)
+
+# Trader workstation modes, paper trading, alerts, and scanning.
+TRADER_PROFILE_DEFAULT = os.environ.get("TRADER_PROFILE_DEFAULT", "balanced").strip().lower()
+BROKER_MODE_DEFAULT = os.environ.get("BROKER_MODE_DEFAULT", "paper").strip().lower()
+LIVE_BROKER_PROVIDER = os.environ.get("LIVE_BROKER_PROVIDER", "alpaca").strip().lower()
+PAPER_TRADING_ENABLED = os.environ.get("PAPER_TRADING_ENABLED", "true").lower() in ("1", "true", "yes")
+PAPER_STARTING_CASH = float(os.environ.get("PAPER_STARTING_CASH", "100000"))
+ALERT_EVENT_COOLDOWN_SEC = int(os.environ.get("ALERT_EVENT_COOLDOWN_SEC", "900"))
+OPPORTUNITY_SCAN_MAX_SYMBOLS = int(os.environ.get("OPPORTUNITY_SCAN_MAX_SYMBOLS", "8"))
+OPPORTUNITY_SCAN_CACHE_TTL_SEC = int(os.environ.get("OPPORTUNITY_SCAN_CACHE_TTL_SEC", "180"))
+OPTIONS_IV_HISTORY_LOOKBACK = int(os.environ.get("OPTIONS_IV_HISTORY_LOOKBACK", "252"))
 
 # Retrain schedule (strings: 'daily', 'weekly', 'monthly', or integer days)
 RETRAIN_SHORT = os.environ.get("RETRAIN_SHORT", "1")   # daily
@@ -259,10 +287,16 @@ def _default_context_daily_symbols(symbol: str) -> dict:
 
 def _default_equity_meta(symbol: str) -> dict:
     sym = str(symbol or "").upper()
+    aliases = [sym]
+    if sym == "QQQ":
+        aliases.extend(["Invesco QQQ", "Nasdaq 100", "Nasdaq-100"])
     return {
         "type": "equity",
         "alpaca": sym,
         "yahoo": sym,
+        "display_name": sym,
+        "news_enabled": True,
+        "news_aliases": aliases,
         "tz": "America/New_York",
         "session_open_minute": 9 * 60 + 30,
         "session_close_minute": 16 * 60,

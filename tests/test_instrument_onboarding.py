@@ -24,8 +24,15 @@ class InstrumentOnboardingTests(unittest.TestCase):
                 io.INSTRUMENTS_FILE = os.path.join(tmp, "instruments.json")
                 io.INSTRUMENTS.clear()
                 os.makedirs(io.NEW_INSTRUMENTS_DIR, exist_ok=True)
+                import news_pipeline as npipe
+                old_news_data_dir = npipe.DATA_DIR
+                old_news_stage_dir = getattr(npipe, "NEW_INSTRUMENTS_DIR", io.NEW_INSTRUMENTS_DIR)
+                npipe.DATA_DIR = tmp
+                npipe.NEW_INSTRUMENTS_DIR = io.NEW_INSTRUMENTS_DIR
 
                 staged = os.path.join(io.NEW_INSTRUMENTS_DIR, "ABC.csv")
+                staged_meta = os.path.join(io.NEW_INSTRUMENTS_DIR, "ABC.meta.json")
+                staged_news = os.path.join(io.NEW_INSTRUMENTS_DIR, "ABC_news.csv")
                 ts = pd.date_range("2026-01-05 14:30:00+00:00", periods=4, freq="5min")
                 pd.DataFrame(
                     {
@@ -37,11 +44,20 @@ class InstrumentOnboardingTests(unittest.TestCase):
                         "volume": [1000, 1200, 1400, 1600],
                     }
                 ).to_csv(staged, index=False)
+                pd.DataFrame(
+                    [
+                        {"published": "2026-01-04T15:00:00Z", "title": "ABC wins tariff relief", "publisher": "local", "link": "http://example.com/1"},
+                    ]
+                ).to_csv(staged_news, index=False)
+                with open(staged_meta, "w") as f:
+                    f.write('{"display_name":"ABC Corp","news_aliases":["ABC","ABC Corp"]}')
 
                 rep = io.process_staged_instrument_files(auto_train=False, full_train=False)
                 self.assertEqual(len(rep.get("processed", [])), 1)
                 self.assertIn("ABC", io.INSTRUMENTS)
+                self.assertEqual(io.INSTRUMENTS["ABC"].get("display_name"), "ABC Corp")
                 self.assertTrue(os.path.exists(os.path.join(tmp, "prices_ABC.csv")))
+                self.assertTrue(os.path.exists(os.path.join(tmp, "news_ABC.csv")))
                 self.assertTrue(os.path.exists(io.INSTRUMENTS_FILE))
             finally:
                 io.DATA_DIR = old_data_dir
@@ -51,6 +67,8 @@ class InstrumentOnboardingTests(unittest.TestCase):
                 io.INSTRUMENTS_FILE = old_instruments_file
                 io.INSTRUMENTS.clear()
                 io.INSTRUMENTS.update(old_instruments)
+                npipe.DATA_DIR = old_news_data_dir
+                npipe.NEW_INSTRUMENTS_DIR = old_news_stage_dir
 
     def test_invalid_staged_file_is_quarantined(self):
         with tempfile.TemporaryDirectory() as tmp:
