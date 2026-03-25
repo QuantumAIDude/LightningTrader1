@@ -5,7 +5,7 @@ import os
 
 APP_NAME = "LightningTrader4000"
 APP_DISPLAY_NAME = "Lightning Trader Terminal"
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.10.1"
 APP_COPYRIGHT = "Internal use only"
 APP_BUNDLE_ID = "com.lightningtrader.terminal"
 APP_VENDOR = "LightningTrader"

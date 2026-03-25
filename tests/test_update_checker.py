@@ -1,6 +1,7 @@
 import unittest
 
 import update_checker as uc
+from app_meta import APP_VERSION
 
 
 class UpdateCheckerTests(unittest.TestCase):
@@ -41,8 +42,8 @@ class UpdateCheckerTests(unittest.TestCase):
             uc._fetch_latest_release = _boom
             uc._read_cache = lambda: {
                 "status": "up_to_date",
-                "current_version": "0.10.0",
-                "latest_version": "0.10.0",
+                "current_version": APP_VERSION,
+                "latest_version": APP_VERSION,
                 "checked_at": "2026-03-25T00:00:00+00:00",
                 "message": "Cached status",
             }
