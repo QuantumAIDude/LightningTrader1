@@ -4,6 +4,7 @@ name: Release Windows App
   release:
     types:
       - published
+      - edited
   workflow_dispatch:
     inputs:
       release_tag:
