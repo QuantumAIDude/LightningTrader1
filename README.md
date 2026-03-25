@@ -88,6 +88,12 @@ Current macOS release outputs:
 - `dist/Lightning Trader Terminal.app`
 - `dist/Lightning Trader Terminal-macOS-v<version>.zip`
 
+Windows release output:
+
+- `dist/Lightning Trader Terminal-Windows-v<version>.zip`
+
+The Windows zip is built automatically on GitHub Actions when a GitHub Release is published, using the same PyInstaller entrypoint and runtime asset manifest as the macOS build.
+
 ## Honesty Rules
 
 The workstation distinguishes:

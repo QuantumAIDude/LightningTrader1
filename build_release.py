@@ -38,12 +38,32 @@ def _build_env() -> dict:
     return env
 
 
-def _zip_macos_app(dist_dir: Path) -> str | None:
-    app_dir = dist_dir / f"{APP_DISPLAY_NAME}.app"
-    if not app_dir.exists():
+def release_platform_label(platform_name: str | None = None) -> str:
+    name = str(platform_name or sys.platform).lower()
+    if name.startswith("darwin"):
+        return "macOS"
+    if name.startswith("win"):
+        return "Windows"
+    return name.capitalize() or "Unknown"
+
+
+def release_bundle_name(platform_name: str | None = None) -> str:
+    if release_platform_label(platform_name) == "macOS":
+        return f"{APP_DISPLAY_NAME}.app"
+    return APP_DISPLAY_NAME
+
+
+def release_archive_name(platform_name: str | None = None) -> str:
+    return f"{APP_DISPLAY_NAME}-{release_platform_label(platform_name)}-v{APP_VERSION}.zip"
+
+
+def create_release_archive(dist_dir: Path, platform_name: str | None = None) -> str | None:
+    bundle_name = release_bundle_name(platform_name)
+    bundle_path = dist_dir / bundle_name
+    if not bundle_path.exists():
         return None
-    archive_base = dist_dir / f"{APP_DISPLAY_NAME}-macOS-v{APP_VERSION}"
-    zip_path = Path(shutil.make_archive(str(archive_base), "zip", root_dir=dist_dir, base_dir=app_dir.name))
+    archive_base = dist_dir / release_archive_name(platform_name).removesuffix(".zip")
+    zip_path = Path(shutil.make_archive(str(archive_base), "zip", root_dir=dist_dir, base_dir=bundle_name))
     return str(zip_path)
 
 
@@ -78,7 +98,7 @@ def run(argv: list[str] | None = None) -> int:
     completed = subprocess.run(cmd, cwd=PROJECT_ROOT, env=_build_env())
     if completed.returncode != 0:
         return int(completed.returncode)
-    zip_path = _zip_macos_app(PROJECT_ROOT / "dist")
+    zip_path = create_release_archive(PROJECT_ROOT / "dist")
     if zip_path:
         print(f"Created release archive: {zip_path}")
     return 0

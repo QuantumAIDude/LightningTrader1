@@ -66,10 +66,11 @@ coll = COLLECT(
     name=APP_DISPLAY_NAME,
 )
 
-app = BUNDLE(
-    coll,
-    name=f"{APP_DISPLAY_NAME}.app",
-    icon=str(icon_path) if icon_path and str(icon_path).endswith(".icns") else None,
-    bundle_identifier="com.lightningtrader.terminal",
-    version=APP_VERSION,
-)
+if sys.platform.startswith("darwin"):
+    app = BUNDLE(
+        coll,
+        name=f"{APP_DISPLAY_NAME}.app",
+        icon=str(icon_path) if icon_path and str(icon_path).endswith(".icns") else None,
+        bundle_identifier="com.lightningtrader.terminal",
+        version=APP_VERSION,
+    )

@@ -1,0 +1,85 @@
+name: Release Windows App
+
+"on":
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to upload the Windows asset to
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      LT4000_GITHUB_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install runtime and build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Resolve release metadata
+        id: release_meta
+        shell: pwsh
+        env:
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $tag = if ($env:INPUT_RELEASE_TAG) { $env:INPUT_RELEASE_TAG } else { $env:EVENT_RELEASE_TAG }
+          if (-not $tag) {
+            throw "A release tag is required."
+          }
+          if ($tag.StartsWith("refs/tags/")) {
+            $tag = $tag.Substring(10)
+          }
+          $version = python -c "from app_meta import APP_VERSION; print(APP_VERSION)"
+          if (-not $version) {
+            throw "Could not read APP_VERSION."
+          }
+          $version = $version.Trim()
+          if ($tag.TrimStart("v", "V") -ne $version) {
+            throw "Release tag '$tag' does not match APP_VERSION '$version'."
+          }
+          $artifact = "dist/Lightning Trader Terminal-Windows-v$version.zip"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "artifact=$artifact" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build Windows release artifact
+        shell: pwsh
+        run: |
+          python build_release.py --clean
+
+      - name: Confirm artifact exists
+        shell: pwsh
+        env:
+          EXPECTED_ARTIFACT: ${{ steps.release_meta.outputs.artifact }}
+        run: |
+          if (-not (Test-Path $env:EXPECTED_ARTIFACT)) {
+            throw "Expected Windows release artifact not found: $env:EXPECTED_ARTIFACT"
+          }
+
+      - name: Upload Windows asset to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          files: ${{ steps.release_meta.outputs.artifact }}
+          fail_on_unmatched_files: true
+          overwrite_files: true

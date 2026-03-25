@@ -38,6 +38,12 @@ Helper wrapper:
 ./scripts/build_macos.sh
 ```
 
+Manual Windows build on a Windows machine:
+
+```powershell
+./scripts/build_windows.ps1
+```
+
 ## Packaging Notes
 
 - PyInstaller entrypoint: [desktop_app.py](/Users/quinnesser/IdeaProjects/LightningTrader4000/desktop_app.py)
@@ -57,8 +63,9 @@ Successful build outputs land in `dist/`:
 
 - `Lightning Trader Terminal.app`
 - `Lightning Trader Terminal-macOS-v<APP_VERSION>.zip`
+- `Lightning Trader Terminal-Windows-v<APP_VERSION>.zip`
 
-The zip is the intended GitHub Releases upload artifact for the current macOS flow.
+The zip files are the intended GitHub Releases upload artifacts.
 
 ## Branding Assets
 
@@ -81,6 +88,25 @@ If generation fails on a release machine, check:
 3. `icon.png` still exists and is readable
 
 The app window uses `icon.png` directly in source mode and packaged runtime mode, with a graceful fallback to the placeholder PPM only if `icon.png` is missing.
+
+## Automated Windows Release Build
+
+GitHub Actions now builds the Windows artifact on a Windows runner and uploads it to the matching GitHub Release:
+
+- workflow: `.github/workflows/release-windows.yml`
+- trigger: `release.published`
+- optional manual rerun: `workflow_dispatch`
+- upload target: the same GitHub Release tag that matches `APP_VERSION`
+
+The workflow does the following:
+
+1. checks out the repository on `windows-latest`
+2. installs runtime and PyInstaller build dependencies
+3. confirms the release tag matches `APP_VERSION`
+4. runs `python build_release.py --clean`
+5. uploads `dist/Lightning Trader Terminal-Windows-v<APP_VERSION>.zip` to the GitHub Release
+
+This is the supported way to produce the Windows asset. PyInstaller does not cross-compile Windows executables from macOS.
 
 ## GitHub Releases Update Checks
 
