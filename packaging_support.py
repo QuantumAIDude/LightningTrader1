@@ -35,13 +35,20 @@ def collect_data_seed_files(root: Path | None = None) -> list[Path]:
         "prices_",
         "context_",
         "news_",
+        "macro_calendar",
+        "market_breadth_",
         "event_snapshot_",
         "options_snapshot_",
+        "options_snapshot_history_",
         "readiness_state_",
         "walk_forward_cache_",
         "horizon_overlay_",
         "horizon_accuracy_",
         "calibration_live_",
+        "sec_events_",
+        "analyst_actions_",
+        "social_sentiment_",
+        "sec_company_tickers_cache",
     )
     allowed = []
     for path in sorted(data_dir.rglob("*")):

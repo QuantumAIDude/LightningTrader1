@@ -140,7 +140,7 @@ def get_update_status(force: bool = False) -> dict:
             "release_url": GITHUB_RELEASES_URL,
             "checked_at": _utc_now(),
             "source_kind": "unavailable",
-            "message": "Update check could not reach GitHub right now.",
+            "message": "Update check could not reach GitHub right now. You can still open the Releases page manually.",
             "repo": GITHUB_RELEASES_REPO,
         }
     except Exception as exc:

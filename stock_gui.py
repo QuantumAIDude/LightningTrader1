@@ -129,8 +129,8 @@ class LightningGUI:
     def __init__(self, root):
         self.root = root
         self.root.title(app_title())
-        self.root.geometry("1540x980")
-        self.root.minsize(1320, 860)
+        self.root.geometry("1660x1020")
+        self.root.minsize(1420, 900)
         self.root.configure(bg="#081018")
         self._window_icon = None
         self._settings_window = None
@@ -161,6 +161,9 @@ class LightningGUI:
         self._pred_started_at = None
         self._pred_timeout_sec = 30.0
         self._pred_seq = 0
+        self._pending_prediction_request = False
+        self._pending_prediction_reason = None
+        self._prediction_payload_cache = {}
         self._acc_lock = threading.Lock()
         self._acc_in_flight = False
         self._dashboard_cache = {}
@@ -171,6 +174,11 @@ class LightningGUI:
         self._latest_price = None
         self._alpaca_setup_window = None
         self._alpaca_setup_prompted = False
+        self._card_labels = []
+        self._right_item_width = 138
+        self._right_value_width = 118
+        self._right_detail_width = 250
+        self._right_news_width = 360
 
         self.executor = ThreadPoolExecutor(max_workers=2)
         self._overview_last_refresh = 0.0
@@ -359,9 +367,9 @@ class LightningGUI:
         self.main_pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg="#081018", sashwidth=8, relief=tk.FLAT, bd=0)
         self.main_pane.pack(fill="both", expand=True, padx=12, pady=(0, 10))
         self.left_panel = tk.Frame(self.main_pane, bg="#081018")
-        self.right_panel = tk.Frame(self.main_pane, bg="#081018", width=430)
+        self.right_panel = tk.Frame(self.main_pane, bg="#081018", width=560)
         self.main_pane.add(self.left_panel, stretch="always")
-        self.main_pane.add(self.right_panel, minsize=380)
+        self.main_pane.add(self.right_panel, minsize=500)
 
         self.right_canvas = tk.Canvas(self.right_panel, bg="#081018", highlightthickness=0, bd=0)
         self.right_scrollbar = ttk.Scrollbar(self.right_panel, orient="vertical", command=self.right_canvas.yview)
@@ -376,7 +384,7 @@ class LightningGUI:
         )
         self.right_canvas.bind(
             "<Configure>",
-            lambda e: self.right_canvas.itemconfigure(self._right_body_window, width=e.width),
+            lambda e: (self.right_canvas.itemconfigure(self._right_body_window, width=e.width), self._refresh_card_wraplengths(e.width)),
         )
 
         # Treeview for 4min outputs
@@ -441,7 +449,9 @@ class LightningGUI:
         self.vol_card_var = tk.StringVar(value="Volatility: loading…")
         self.vol_detail_var = tk.StringVar(value="-")
         self.options_card_var = tk.StringVar(value="Options: loading…")
+        self.options_detail_var = tk.StringVar(value="-")
         self.news_card_var = tk.StringVar(value="News: loading…")
+        self.news_detail_var = tk.StringVar(value="-")
         self.profile_card_var = tk.StringVar(value="Profile: loading…")
         self.profile_detail_var = tk.StringVar(value="-")
         self.broker_card_var = tk.StringVar(value="Broker: loading…")
@@ -453,9 +463,13 @@ class LightningGUI:
             frame = tk.Frame(parent, bg="#0f1724", highlightbackground="#1f2a44", highlightthickness=1, bd=0)
             frame.pack(fill="x", pady=4)
             tk.Label(frame, text=title, font=self.small_font, fg=accent, bg="#0f1724").pack(anchor="w", padx=10, pady=(8, 0))
-            tk.Label(frame, textvariable=main_var, font=self.big_font, fg="#f8fafc", bg="#0f1724", wraplength=360, justify="left").pack(anchor="w", padx=10, pady=(2, 0))
+            main_label = tk.Label(frame, textvariable=main_var, font=self.big_font, fg="#f8fafc", bg="#0f1724", wraplength=500, justify="left")
+            main_label.pack(anchor="w", padx=10, pady=(2, 0))
+            self._card_labels.append(main_label)
             if detail_var is not None:
-                tk.Label(frame, textvariable=detail_var, font=self.small_font, fg="#cbd5e1", bg="#0f1724", wraplength=360, justify="left").pack(anchor="w", padx=10, pady=(2, 8))
+                detail_label = tk.Label(frame, textvariable=detail_var, font=self.small_font, fg="#cbd5e1", bg="#0f1724", wraplength=500, justify="left")
+                detail_label.pack(anchor="w", padx=10, pady=(2, 8))
+                self._card_labels.append(detail_label)
             else:
                 tk.Label(frame, text="", font=self.small_font, bg="#0f1724").pack(anchor="w", padx=10, pady=(0, 8))
 
@@ -463,8 +477,8 @@ class LightningGUI:
         _make_card(self.cards_frame, "Action", self.action_card_var, self.action_detail_var, accent="#fbbf24")
         _make_card(self.cards_frame, "Signal Quality", self.quality_card_var, self.quality_detail_var, accent="#c084fc")
         _make_card(self.cards_frame, "Volatility", self.vol_card_var, self.vol_detail_var, accent="#fbbf24")
-        _make_card(self.cards_frame, "Options", self.options_card_var, None, accent="#c084fc")
-        _make_card(self.cards_frame, "News", self.news_card_var, None, accent="#7dd3fc")
+        _make_card(self.cards_frame, "Options", self.options_card_var, self.options_detail_var, accent="#c084fc")
+        _make_card(self.cards_frame, "News", self.news_card_var, self.news_detail_var, accent="#7dd3fc")
         _make_card(self.cards_frame, "Trader Profile", self.profile_card_var, self.profile_detail_var, accent="#f5d0fe")
         _make_card(self.cards_frame, "Broker / Forward Test", self.broker_card_var, self.broker_detail_var, accent="#fdba74")
         _make_card(self.cards_frame, "Replay / Simulation", self.replay_card_var, self.replay_detail_var, accent="#67e8f9")
@@ -472,7 +486,7 @@ class LightningGUI:
         self.market_label = tk.Label(self.right_body, text="Market Context", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.market_label.pack(anchor="w", pady=(2, 2))
         self.market_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 120), ("value", 90), ("detail", 170)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width)):
             self.market_tree.heading(col, text=col.title())
             self.market_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.market_tree.pack(fill="x", pady=(0, 8))
@@ -480,7 +494,7 @@ class LightningGUI:
         self.signal_label = tk.Label(self.right_body, text="Signal Context", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.signal_label.pack(anchor="w", pady=(2, 2))
         self.signal_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=6)
-        for col, width in (("item", 120), ("value", 100), ("detail", 160)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width)):
             self.signal_tree.heading(col, text=col.title())
             self.signal_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.signal_tree.pack(fill="x", pady=(0, 8))
@@ -488,7 +502,7 @@ class LightningGUI:
         self.breadth_label = tk.Label(self.right_body, text="Breadth / Internals", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.breadth_label.pack(anchor="w", pady=(2, 2))
         self.breadth_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 120), ("value", 100), ("detail", 170)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width)):
             self.breadth_tree.heading(col, text=col.title())
             self.breadth_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.breadth_tree.pack(fill="x", pady=(0, 8))
@@ -496,7 +510,7 @@ class LightningGUI:
         self.macro_label = tk.Label(self.right_body, text="Macro / Event Risk", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.macro_label.pack(anchor="w", pady=(2, 2))
         self.macro_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 120), ("value", 110), ("detail", 160)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width)):
             self.macro_tree.heading(col, text=col.title())
             self.macro_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.macro_tree.pack(fill="x", pady=(0, 8))
@@ -504,7 +518,7 @@ class LightningGUI:
         self.stack_label = tk.Label(self.right_body, text="Advisory Stack", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.stack_label.pack(anchor="w", pady=(2, 2))
         self.stack_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=6)
-        for col, width in (("item", 120), ("value", 100), ("detail", 160)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width)):
             self.stack_tree.heading(col, text=col.title())
             self.stack_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.stack_tree.pack(fill="x", pady=(0, 8))
@@ -512,7 +526,7 @@ class LightningGUI:
         self.probability_label = tk.Label(self.right_body, text="Probability Map", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.probability_label.pack(anchor="w", pady=(2, 2))
         self.probability_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=6)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.probability_tree.heading(col, text=col.title())
             self.probability_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.probability_tree.pack(fill="x", pady=(0, 8))
@@ -520,7 +534,7 @@ class LightningGUI:
         self.quality_label = tk.Label(self.right_body, text="Signal Quality", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.quality_label.pack(anchor="w", pady=(2, 2))
         self.quality_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=6)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.quality_tree.heading(col, text=col.title())
             self.quality_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.quality_tree.pack(fill="x", pady=(0, 8))
@@ -528,7 +542,7 @@ class LightningGUI:
         self.liquidity_label = tk.Label(self.right_body, text="Liquidity / Execution", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.liquidity_label.pack(anchor="w", pady=(2, 2))
         self.liquidity_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=6)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.liquidity_tree.heading(col, text=col.title())
             self.liquidity_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.liquidity_tree.pack(fill="x", pady=(0, 8))
@@ -536,7 +550,7 @@ class LightningGUI:
         self.catalyst_label = tk.Label(self.right_body, text="Catalyst Context", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.catalyst_label.pack(anchor="w", pady=(2, 2))
         self.catalyst_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.catalyst_tree.heading(col, text=col.title())
             self.catalyst_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.catalyst_tree.pack(fill="x", pady=(0, 8))
@@ -544,7 +558,7 @@ class LightningGUI:
         self.alerts_label = tk.Label(self.right_body, text="Trader Alerts", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.alerts_label.pack(anchor="w", pady=(2, 2))
         self.alerts_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 125), ("value", 95), ("detail", 200)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.alerts_tree.heading(col, text=col.title())
             self.alerts_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.alerts_tree.pack(fill="x", pady=(0, 8))
@@ -552,7 +566,7 @@ class LightningGUI:
         self.execution_label = tk.Label(self.right_body, text="Execution", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.execution_label.pack(anchor="w", pady=(2, 2))
         self.execution_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.execution_tree.heading(col, text=col.title())
             self.execution_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.execution_tree.pack(fill="x", pady=(0, 8))
@@ -560,7 +574,7 @@ class LightningGUI:
         self.replay_label = tk.Label(self.right_body, text="Replay State", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.replay_label.pack(anchor="w", pady=(2, 2))
         self.replay_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.replay_tree.heading(col, text=col.title())
             self.replay_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.replay_tree.pack(fill="x", pady=(0, 8))
@@ -568,7 +582,7 @@ class LightningGUI:
         self.portfolio_label = tk.Label(self.right_body, text="Portfolio", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.portfolio_label.pack(anchor="w", pady=(2, 2))
         self.portfolio_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=4)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.portfolio_tree.heading(col, text=col.title())
             self.portfolio_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.portfolio_tree.pack(fill="x", pady=(0, 8))
@@ -576,7 +590,7 @@ class LightningGUI:
         self.performance_label = tk.Label(self.right_body, text="Paper Performance", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.performance_label.pack(anchor="w", pady=(2, 2))
         self.performance_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=6)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.performance_tree.heading(col, text=col.title())
             self.performance_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.performance_tree.pack(fill="x", pady=(0, 8))
@@ -584,7 +598,7 @@ class LightningGUI:
         self.opportunity_label = tk.Label(self.right_body, text="Opportunity Scan", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.opportunity_label.pack(anchor="w", pady=(2, 2))
         self.opportunity_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 125), ("value", 95), ("detail", 200)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.opportunity_tree.heading(col, text=col.title())
             self.opportunity_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.opportunity_tree.pack(fill="x", pady=(0, 8))
@@ -592,7 +606,7 @@ class LightningGUI:
         self.setups_label = tk.Label(self.right_body, text="Trade Plan", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.setups_label.pack(anchor="w", pady=(2, 2))
         self.setup_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.setup_tree.heading(col, text=col.title())
             self.setup_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.setup_tree.pack(fill="x", pady=(0, 8))
@@ -600,7 +614,7 @@ class LightningGUI:
         self.scenario_label = tk.Label(self.right_body, text="Scenario Map", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.scenario_label.pack(anchor="w", pady=(2, 2))
         self.scenario_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=4)
-        for col, width in (("item", 125), ("value", 140), ("detail", 160)):
+        for col, width in (("item", self._right_item_width), ("value", 148), ("detail", self._right_detail_width)):
             self.scenario_tree.heading(col, text=col.title())
             self.scenario_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.scenario_tree.pack(fill="x", pady=(0, 8))
@@ -608,7 +622,7 @@ class LightningGUI:
         self.invalidate_label = tk.Label(self.right_body, text="Invalidation / No-Trade", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.invalidate_label.pack(anchor="w", pady=(2, 2))
         self.invalidate_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.invalidate_tree.heading(col, text=col.title())
             self.invalidate_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.invalidate_tree.pack(fill="x", pady=(0, 8))
@@ -616,7 +630,7 @@ class LightningGUI:
         self.reliability_label = tk.Label(self.right_body, text="Historical Reliability", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.reliability_label.pack(anchor="w", pady=(2, 2))
         self.reliability_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=6)
-        for col, width in (("item", 125), ("value", 105), ("detail", 190)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width + 20)):
             self.reliability_tree.heading(col, text=col.title())
             self.reliability_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.reliability_tree.pack(fill="x", pady=(0, 8))
@@ -624,7 +638,7 @@ class LightningGUI:
         self.levels_label = tk.Label(self.right_body, text="Key Levels", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.levels_label.pack(anchor="w", pady=(2, 2))
         self.levels_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=8)
-        for col, width in (("item", 120), ("value", 110), ("detail", 150)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width)):
             self.levels_tree.heading(col, text=col.title())
             self.levels_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.levels_tree.pack(fill="x", pady=(0, 8))
@@ -632,7 +646,7 @@ class LightningGUI:
         self.options_label = tk.Label(self.right_body, text="Options Positioning", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.options_label.pack(anchor="w", pady=(2, 2))
         self.options_tree = ttk.Treeview(self.right_body, columns=("item", "value", "detail"), show="headings", height=5)
-        for col, width in (("item", 120), ("value", 110), ("detail", 150)):
+        for col, width in (("item", self._right_item_width), ("value", self._right_value_width), ("detail", self._right_detail_width)):
             self.options_tree.heading(col, text=col.title())
             self.options_tree.column(col, anchor=tk.CENTER if col != "detail" else tk.W, width=width)
         self.options_tree.pack(fill="x", pady=(0, 8))
@@ -640,7 +654,7 @@ class LightningGUI:
         self.news_label = tk.Label(self.right_body, text="Recent Catalysts", font=self.big_font, fg="#e2e8f0", bg="#081018")
         self.news_label.pack(anchor="w", pady=(2, 2))
         self.news_tree = ttk.Treeview(self.right_body, columns=("age", "tone", "headline"), show="headings", height=7)
-        for col, width in (("age", 60), ("tone", 80), ("headline", 270)):
+        for col, width in (("age", 64), ("tone", 90), ("headline", self._right_news_width)):
             self.news_tree.heading(col, text=col.title())
             self.news_tree.column(col, anchor=tk.CENTER if col != "headline" else tk.W, width=width)
         self.news_tree.pack(fill="both", expand=False, pady=(0, 4))
@@ -685,11 +699,45 @@ class LightningGUI:
             pass
         return df
 
+    def _prediction_payload_cache_key(self, mode: str, selected: str, df_copy, replay_snapshot: dict | None = None):
+        last_bar_key = "-"
+        try:
+            if df_copy is not None and not getattr(df_copy, "empty", True):
+                last_bar = pd.to_datetime(df_copy.index[-1], utc=True, errors="coerce")
+                if pd.notna(last_bar):
+                    last_bar_key = str(last_bar.isoformat())
+        except Exception:
+            pass
+        replay_marker = "live"
+        if isinstance(replay_snapshot, dict) and replay_snapshot.get("active"):
+            replay_marker = "|".join(
+                [
+                    "replay",
+                    str(replay_snapshot.get("status") or "-"),
+                    str(replay_snapshot.get("cursor") or replay_snapshot.get("current_index") or "-"),
+                    str(bool(replay_snapshot.get("completed"))),
+                ]
+            )
+        return (
+            str(selected or "").upper(),
+            str(mode or ""),
+            last_bar_key,
+            replay_marker,
+            str(self.profile_var.get() or ""),
+        )
+
     def mode_apply(self):
-        self.status(f"Mode set to {self.mode_var.get()}; refreshing predictions...")
+        mode = self.mode_var.get()
+        self.status(f"Switching to {mode} view…")
         self._show_mode_ui()
-        # immediate refresh without reloading data/models (fast switch)
-        self.run_prediction_and_refresh_ui()
+        df_copy, _, selected, replay_snapshot = self._current_prediction_inputs()
+        cache_key = self._prediction_payload_cache_key(mode, selected, df_copy, replay_snapshot)
+        cached = self._prediction_payload_cache.get(cache_key)
+        if isinstance(cached, dict):
+            cached_payload = dict(cached)
+            cached_payload["status_messages"] = list(cached_payload.get("status_messages") or []) + [f"Showing cached {mode} view while refreshing…"]
+            self._apply_prediction_payload(cached_payload)
+        self.run_prediction_and_refresh_ui(reason=f"Switching to {mode} view…")
 
     def _show_mode_ui(self):
         mode = self.mode_var.get()
@@ -724,14 +772,16 @@ class LightningGUI:
     def _on_instrument_change(self, event=None):
         self.status(f"Instrument changed to {self.instrument_var.get()}; reloading…")
         self._dashboard_cache.pop(str(self.instrument_var.get() or "").upper(), None)
+        self._prediction_payload_cache.clear()
         self.reload_once_threaded()
 
     def _on_profile_change(self, event=None):
         profile = get_trader_profile(self.profile_var.get())
         self._dashboard_cache.clear()
+        self._prediction_payload_cache.clear()
         self.profile_summary_var.set(f"Profile: {profile.get('label', 'Balanced')}")
         self.status(f"Trader style set to {profile.get('label', 'Balanced')}; refreshing advisory context…")
-        self.run_prediction_and_refresh_ui()
+        self.run_prediction_and_refresh_ui(reason="Refreshing advisory context…")
 
     def _current_replay_snapshot(self):
         try:
@@ -1319,11 +1369,31 @@ class LightningGUI:
 
     def status(self, text):
         ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        def _apply():
+            try:
+                self.status_label.config(text=f"Status: {text} — {ts} UTC")
+            except Exception:
+                pass
         try:
-            self.status_label.config(text=f"Status: {text} — {ts} UTC")
+            if threading.current_thread() is threading.main_thread():
+                _apply()
+            else:
+                self.root.after(0, _apply)
         except Exception:
             pass
         logger.info(text)
+
+    def _refresh_card_wraplengths(self, width: int | None = None):
+        try:
+            base_width = int(width or self.right_canvas.winfo_width() or 0)
+        except Exception:
+            base_width = 0
+        wrap = max(360, base_width - 70)
+        for widget in list(getattr(self, "_card_labels", [])):
+            try:
+                widget.configure(wraplength=wrap)
+            except Exception:
+                pass
 
     def _apply_window_icon(self):
         try:
@@ -1732,7 +1802,7 @@ class LightningGUI:
 
     def _train_and_reload(self, selected):
         try:
-            self.status("Background training started...")
+            self.status("Training models and refreshing live support data…")
             df = update_price_data(selected)
             if df is None or getattr(df, "empty", True):
                 self.status("No data available for training")
@@ -1750,10 +1820,10 @@ class LightningGUI:
                 self.models = models
                 self.df = self._trim_df_for_ui(df2)
             self._dashboard_cache.pop(str(selected or "").upper(), None)
-            self.root.after(0, self.run_prediction_and_refresh_ui)
+            self.root.after(0, lambda: self.run_prediction_and_refresh_ui(reason="Refreshing dashboard after training…"))
             self.root.after(0, self.refresh_overview_threaded)
             self.root.after(0, self.refresh_accuracy_summary_threaded)
-            self.status("Background training complete")
+            self.status("Training complete — refreshing dashboard…")
         except Exception:
             logger.exception("Background training failed")
             self.status("Background training failed; see logs")
@@ -1763,7 +1833,7 @@ class LightningGUI:
     def reload_once_threaded(self):
         def _job():
             try:
-                self.status("Reloading data and models…")
+                self.status("Reloading prices, news, options, and models…")
                 selected = self.instrument_var.get()
                 models = load_models(instrument_key=selected)
                 df = update_price_data(selected)
@@ -1774,10 +1844,10 @@ class LightningGUI:
                     self.models = models
                     self.df = self._trim_df_for_ui(df)
                 self._dashboard_cache.pop(str(selected or "").upper(), None)
-                self.root.after(0, self.run_prediction_and_refresh_ui)
+                self.root.after(0, lambda: self.run_prediction_and_refresh_ui(reason="Refreshing dashboard after reload…"))
                 self.root.after(0, self.refresh_overview_threaded)
                 self.root.after(0, self.refresh_accuracy_summary_threaded)
-                self.status("Reload complete")
+                self.status("Reload complete — dashboard refreshed")
             except Exception:
                 logger.exception("Reload failed")
                 self.status("Reload failed; see logs")
@@ -1787,7 +1857,7 @@ class LightningGUI:
         def _tr():
             try:
                 self._retrain_in_progress = True
-                self.status("Retraining models…")
+                self.status("Retraining models with current local data…")
                 selected = self.instrument_var.get()
                 df = update_price_data(selected)
                 train_all_models(
@@ -1802,10 +1872,10 @@ class LightningGUI:
                 with self._lock:
                     self.models = models
                     self.df = self._trim_df_for_ui(df2)
-                self.root.after(0, self.run_prediction_and_refresh_ui)
+                self.root.after(0, lambda: self.run_prediction_and_refresh_ui(reason="Refreshing dashboard after retrain…"))
                 self.root.after(0, self.refresh_overview_threaded)
                 self.root.after(0, self.refresh_accuracy_summary_threaded)
-                self.status("Retrain complete")
+                self.status("Retrain complete — refreshing dashboard…")
             except Exception:
                 logger.exception("Retrain failed")
                 self.status("Retrain failed; see logs")
@@ -1856,7 +1926,9 @@ class LightningGUI:
             "vol_card": "Volatility: unavailable",
             "vol_detail": "-",
             "options_card": "Options: unavailable",
+            "options_detail": "-",
             "news_card": "News: unavailable",
+            "news_detail": "-",
             "profile_card": "Profile: unavailable",
             "profile_detail": "-",
             "broker_card": "Broker: unavailable",
@@ -1867,11 +1939,49 @@ class LightningGUI:
             "advisory_meta": {},
             "execution_meta": {},
             "replay_meta": {},
+            "section_errors": {},
             "status_messages": []
         }
 
+    def _populate_panel_placeholders(self, payload: dict, reason: str):
+        detail = str(reason or "Loading…").strip() or "Loading…"
+        generic = ("Status", "-", detail)
+        payload["market_rows"] = [generic]
+        payload["breadth_rows"] = [generic]
+        payload["macro_rows"] = [generic]
+        payload["signal_rows"] = [generic]
+        payload["stack_rows"] = [generic]
+        payload["probability_rows"] = [generic]
+        payload["quality_rows"] = [generic]
+        payload["liquidity_rows"] = [generic]
+        payload["catalyst_rows"] = [generic]
+        payload["alerts_rows"] = [generic]
+        payload["execution_rows"] = [generic]
+        payload["replay_rows"] = [generic]
+        payload["portfolio_rows"] = [generic]
+        payload["performance_rows"] = [generic]
+        payload["opportunity_rows"] = [generic]
+        payload["setup_rows"] = [generic]
+        payload["scenario_rows"] = [generic]
+        payload["invalidation_rows"] = [generic]
+        payload["reliability_rows"] = [generic]
+        payload["levels_rows"] = [generic]
+        payload["options_rows"] = [generic]
+        payload["news_rows"] = [("-", "info", detail)]
+        payload["setup_detail"] = detail
+        payload["action_detail"] = detail
+        payload["quality_detail"] = detail
+        payload["vol_detail"] = detail
+        payload["options_detail"] = detail
+        payload["news_detail"] = detail
+
     def _build_waiting_payload(self, mode: str, msg: str, status: str | None = None) -> dict:
         payload = self._base_payload(mode)
+        self._populate_panel_placeholders(payload, msg)
+        payload["quality_card"] = "Quality: loading…"
+        payload["vol_card"] = "Volatility: loading…"
+        payload["options_card"] = "Options: loading…"
+        payload["news_card"] = "News: loading…"
         if mode == "4min":
             for m in ["Base", "Forest", "Boost", "Extra Trees"]:
                 payload["tree_4min"].append(((m, "-", "-", "-", msg), None))
@@ -1886,6 +1996,14 @@ class LightningGUI:
 
     def _build_error_payload(self, mode: str, err: str) -> dict:
         payload = self._build_waiting_payload(mode, "Prediction error")
+        payload["quality_card"] = "Quality: error"
+        payload["vol_card"] = "Volatility: error"
+        payload["options_card"] = "Options: error"
+        payload["news_card"] = "News: error"
+        payload["quality_detail"] = err
+        payload["vol_detail"] = err
+        payload["options_detail"] = err
+        payload["news_detail"] = err
         payload["status_messages"].append("Prediction error — fallback displayed")
         payload["status_messages"].append(f"Prediction error: {err}")
         return payload
@@ -2016,7 +2134,9 @@ class LightningGUI:
         self.vol_card_var.set(payload.get("vol_card", "Volatility: unavailable"))
         self.vol_detail_var.set(payload.get("vol_detail", "-"))
         self.options_card_var.set(payload.get("options_card", "Options: unavailable"))
+        self.options_detail_var.set(payload.get("options_detail", "-"))
         self.news_card_var.set(payload.get("news_card", "News: unavailable"))
+        self.news_detail_var.set(payload.get("news_detail", "-"))
         self.profile_card_var.set(payload.get("profile_card", "Profile: unavailable"))
         self.profile_detail_var.set(payload.get("profile_detail", "-"))
         self.broker_card_var.set(payload.get("broker_card", "Broker: unavailable"))
@@ -2248,6 +2368,7 @@ class LightningGUI:
         payload["regime_text"] = f"Market Regime: {' / '.join(parts)}"
 
         dashboard = None
+        dashboard_error = None
         try:
             last_bar_key = None
             try:
@@ -2296,6 +2417,7 @@ class LightningGUI:
                 }
         except Exception:
             logger.exception("Dashboard analytics build failed")
+            dashboard_error = "Dashboard analytics failed; showing available data only"
             dashboard = None
         try:
             if isinstance(dashboard, dict):
@@ -2341,22 +2463,42 @@ class LightningGUI:
                 payload["advisory_meta"] = dashboard.get("advisory_meta", {})
                 payload["execution_meta"] = dashboard.get("execution_meta", {})
                 payload["replay_meta"] = dashboard.get("replay_meta", {})
+                payload["section_errors"] = dashboard.get("section_errors", {})
+                payload["options_detail"] = dashboard.get("options_detail", payload.get("options_detail", "-"))
+                payload["news_detail"] = dashboard.get("news_detail", payload.get("news_detail", "-"))
+            else:
+                self._populate_panel_placeholders(payload, dashboard_error or "Dashboard context is still loading")
+                payload["quality_card"] = "Quality: unavailable"
+                payload["vol_card"] = "Volatility: unavailable"
+                payload["options_card"] = "Options: unavailable"
+                payload["news_card"] = "News: unavailable"
+                if dashboard_error:
+                    payload["status_messages"].append(dashboard_error)
         except Exception:
             logger.exception("Dashboard analytics build failed")
+            self._populate_panel_placeholders(payload, "Dashboard context is still loading")
+            payload["status_messages"].append("Dashboard analytics failed; fallback displayed")
         payload["status_messages"].append("Predicted")
         return payload
 
-    def run_prediction_and_refresh_ui(self):
+    def run_prediction_and_refresh_ui(self, reason: str | None = None):
         mode = self.mode_var.get()
         df_copy, models_copy, selected, replay_snapshot = self._current_prediction_inputs()
+        if reason:
+            self.status(reason)
 
         if df_copy is None or getattr(df_copy, "empty", True) or not models_copy:
             payload = self._build_waiting_payload(mode, "Waiting…")
             self.root.after(0, lambda: self._apply_prediction_payload(payload))
             return
 
+        cache_key = self._prediction_payload_cache_key(mode, selected, df_copy, replay_snapshot)
+
         with self._pred_lock:
             if self._pred_in_flight:
+                self._pending_prediction_request = True
+                if reason:
+                    self._pending_prediction_reason = reason
                 if self._pred_started_at is not None:
                     try:
                         if (time.time() - self._pred_started_at) > self._pred_timeout_sec:
@@ -2372,6 +2514,8 @@ class LightningGUI:
             seq = self._pred_seq
 
         def _job():
+            pending = False
+            pending_reason = None
             try:
                 payload = self._compute_prediction_payload(df_copy, models_copy, mode, selected, replay_snapshot=replay_snapshot)
             except Exception as e:
@@ -2381,12 +2525,19 @@ class LightningGUI:
                 with self._pred_lock:
                     self._pred_in_flight = False
                     self._pred_started_at = None
+                    pending = bool(self._pending_prediction_request)
+                    pending_reason = self._pending_prediction_reason
+                    self._pending_prediction_request = False
+                    self._pending_prediction_reason = None
+            self._prediction_payload_cache[cache_key] = dict(payload)
             try:
                 def _apply_if_latest():
                     with self._pred_lock:
                         if seq != self._pred_seq:
                             return
                     self._apply_prediction_payload(payload)
+                    if pending:
+                        self.run_prediction_and_refresh_ui(reason=pending_reason or "Refreshing latest view…")
                 self.root.after(0, _apply_if_latest)
             except Exception:
                 pass

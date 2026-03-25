@@ -8,16 +8,20 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 
 from credential_store import get_runtime_broker_settings
+from breadth_analytics import get_breadth_snapshot
+from catalyst_providers import get_catalyst_provider_snapshot
 from config import (
     DATA_DIR, SYMBOL, INTERVAL, MAX_HISTORY_DAYS,
     DATA_PROVIDER,
     IB_GATEWAY_HOST, IB_GATEWAY_PORT, IB_CLIENT_ID, INSTRUMENTS,
     YFINANCE_LOOKBACK_DAYS, YFINANCE_REFRESH_BUFFER_DAYS, NEWS_PIPELINE_SYMBOL
 )
+from event_analytics import get_event_snapshot
 from instrument_onboarding import ensure_runtime_instruments
 from market_context import maybe_refresh_context_data
 from macro_events import maybe_refresh_macro_events
 from news_pipeline import maybe_refresh_news
+from options_analytics import get_options_snapshot
 
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
@@ -50,6 +54,87 @@ def _data_file_for_instrument(instr_key: str, source: str | None = None) -> str:
     os.makedirs(DATA_DIR, exist_ok=True)
     suffix = f"_{source}" if source else ""
     return os.path.join(DATA_DIR, f"prices_{safe}{suffix}.csv")
+
+
+def _clean_support_status(value, fallback: str = "unavailable") -> str:
+    text = str(value or fallback).strip() or fallback
+    if "Could not resolve host" in text or "curl:" in text or "DNSError" in text:
+        return "remote_unavailable"
+    return text.replace(" ", "_").lower()
+
+
+def refresh_support_data(instr_key: str = None, current_price: float | None = None, force: bool = False) -> dict:
+    symbol = str(instr_key or SYMBOL or "").upper()
+    results: dict[str, dict] = {"symbol": symbol}
+
+    try:
+        instr_meta = INSTRUMENTS.get(symbol, {})
+    except Exception:
+        instr_meta = {}
+
+    try:
+        if bool(instr_meta.get("news_enabled", True)):
+            news = maybe_refresh_news(symbol=symbol)
+        else:
+            news = {"symbol": symbol, "status": "disabled", "reason": "news_disabled"}
+    except Exception as exc:
+        news = {"symbol": symbol, "status": "error", "reason": str(exc)}
+    results["news"] = {
+        "status": _clean_support_status(news.get("status") or news.get("reason") or ("skipped" if news.get("skipped") else "ok")),
+        "detail": str(news.get("reason") or news.get("status") or news.get("rows") or "-"),
+    }
+
+    try:
+        maybe_refresh_context_data(symbol)
+        results["context"] = {"status": "ok", "detail": "context_refresh_checked"}
+    except Exception as exc:
+        results["context"] = {"status": "error", "detail": str(exc)}
+
+    try:
+        macro = maybe_refresh_macro_events(force=bool(force))
+    except Exception as exc:
+        macro = {"status": "error", "reason": str(exc)}
+    results["macro"] = {
+        "status": _clean_support_status(macro.get("status") or macro.get("reason")),
+        "detail": str(macro.get("provider_note") or macro.get("reason") or "-"),
+    }
+
+    try:
+        event = get_event_snapshot(symbol, max_age_sec=0 if force else None)
+    except Exception as exc:
+        event = {"status": "error", "reason": str(exc)}
+    results["event"] = {
+        "status": _clean_support_status(event.get("status") or event.get("reason")),
+        "detail": str(event.get("source") or event.get("reason") or "-"),
+    }
+
+    try:
+        options = get_options_snapshot(symbol, spot_price=current_price, max_age_sec=0 if force else None)
+    except Exception as exc:
+        options = {"status": "error", "reason": str(exc)}
+    results["options"] = {
+        "status": _clean_support_status(options.get("status") or options.get("reason")),
+        "detail": str(options.get("source") or options.get("source_kind") or options.get("reason") or "-"),
+    }
+
+    try:
+        breadth = get_breadth_snapshot(symbol)
+    except Exception as exc:
+        breadth = {"status": "error", "reason": str(exc)}
+    results["breadth"] = {
+        "status": _clean_support_status(breadth.get("status") or breadth.get("reason") or breadth.get("source_kind")),
+        "detail": str(breadth.get("provider_note") or breadth.get("reason") or breadth.get("kind") or "-"),
+    }
+
+    try:
+        catalyst = get_catalyst_provider_snapshot(symbol)
+    except Exception as exc:
+        catalyst = {"status": "error", "reason": str(exc)}
+    results["catalyst"] = {
+        "status": _clean_support_status(catalyst.get("status") or catalyst.get("reason")),
+        "detail": str(catalyst.get("active_catalyst", {}).get("title") or catalyst.get("status") or catalyst.get("reason") or "-"),
+    }
+    return results
 
 # Attempt to import Alpaca (non-fatal)
 try:
@@ -701,6 +786,14 @@ def update_price_data(instr_key: str = None):
                     df_active.attrs.setdefault("contract_auto_rolled", bool(ib_meta_res.get("_contract_auto_rolled", False)))
         except Exception:
             pass
+
+        try:
+            last_close = None
+            if "close" in df_active.columns and len(df_active):
+                last_close = float(pd.to_numeric(df_active["close"], errors="coerce").iloc[-1])
+            df_active.attrs["support_refresh"] = refresh_support_data(instr_key, current_price=last_close, force=False)
+        except Exception:
+            logger.debug("Support refresh failed", exc_info=True)
 
         # Persist active dataset
         _write_csv(data_file_active, df_active)

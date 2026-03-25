@@ -100,6 +100,19 @@ class StockGuiDashboardSignatureTests(unittest.TestCase):
         self.assertIn("profile_card", payload)
         self.assertIn("broker_card", payload)
         self.assertIn("replay_card", payload)
+        self.assertIn("options_detail", payload)
+        self.assertIn("news_detail", payload)
+
+    def test_waiting_payload_populates_right_side_reasons(self):
+        gui = LightningGUI.__new__(LightningGUI)
+        payload = gui._build_waiting_payload("4min", "Loading support data…", status="Loading support data…")
+
+        self.assertTrue(payload["market_rows"])
+        self.assertTrue(payload["options_rows"])
+        self.assertTrue(payload["news_rows"])
+        self.assertEqual(payload["options_detail"], "Loading support data…")
+        self.assertEqual(payload["news_detail"], "Loading support data…")
+        self.assertIn("Loading support data…", payload["status_messages"])
 
     def test_sync_action_buttons_reflects_route_and_replay_state(self):
         gui = LightningGUI.__new__(LightningGUI)

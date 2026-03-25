@@ -281,6 +281,72 @@ class TraderAnalyticsTests(unittest.TestCase):
             ta.get_alert_snapshot = old_alerts
             ta.get_opportunity_scan = old_scan
 
+    def test_build_trader_dashboard_keeps_reason_rows_when_sections_fail(self):
+        prices = pd.DataFrame(
+            {
+                "open": [100.0, 101.0, 102.0],
+                "high": [101.0, 102.0, 103.0],
+                "low": [99.0, 100.0, 101.0],
+                "close": [100.5, 101.8, 102.6],
+                "volume": [1000.0, 1200.0, 1300.0],
+            },
+            index=pd.date_range("2026-03-19 14:30:00+00:00", periods=3, freq="2h"),
+        )
+        daily_long = pd.DataFrame(
+            {
+                "open": [95.0, 96.0, 97.0, 98.0, 99.0, 100.0],
+                "high": [96.0, 97.0, 98.0, 99.0, 100.0, 103.0],
+                "low": [94.0, 95.0, 96.0, 97.0, 98.0, 99.0],
+                "close": [95.5, 96.5, 97.5, 98.5, 99.5, 102.0],
+                "volume": [1000.0] * 6,
+            },
+            index=pd.date_range("2026-03-10", periods=6, freq="B"),
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("feed exploded")
+
+        old_load_long = ta._load_long_daily_history
+        old_get_options = ta.get_options_snapshot
+        old_load_news = ta.load_recent_headlines
+        old_build_advisory = ta.build_advisory_snapshot
+        old_exec = ta.get_execution_dashboard_snapshot
+        old_perf = ta.get_performance_snapshot
+        old_replay = ta.get_replay_dashboard_snapshot
+        old_alerts = ta.get_alert_snapshot
+        old_scan = ta.get_opportunity_scan
+        try:
+            ta._load_long_daily_history = lambda instrument_key: daily_long.copy()
+            ta.get_options_snapshot = _boom
+            ta.load_recent_headlines = _boom
+            ta.build_advisory_snapshot = _boom
+            ta.get_execution_dashboard_snapshot = _boom
+            ta.get_performance_snapshot = lambda symbol=None: {"summary": "No closed paper trades yet", "rows": []}
+            ta.get_replay_dashboard_snapshot = lambda symbol=None: {"card": "Replay: unavailable", "detail": "No replay session", "rows": []}
+            ta.get_alert_snapshot = lambda *args, **kwargs: {"summary": "No active trader alerts", "rows": []}
+            ta.get_opportunity_scan = lambda *args, **kwargs: {"summary": "No ranked opportunities", "rows": []}
+
+            out = ta.build_trader_dashboard(prices, "QQQ", predictions={})
+
+            self.assertTrue(out["options_rows"])
+            self.assertIn("feed exploded", out["options_rows"][0][2])
+            self.assertTrue(out["news_rows"])
+            self.assertIn("feed exploded", out["news_rows"][0][2])
+            self.assertTrue(out["quality_rows"])
+            self.assertTrue(out["execution_rows"])
+            self.assertIn("feed exploded", out["quality_detail"])
+            self.assertIn("feed exploded", out["execution_rows"][0][2])
+        finally:
+            ta._load_long_daily_history = old_load_long
+            ta.get_options_snapshot = old_get_options
+            ta.load_recent_headlines = old_load_news
+            ta.build_advisory_snapshot = old_build_advisory
+            ta.get_execution_dashboard_snapshot = old_exec
+            ta.get_performance_snapshot = old_perf
+            ta.get_replay_dashboard_snapshot = old_replay
+            ta.get_alert_snapshot = old_alerts
+            ta.get_opportunity_scan = old_scan
+
 
 if __name__ == "__main__":
     unittest.main()

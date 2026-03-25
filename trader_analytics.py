@@ -103,6 +103,29 @@ def _age_text(ts_value) -> str:
         return "-"
 
 
+def _clean_reason_text(value, fallback: str = "Unavailable") -> str:
+    text = str(value or fallback).strip() or fallback
+    if "Could not resolve host" in text or "curl:" in text or "DNSError" in text:
+        return "Remote feed unavailable"
+    if text.lower() in {"none", "nan"}:
+        return fallback
+    if len(text) > 110:
+        return text[:107] + "..."
+    return text
+
+
+def _info_rows(rows: list[tuple[str, str, str]] | None, label: str, reason: str) -> list[tuple[str, str, str]]:
+    if rows:
+        return rows
+    return [(label, "-", _clean_reason_text(reason))]
+
+
+def _news_info_rows(rows: list[tuple[str, str, str]] | None, reason: str) -> list[tuple[str, str, str]]:
+    if rows:
+        return rows
+    return [("-", "info", _clean_reason_text(reason))]
+
+
 def _avg_prediction_price(block: dict, key: str = "pred_price") -> float | None:
     if not isinstance(block, dict):
         return None
@@ -544,7 +567,9 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
             "vol_card": "Volatility: unavailable",
             "vol_detail": "No data",
             "options_card": "Options: unavailable",
+            "options_detail": "No data",
             "news_card": "News: unavailable",
+            "news_detail": "No data",
             "market_rows": [],
             "breadth_rows": [],
             "macro_rows": [],
@@ -586,41 +611,180 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
         }
     price = _safe_float(df["close"].iloc[-1]) if "close" in df.columns else None
     align_head, align_detail = _prediction_alignment(price, predictions or {})
-    levels = _levels_rows(df, instrument_key)
-    market = _market_context_rows(instrument_key)
     symbol = str(instrument_key).upper()
     profile = get_trader_profile(profile_name)
-    breadth_snapshot = get_breadth_snapshot(symbol)
-    macro_snapshot = get_macro_event_snapshot()
-    catalyst_snapshot = get_catalyst_provider_snapshot(symbol)
-    opt_snap, opt_rows, opt_card = _options_rows(symbol, spot_price=price)
-    liquidity_snapshot = get_liquidity_snapshot(df, symbol)
-    event_snapshot = get_event_snapshot(symbol)
-    news_items = load_recent_headlines(symbol, limit=6)
-    news_rows, news_card = _news_rows(symbol, headlines=news_items)
-    signal_rows = _signal_rows(df, instrument_key, options_snapshot=opt_snap)
-    stack_rows = _stack_rows(df, instrument_key, options_snapshot=opt_snap, event_snapshot=event_snapshot)
-    advisory = build_advisory_snapshot(
-        df,
-        instrument_key,
-        predictions=predictions or {},
-        options_snapshot=opt_snap,
-        event_snapshot=event_snapshot,
-        news_items=news_items,
-        macro_snapshot=macro_snapshot,
-        breadth_snapshot=breadth_snapshot,
-        liquidity_snapshot=liquidity_snapshot,
-        catalyst_snapshot=catalyst_snapshot,
+    section_errors: dict[str, str] = {}
+
+    try:
+        levels = _levels_rows(df, instrument_key)
+    except Exception as exc:
+        section_errors["levels"] = _clean_reason_text(exc, "Key levels unavailable")
+        levels = []
+    levels = _info_rows(levels, "Levels", section_errors.get("levels", "Need more OHLC history for key levels"))
+
+    try:
+        market = _market_context_rows(instrument_key)
+    except Exception as exc:
+        section_errors["market"] = _clean_reason_text(exc, "Market context unavailable")
+        market = []
+    market = _info_rows(market, "Market Context", section_errors.get("market", "No cached context history loaded"))
+
+    try:
+        breadth_snapshot = get_breadth_snapshot(symbol)
+    except Exception as exc:
+        section_errors["breadth"] = _clean_reason_text(exc, "Breadth snapshot unavailable")
+        breadth_snapshot = {"status": "error", "reason": section_errors["breadth"], "rows": []}
+
+    try:
+        macro_snapshot = get_macro_event_snapshot()
+    except Exception as exc:
+        section_errors["macro"] = _clean_reason_text(exc, "Macro snapshot unavailable")
+        macro_snapshot = {"status": "error", "reason": section_errors["macro"], "rows": []}
+
+    try:
+        catalyst_snapshot = get_catalyst_provider_snapshot(symbol)
+    except Exception as exc:
+        section_errors["catalyst"] = _clean_reason_text(exc, "Catalyst snapshot unavailable")
+        catalyst_snapshot = {"status": "error", "reason": section_errors["catalyst"], "rows": []}
+
+    try:
+        opt_snap, opt_rows, opt_card = _options_rows(symbol, spot_price=price)
+    except Exception as exc:
+        section_errors["options"] = _clean_reason_text(exc, "Options feed unavailable")
+        opt_snap = {"status": "error", "reason": section_errors["options"], "source_kind": "error"}
+        opt_rows = []
+        opt_card = "Options: unavailable"
+    opt_rows = _info_rows(
+        opt_rows,
+        "Options",
+        section_errors.get("options")
+        or opt_snap.get("refresh_error")
+        or opt_snap.get("reason")
+        or opt_snap.get("source")
+        or opt_snap.get("source_kind")
+        or "No options snapshot cached yet",
     )
-    execution_snapshot = get_execution_dashboard_snapshot(symbol, current_price=price, advisory=advisory, profile_name=profile.get("key"))
-    performance_snapshot = get_performance_snapshot()
-    replay_snapshot = get_replay_dashboard_snapshot(symbol)
-    alerts_snapshot = get_alert_snapshot(symbol, current_price=price, advisory=advisory, profile_name=profile.get("key"), persist=True)
-    scan_snapshot = get_opportunity_scan(profile_name=profile.get("key"))
+    options_detail = str(opt_rows[0][2]) if opt_rows else "No options snapshot cached yet"
+
+    try:
+        liquidity_snapshot = get_liquidity_snapshot(df, symbol)
+    except Exception as exc:
+        section_errors["liquidity"] = _clean_reason_text(exc, "Liquidity snapshot unavailable")
+        liquidity_snapshot = {"status": "error", "reason": section_errors["liquidity"], "rows": []}
+
+    try:
+        event_snapshot = get_event_snapshot(symbol)
+    except Exception as exc:
+        section_errors["event"] = _clean_reason_text(exc, "Event snapshot unavailable")
+        event_snapshot = {"status": "error", "reason": section_errors["event"]}
+
+    try:
+        news_items = load_recent_headlines(symbol, limit=6)
+    except Exception as exc:
+        section_errors["news"] = _clean_reason_text(exc, "News store unavailable")
+        news_items = []
+
+    try:
+        news_rows, news_card = _news_rows(symbol, headlines=news_items)
+    except Exception as exc:
+        section_errors["news"] = _clean_reason_text(exc, "News summary unavailable")
+        news_rows, news_card = [], "News: unavailable"
+    news_rows = _news_info_rows(news_rows, section_errors.get("news", "No local headlines yet; feed will populate after refresh"))
+    news_detail = str(news_rows[0][2]) if news_rows else "No local headlines yet"
+
+    try:
+        signal_rows = _signal_rows(df, instrument_key, options_snapshot=opt_snap)
+    except Exception as exc:
+        section_errors["signal"] = _clean_reason_text(exc, "Signal context unavailable")
+        signal_rows = []
+    signal_rows = _info_rows(signal_rows, "Signal Context", section_errors.get("signal", "Need daily history and context data"))
+
+    try:
+        stack_rows = _stack_rows(df, instrument_key, options_snapshot=opt_snap, event_snapshot=event_snapshot)
+    except Exception as exc:
+        section_errors["stack"] = _clean_reason_text(exc, "Advisory stack unavailable")
+        stack_rows = []
+    stack_rows = _info_rows(stack_rows, "Data Stack", section_errors.get("stack", "Support feeds are still warming up"))
+
+    try:
+        advisory = build_advisory_snapshot(
+            df,
+            instrument_key,
+            predictions=predictions or {},
+            options_snapshot=opt_snap,
+            event_snapshot=event_snapshot,
+            news_items=news_items,
+            macro_snapshot=macro_snapshot,
+            breadth_snapshot=breadth_snapshot,
+            liquidity_snapshot=liquidity_snapshot,
+            catalyst_snapshot=catalyst_snapshot,
+        )
+    except Exception as exc:
+        section_errors["advisory"] = _clean_reason_text(exc, "Advisory context unavailable")
+        advisory = {
+            "action_card": "Action: unavailable",
+            "action_detail": section_errors["advisory"],
+            "quality_card": "Quality: unavailable",
+            "quality_detail": section_errors["advisory"],
+            "probability_rows": [],
+            "quality_rows": [],
+            "setup_rows": [],
+            "scenario_rows": [],
+            "invalidation_rows": [],
+            "reliability_rows": [],
+            "breadth_rows": [],
+            "macro_rows": [],
+            "liquidity_rows": [],
+            "catalyst_rows": [],
+            "quality_meta": {},
+            "plan_meta": {},
+            "pred_state": {},
+            "macro_meta": macro_snapshot if isinstance(macro_snapshot, dict) else {},
+            "breadth_meta": breadth_snapshot if isinstance(breadth_snapshot, dict) else {},
+            "liquidity_meta": liquidity_snapshot if isinstance(liquidity_snapshot, dict) else {},
+            "catalyst_meta": catalyst_snapshot if isinstance(catalyst_snapshot, dict) else {},
+        }
+
+    try:
+        execution_snapshot = get_execution_dashboard_snapshot(symbol, current_price=price, advisory=advisory, profile_name=profile.get("key"))
+    except Exception as exc:
+        section_errors["execution"] = _clean_reason_text(exc, "Execution panel unavailable")
+        execution_snapshot = {
+            "broker_mode": "unavailable",
+            "rows": [],
+            "portfolio_rows": [],
+            "runtime": {"route_label": "Unavailable", "detail": section_errors["execution"]},
+            "diagnostics": {},
+            "verification": {},
+        }
+
+    try:
+        performance_snapshot = get_performance_snapshot()
+    except Exception as exc:
+        section_errors["performance"] = _clean_reason_text(exc, "Performance panel unavailable")
+        performance_snapshot = {"summary": section_errors["performance"], "rows": []}
+
+    try:
+        replay_snapshot = get_replay_dashboard_snapshot(symbol)
+    except Exception as exc:
+        section_errors["replay"] = _clean_reason_text(exc, "Replay panel unavailable")
+        replay_snapshot = {"card": "Replay: unavailable", "detail": section_errors["replay"], "rows": []}
+
+    try:
+        alerts_snapshot = get_alert_snapshot(symbol, current_price=price, advisory=advisory, profile_name=profile.get("key"), persist=True)
+    except Exception as exc:
+        section_errors["alerts"] = _clean_reason_text(exc, "Alerts unavailable")
+        alerts_snapshot = {"summary": section_errors["alerts"], "rows": []}
+
+    try:
+        scan_snapshot = get_opportunity_scan(profile_name=profile.get("key"))
+    except Exception as exc:
+        section_errors["scan"] = _clean_reason_text(exc, "Opportunity scan unavailable")
+        scan_snapshot = {"summary": section_errors["scan"], "rows": []}
 
     atr_row = next((r for r in levels if r[0] == "ATR(14)"), None)
     vol_card = f"Volatility: {atr_row[1]}" if atr_row else "Volatility: unavailable"
-    vol_detail = atr_row[2] if atr_row else "ATR unavailable"
+    vol_detail = atr_row[2] if atr_row else section_errors.get("levels", "ATR unavailable")
     if market:
         first_market = market[0]
         vol_detail = f"{vol_detail} | {first_market[0]} {first_market[1]}"
@@ -643,18 +807,111 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
     if operator_hint:
         broker_detail = f"{broker_detail} | {operator_hint}"
 
+    breadth_rows = _info_rows(
+        list(advisory.get("breadth_rows") or []),
+        "Breadth",
+        section_errors.get("breadth")
+        or breadth_snapshot.get("provider_note")
+        or breadth_snapshot.get("reason")
+        or "No breadth cache loaded yet",
+    )
+    macro_rows = _info_rows(
+        list(advisory.get("macro_rows") or []),
+        "Macro",
+        section_errors.get("macro")
+        or macro_snapshot.get("provider_note")
+        or macro_snapshot.get("reason")
+        or "No macro calendar loaded yet",
+    )
+    liquidity_rows = _info_rows(
+        list(advisory.get("liquidity_rows") or []),
+        "Liquidity",
+        section_errors.get("liquidity")
+        or liquidity_snapshot.get("reason")
+        or "Need more price history for tradability checks",
+    )
+    catalyst_rows = _info_rows(
+        list(advisory.get("catalyst_rows") or []),
+        "Catalysts",
+        section_errors.get("catalyst")
+        or catalyst_snapshot.get("status")
+        or "No fresh catalyst records cached yet",
+    )
+    probability_rows = _info_rows(
+        list(advisory.get("probability_rows") or []),
+        "Probabilities",
+        section_errors.get("advisory", "Predictions are still warming up"),
+    )
+    quality_rows = _info_rows(
+        list(advisory.get("quality_rows") or []),
+        "Signal Quality",
+        section_errors.get("advisory", "Quality analysis unavailable right now"),
+    )
+    setup_rows = _info_rows(
+        list(advisory.get("setup_rows") or []),
+        "Trade Plan",
+        section_errors.get("advisory", "No actionable setup summary yet"),
+    )
+    scenario_rows = _info_rows(
+        list(advisory.get("scenario_rows") or []),
+        "Scenario Map",
+        section_errors.get("advisory", "Scenario map unavailable right now"),
+    )
+    invalidation_rows = _info_rows(
+        list(advisory.get("invalidation_rows") or []),
+        "Invalidation",
+        section_errors.get("advisory", "Invalidation rules unavailable right now"),
+    )
+    reliability_rows = _info_rows(
+        list(advisory.get("reliability_rows") or []),
+        "Reliability",
+        section_errors.get("advisory", "No readiness history loaded yet"),
+    )
+    execution_rows = _info_rows(
+        list(execution_snapshot.get("rows") or []),
+        "Execution",
+        section_errors.get("execution", "Execution panel unavailable"),
+    )
+    portfolio_rows = _info_rows(
+        list(execution_snapshot.get("portfolio_rows") or []),
+        "Portfolio",
+        section_errors.get("execution", "Portfolio summary unavailable"),
+    )
+    performance_rows = _info_rows(
+        list(performance_snapshot.get("rows") or []),
+        "Performance",
+        section_errors.get("performance", "No closed paper trades yet"),
+    )
+    replay_rows = _info_rows(
+        list(replay_snapshot.get("rows") or []),
+        "Replay",
+        section_errors.get("replay", "No replay session"),
+    )
+    alerts_rows = _info_rows(
+        list(alerts_snapshot.get("rows") or []),
+        "Alerts",
+        section_errors.get("alerts", "No active trader alerts"),
+    )
+    opportunity_rows = _info_rows(
+        list(scan_snapshot.get("rows") or []),
+        "Scan",
+        section_errors.get("scan", "Opportunity scan unavailable"),
+    )
+
     return {
         "setup_card": align_head,
         "setup_detail": align_detail,
         "vol_card": vol_card,
         "vol_detail": vol_detail,
         "options_card": opt_card,
+        "options_detail": options_detail,
         "news_card": news_card,
+        "news_detail": news_detail,
         "market_rows": market,
-        "breadth_rows": advisory.get("breadth_rows", []),
-        "macro_rows": advisory.get("macro_rows", []),
-        "liquidity_rows": advisory.get("liquidity_rows", []),
-        "catalyst_rows": advisory.get("catalyst_rows", []),
+        "breadth_rows": breadth_rows,
+        "macro_rows": macro_rows,
+        "liquidity_rows": liquidity_rows,
+        "catalyst_rows": catalyst_rows,
         "signal_rows": signal_rows,
         "stack_rows": stack_rows,
         "levels_rows": levels,
@@ -665,18 +922,18 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
         "action_detail": advisory.get("action_detail", "-"),
         "quality_card": advisory.get("quality_card", "Quality: unavailable"),
         "quality_detail": advisory.get("quality_detail", "-"),
-        "probability_rows": advisory.get("probability_rows", []),
-        "quality_rows": advisory.get("quality_rows", []),
-        "setup_rows": advisory.get("setup_rows", []),
-        "scenario_rows": advisory.get("scenario_rows", []),
-        "invalidation_rows": advisory.get("invalidation_rows", []),
-        "reliability_rows": advisory.get("reliability_rows", []),
-        "execution_rows": execution_snapshot.get("rows", []),
-        "portfolio_rows": execution_snapshot.get("portfolio_rows", []),
-        "performance_rows": performance_snapshot.get("rows", []),
-        "replay_rows": replay_snapshot.get("rows", []),
-        "alerts_rows": alerts_snapshot.get("rows", []),
-        "opportunity_rows": scan_snapshot.get("rows", []),
+        "probability_rows": probability_rows,
+        "quality_rows": quality_rows,
+        "setup_rows": setup_rows,
+        "scenario_rows": scenario_rows,
+        "invalidation_rows": invalidation_rows,
+        "reliability_rows": reliability_rows,
+        "execution_rows": execution_rows,
+        "portfolio_rows": portfolio_rows,
+        "performance_rows": performance_rows,
+        "replay_rows": replay_rows,
+        "alerts_rows": alerts_rows,
+        "opportunity_rows": opportunity_rows,
         "profile_card": f"Profile: {profile.get('label', 'Balanced')}",
         "profile_detail": f"Risk/trade {100.0 * float(profile.get('risk_per_trade') or 0.0):.2f}% | gross cap {100.0 * float(profile.get('max_gross_exposure') or 0.0):.0f}%",
         "broker_card": f"Broker: {str((execution_snapshot.get('runtime') or {}).get('route_label') or execution_snapshot.get('broker_mode') or 'paper')}",
@@ -689,4 +946,5 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
         "replay_meta": replay_snapshot,
         "alerts_meta": alerts_snapshot,
         "scan_meta": scan_snapshot,
+        "section_errors": section_errors,
     }
