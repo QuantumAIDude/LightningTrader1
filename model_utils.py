@@ -82,6 +82,11 @@ STALE_MULTIPLIER = 3.5
 MIN_STALE_SECONDS = 120
 NO_SIGNAL_CONF = 0.40
 NO_SIGNAL_DISP = 3.0
+TENTATIVE_DIRECTION_CONF_PCT = 20.0
+TENTATIVE_DIRECTION_SIZE_MULT = 0.50
+STOCK_HORIZON_SUPPORT_CONF_MAX_BONUS = 8.0
+STOCK_HORIZON_SUPPORT_SIZE_MAX_MULT = 1.10
+STOCK_HORIZON_SUPPORT_SIZE_MIN_MULT = 0.60
 
 _LIVE_CAL_CACHE = {}
 _LAST_CAL_UPDATE = {}
@@ -165,6 +170,59 @@ def _apply_summary_calibration(summary: dict | None, calibration: dict | None):
     except Exception:
         pass
     return out
+
+
+def _restore_summary_target_mean(summary: dict | None, payload: dict | None):
+    if not isinstance(summary, dict):
+        return summary
+    if not isinstance(payload, dict):
+        return summary
+    meta = dict(payload.get("meta") or {})
+    if not bool(meta.get("demeaned")):
+        return summary
+    try:
+        target_mean = float(meta.get("target_mean", 0.0))
+    except Exception:
+        target_mean = 0.0
+    if (not np.isfinite(target_mean)) or abs(target_mean) <= 1e-12:
+        return summary
+    out = dict(summary)
+    for key in ("mean", "q10", "q50", "q90"):
+        if key in out:
+            try:
+                out[key] = float(out[key]) + float(target_mean)
+            except Exception:
+                pass
+    try:
+        mean_val = float(out.get("mean", 0.0))
+        std_val = max(1e-6, float(out.get("std", 1e-6)))
+        z = mean_val / std_val
+        out["p_up"] = float(max(0.001, min(0.999, 0.5 * (1.0 + math.erf(z / math.sqrt(2.0))))))
+    except Exception:
+        pass
+    return out
+
+
+def _apply_fallback_return_calibration(summary: dict | None, calibration: dict | None):
+    if not isinstance(summary, dict):
+        return summary
+    if not isinstance(calibration, dict):
+        return summary
+    try:
+        selected = str(calibration.get("selected") or "").strip().lower()
+    except Exception:
+        selected = ""
+    try:
+        scale = float(calibration.get("scale", 1.0))
+    except Exception:
+        scale = 1.0
+    try:
+        bias = float(calibration.get("bias", 0.0))
+    except Exception:
+        bias = 0.0
+    if selected in {"anchor_only", "insufficient_samples", "no_material_edge", "exception"} and abs(scale) <= 1e-12 and abs(bias) <= 1e-12:
+        return summary
+    return _apply_summary_calibration(summary, calibration)
 
 
 def _resolve_predictability_gate(models_dict: dict | None):
@@ -593,23 +651,37 @@ def _session_close_datetime(session_date, session_open_minute: int, session_clos
     except Exception:
         return None
 
-def _target_session_date(instr_meta: dict):
+def _coerce_now_utc(value) -> pd.Timestamp | None:
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def _target_session_date(instr_meta: dict, now_utc: pd.Timestamp | None = None):
     tz = instr_meta.get("tz", "America/New_York")
     session_open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
     session_close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
-    now_local = pd.Timestamp.now(tz=tz)
+    now_ref = _coerce_now_utc(now_utc)
+    now_local = now_ref.tz_convert(tz) if now_ref is not None else pd.Timestamp.now(tz=tz)
     session_date = _session_date_for_time(now_local, session_open_minute, session_close_minute)
     close_dt = _session_close_datetime(session_date, session_open_minute, session_close_minute, tz)
     if close_dt is not None and now_local >= close_dt:
         return session_date + pd.Timedelta(days=1)
     return session_date
 
-def _target_week_key(instr_meta: dict):
+def _target_week_key(instr_meta: dict, now_utc: pd.Timestamp | None = None):
     tz = instr_meta.get("tz", "America/New_York")
     week_end_day = int(instr_meta.get("week_end_day", 4))
     session_open_minute = int(instr_meta.get("session_open_minute", 9 * 60 + 30))
     session_close_minute = int(instr_meta.get("session_close_minute", 16 * 60))
-    now_local = pd.Timestamp.now(tz=tz)
+    now_ref = _coerce_now_utc(now_utc)
+    now_local = now_ref.tz_convert(tz) if now_ref is not None else pd.Timestamp.now(tz=tz)
     session_date = _session_date_for_time(now_local, session_open_minute, session_close_minute)
     close_dt = _session_close_datetime(session_date, session_open_minute, session_close_minute, tz)
     iso = now_local.isocalendar()
@@ -679,14 +751,14 @@ def _market_open_now(instr_meta: dict, now_utc: pd.Timestamp) -> bool:
     )
     return not in_weekly_closure
 
-def _staleness_info(df_latest: pd.DataFrame, instrument_key: str = None):
+def _staleness_info(df_latest: pd.DataFrame, instrument_key: str = None, now_utc: pd.Timestamp | None = None):
     if df_latest is None or df_latest.empty:
         return {"is_stale": True, "age_sec": None, "threshold_sec": None, "market_open": None, "market_state": "unknown"}
     try:
         last_ts = pd.to_datetime(df_latest.index[-1], utc=True, errors="coerce")
     except Exception:
         last_ts = pd.NaT
-    now = pd.Timestamp.now(tz="UTC")
+    now = _coerce_now_utc(now_utc) or pd.Timestamp.now(tz="UTC")
     try:
         age_sec = max(0.0, float((now - last_ts).total_seconds())) if pd.notna(last_ts) else None
     except Exception:
@@ -716,7 +788,7 @@ def _staleness_info(df_latest: pd.DataFrame, instrument_key: str = None):
         "market_state": market_state
     }
 
-def _drop_incomplete_last_bar(df_latest: pd.DataFrame, instrument_key: str = None):
+def _drop_incomplete_last_bar(df_latest: pd.DataFrame, instrument_key: str = None, now_utc: pd.Timestamp | None = None):
     """
     Drop the newest bar if it is likely incomplete (very recent or timestamped in the future).
     This avoids using partial bars that can distort short-horizon signals.
@@ -732,7 +804,7 @@ def _drop_incomplete_last_bar(df_latest: pd.DataFrame, instrument_key: str = Non
         return df_latest, False
     if pd.isna(last_ts):
         return df_latest, False
-    now = pd.Timestamp.now(tz="UTC")
+    now = _coerce_now_utc(now_utc) or pd.Timestamp.now(tz="UTC")
     try:
         age_sec = float((now - last_ts).total_seconds())
     except Exception:
@@ -1030,8 +1102,59 @@ def _estimated_trade_cost_ret(last_price: float, instr_meta: dict = None, spread
     spread_term = max(tick_spread, spread_cost)
     return float(max(0.0, mult * (base + spread_term)))
 
+
+def _live_edge_floor_inputs(
+    last_price: float,
+    df_latest: pd.DataFrame,
+    instr_meta: dict | None = None,
+) -> dict:
+    spread_frac = None
+    try:
+        if "ask" in df_latest.columns and "bid" in df_latest.columns:
+            spread = float(df_latest["ask"].iloc[-1] - df_latest["bid"].iloc[-1])
+            if spread > 0 and float(last_price) > 0:
+                spread_frac = spread / float(last_price)
+    except Exception:
+        spread_frac = None
+    try:
+        cost_ret_est = _estimated_trade_cost_ret(last_price, instr_meta=instr_meta, spread_frac=spread_frac)
+    except Exception:
+        cost_ret_est = 0.0
+    try:
+        min_edge_floor = max(0.0, float(LIVE_MIN_EDGE_BPS) / 10000.0)
+    except Exception:
+        min_edge_floor = 0.0
+    try:
+        unc_mult = max(0.0, float(LIVE_UNCERTAINTY_EDGE_MULT))
+    except Exception:
+        unc_mult = 0.0
+    return {
+        "spread_frac": spread_frac,
+        "cost_ret_est": float(max(0.0, cost_ret_est)),
+        "min_edge_floor": float(max(0.0, min_edge_floor)),
+        "uncertainty_mult": float(max(0.0, unc_mult)),
+    }
+
 def _predict_horizon_norm(models_dict, df_latest, horizon_minutes: int, instrument_key: str = None,
                           feature_frame: pd.DataFrame | None = None, feat_cache: dict | None = None):
+    summary = _predict_horizon_summary(
+        models_dict,
+        df_latest,
+        horizon_minutes,
+        instrument_key=instrument_key,
+        feature_frame=feature_frame,
+        feat_cache=feat_cache,
+    )
+    if not isinstance(summary, dict):
+        return None
+    try:
+        return float(summary.get("mean"))
+    except Exception:
+        return None
+
+
+def _predict_horizon_summary(models_dict, df_latest, horizon_minutes: int, instrument_key: str = None,
+                             feature_frame: pd.DataFrame | None = None, feat_cache: dict | None = None):
     try:
         h_key = str(int(horizon_minutes))
     except Exception:
@@ -1060,34 +1183,188 @@ def _predict_horizon_norm(models_dict, df_latest, horizon_minutes: int, instrume
         ensemble_map = h_payload.get("ensemble_models", {}) if h_payload else {}
         win_calibration = h_payload.get("window_calibration", {}) if h_payload else {}
         perf = h_payload.get("performance", h_payload.get("performance_mae", {})) if h_payload else {}
-        win_weights = _window_weights(perf)
         combined = None
-        combined_weight = 0.0
-        for win in ["short", "mid", "long"]:
-            members = ensemble_map.get(win, []) or []
-            if not members:
-                continue
-            preds_norm = _ensemble_predict_members(members, X)
-            if preds_norm.size == 0:
-                continue
-            mean_norm, std_norm, _, _, _ = _aggregate_preds(preds_norm)
-            win_sum = {"mean": mean_norm, "std": std_norm, "q10": 0.0, "q50": mean_norm, "q90": 0.0, "p_up": float(np.mean(preds_norm > 0))}
-            win_sum = _apply_summary_calibration(win_sum, win_calibration.get(win))
-            w = win_weights.get(win, 0.0)
-            if combined is None:
-                combined = win_sum
-                combined_weight = w
-            else:
-                total = combined_weight + w
-                w_a = combined_weight / total if total > 0 else 0.5
-                combined = _blend_summaries(combined, win_sum, w_a)
-                combined_weight = total
+        if isinstance(ensemble_map, dict) and ensemble_map:
+            win_weights = _window_weights(perf)
+            combined_weight = 0.0
+            for win in ["short", "mid", "long"]:
+                members = ensemble_map.get(win, []) or []
+                if not members:
+                    continue
+                preds_norm = _ensemble_predict_members(members, X)
+                if preds_norm.size == 0:
+                    continue
+                mean_norm, std_norm, q10_norm, q50_norm, q90_norm = _aggregate_preds(preds_norm)
+                win_sum = {
+                    "mean": mean_norm,
+                    "std": std_norm,
+                    "q10": q10_norm,
+                    "q50": q50_norm,
+                    "q90": q90_norm,
+                    "p_up": float(np.mean(preds_norm > 0)),
+                }
+                win_sum = _apply_summary_calibration(win_sum, win_calibration.get(win))
+                w = win_weights.get(win, 0.0)
+                if combined is None:
+                    combined = win_sum
+                    combined_weight = w
+                else:
+                    total = combined_weight + w
+                    w_a = combined_weight / total if total > 0 else 0.5
+                    combined = _blend_summaries(combined, win_sum, w_a)
+                    combined_weight = total
         if combined is None:
-            continue
-        preds.append(float(combined["mean"]))
+            model = h_payload.get("model") or h_payload.get("fallback_model")
+            if model is None:
+                continue
+            try:
+                pred_norm = float(np.asarray(model.predict(X), dtype=float)[0])
+            except Exception:
+                continue
+            meta = dict(h_payload.get("meta") or {})
+            try:
+                if bool(meta.get("target_norm")) and bool(meta.get("demeaned")):
+                    pred_norm += float(meta.get("target_mean", 0.0) or 0.0)
+            except Exception:
+                pass
+            try:
+                resid_std = abs(float(meta.get("resid_std", 1e-6) or 1e-6))
+            except Exception:
+                resid_std = 1e-6
+            z = pred_norm / max(1e-6, resid_std)
+            combined = {
+                "mean": float(pred_norm),
+                "std": float(max(1e-6, resid_std)),
+                "q10": float(pred_norm - resid_std),
+                "q50": float(pred_norm),
+                "q90": float(pred_norm + resid_std),
+                "p_up": float(max(0.001, min(0.999, 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))))),
+            }
+        preds.append(dict(combined))
     if not preds:
         return None
-    return float(np.mean(preds))
+    means = np.asarray([float(p.get("mean", 0.0)) for p in preds], dtype=float)
+    stds = np.asarray([abs(float(p.get("std", 0.0))) for p in preds], dtype=float)
+    p_ups = np.asarray([float(p.get("p_up", 0.5)) for p in preds], dtype=float)
+    mean_val = float(np.mean(means))
+    spread = float(np.std(means)) if len(means) >= 2 else 0.0
+    base_std = float(np.mean(stds)) if len(stds) else 1e-6
+    std_val = max(1e-6, base_std, spread)
+    direction = "UP" if mean_val > 0.0 else "DOWN" if mean_val < 0.0 else "-"
+    strength = float(max(0.0, min(1.0, math.tanh(abs(mean_val) / 1.35))))
+    return {
+        "mean": mean_val,
+        "std": std_val,
+        "p_up": float(np.mean(p_ups)) if len(p_ups) else 0.5,
+        "direction": direction,
+        "strength": strength,
+        "models": int(len(preds)),
+    }
+
+
+def _stock_horizon_support(raw_direction: str | None,
+                           raw_pred_ret: float | None,
+                           current_vol: float | None,
+                           h10_summary: dict | None,
+                           h30_summary: dict | None) -> dict:
+    raw_dir = str(raw_direction or "-").upper()
+    try:
+        raw_ret = float(raw_pred_ret or 0.0)
+    except Exception:
+        raw_ret = 0.0
+    try:
+        vol = max(1e-6, abs(float(current_vol or 0.0)))
+    except Exception:
+        vol = 1e-6
+    raw_norm = raw_ret / vol if vol > 0 else 0.0
+    if raw_dir not in {"UP", "DOWN"}:
+        raw_dir = "UP" if raw_norm > 0.0 else "DOWN" if raw_norm < 0.0 else "-"
+    rows = []
+    for horizon, weight, summary in ((10, 0.55, h10_summary), (30, 0.45, h30_summary)):
+        if not isinstance(summary, dict):
+            continue
+        direction = str(summary.get("direction") or "-").upper()
+        try:
+            mean_norm = float(summary.get("mean", 0.0) or 0.0)
+        except Exception:
+            mean_norm = 0.0
+        try:
+            strength = float(summary.get("strength", 0.0) or 0.0)
+        except Exception:
+            strength = 0.0
+        if direction not in {"UP", "DOWN"}:
+            direction = "UP" if mean_norm > 0.0 else "DOWN" if mean_norm < 0.0 else "-"
+        rows.append(
+            {
+                "horizon": int(horizon),
+                "weight": float(weight),
+                "direction": direction,
+                "mean_norm": float(mean_norm),
+                "strength": float(max(0.0, min(1.0, strength))),
+            }
+        )
+    if raw_dir not in {"UP", "DOWN"} or not rows:
+        return {
+            "stage": "unavailable",
+            "direction": "-",
+            "score": 0.0,
+            "confidence_bonus": 0.0,
+            "size_mult": 1.0,
+            "align_score": 1.0,
+            "blended_norm": float(raw_norm),
+            "rows": rows,
+        }
+    aligned = 0.0
+    opposing = 0.0
+    weighted_norm = 0.50 * max(-3.0, min(3.0, raw_norm))
+    total_weight = 0.50
+    aligned_count = 0
+    opposing_count = 0
+    for row in rows:
+        contribution = float(row["weight"]) * float(row["strength"])
+        total_weight += float(row["weight"])
+        weighted_norm += float(row["weight"]) * max(-3.0, min(3.0, float(row["mean_norm"])))
+        if row["direction"] == raw_dir:
+            aligned += contribution
+            aligned_count += 1
+        elif row["direction"] in {"UP", "DOWN"}:
+            opposing += contribution
+            opposing_count += 1
+    net = aligned - (0.85 * opposing)
+    score = max(0.0, min(1.0, net / max(1e-6, total_weight)))
+    stage = "mixed"
+    if aligned_count >= 1 and score >= 0.18 and opposing <= 0.08:
+        stage = "supportive"
+    if aligned_count >= 2 and score >= 0.28 and opposing <= 0.04:
+        stage = "confirmed"
+    if aligned <= 0.0 and opposing > 0.0:
+        stage = "contrary"
+    conf_bonus = 0.0
+    size_mult = 1.0
+    if stage == "supportive":
+        conf_bonus = 2.5 + (3.5 * score)
+        size_mult = 0.85 + (0.20 * score)
+    elif stage == "confirmed":
+        conf_bonus = 4.0 + (float(STOCK_HORIZON_SUPPORT_CONF_MAX_BONUS) * score * 0.50)
+        size_mult = 0.92 + (0.18 * score)
+    elif stage == "contrary":
+        size_mult = float(STOCK_HORIZON_SUPPORT_SIZE_MIN_MULT)
+    align_score = max(
+        float(STOCK_HORIZON_SUPPORT_SIZE_MIN_MULT),
+        min(float(STOCK_HORIZON_SUPPORT_SIZE_MAX_MULT), float(size_mult)),
+    )
+    return {
+        "stage": stage,
+        "direction": raw_dir if stage in {"supportive", "confirmed"} else "-",
+        "score": float(score),
+        "confidence_bonus": float(max(0.0, conf_bonus)),
+        "size_mult": float(size_mult),
+        "align_score": float(align_score),
+        "blended_norm": float(weighted_norm / max(1e-6, total_weight)),
+        "aligned_count": int(aligned_count),
+        "opposing_count": int(opposing_count),
+        "rows": rows,
+    }
 
 def _load_live_calibration(instrument_key: str):
     if not LIVE_CALIBRATION:
@@ -1945,7 +2222,8 @@ def _recent_live_abs_error(live_cal: dict | None, min_n: int = 20):
 def _posterior_shrink_return(pred_ret: float, uncertainty_ret: float) -> tuple[float, float]:
     """
     Empirical-Bayes style shrinkage toward zero.
-    When uncertainty dominates the estimated edge, suppress the tradeable signal.
+    Use a linear-in-SNR shrink rather than a quadratic collapse because
+    uncertainty is already charged again in the live edge gate and position sizing.
     """
     try:
         mu = float(pred_ret)
@@ -1957,8 +2235,88 @@ def _posterior_shrink_return(pred_ret: float, uncertainty_ret: float) -> tuple[f
     if sigma <= 1e-12:
         return mu, 1.0
     snr = abs(mu) / sigma
-    shrink = (snr * snr) / (1.0 + (snr * snr))
+    shrink = snr / (1.0 + snr)
     return float(mu * shrink), float(shrink)
+
+
+def _uncertainty_scale_from_prob(prob: float | None) -> float:
+    """
+    Convert calibrated directional reliability into a modest uncertainty adjustment.
+    This avoids charging high-quality signal buckets the full global residual std
+    while leaving weak buckets essentially unchanged.
+    """
+    try:
+        p = float(prob)
+    except Exception:
+        return 1.0
+    if not np.isfinite(p):
+        return 1.0
+    p = max(0.50, min(0.80, p))
+    edge = (p - 0.50) / 0.30
+    return float(max(0.72, min(1.05, 1.05 - (0.25 * edge))))
+
+
+def _combine_uncertainty_estimates(
+    base_uncertainty: float | None,
+    live_uncertainty: float | None = None,
+    reliability_prob: float | None = None,
+) -> float:
+    """
+    Blend ensemble/disagreement uncertainty with live residual uncertainty.
+    These components are correlated views of the same forecast error, so
+    summing them in quadrature tends to double-count risk in the recent window.
+    Keep the blend conservative, but avoid RSS over-penalization.
+    """
+    try:
+        base = max(0.0, float(base_uncertainty or 0.0))
+    except Exception:
+        base = 0.0
+    if live_uncertainty is None:
+        return float(base)
+    try:
+        live = max(0.0, float(live_uncertainty))
+    except Exception:
+        return float(base)
+    high = max(base, live)
+    low = min(base, live)
+    try:
+        rel = float(reliability_prob)
+    except Exception:
+        rel = 0.50
+    if not np.isfinite(rel):
+        rel = 0.50
+    rel = max(0.50, min(0.75, rel))
+    low_w = 0.20 + (0.08 * ((rel - 0.50) / 0.25))
+    low_w = max(0.20, min(0.28, low_w))
+    return float(((1.0 - low_w) * high) + (low_w * low))
+
+
+def _resolve_direction_stage(
+    raw_direction: str | None,
+    confidence_pct: float | None,
+    edge_ret: float | None,
+    *,
+    conformal_block: bool = False,
+    readiness_locked: bool = False,
+) -> tuple[str, str]:
+    direction = str(raw_direction or "-").upper()
+    if direction not in {"UP", "DOWN"}:
+        return "-", "blocked"
+    try:
+        conf_pct = float(confidence_pct or 0.0)
+    except Exception:
+        conf_pct = 0.0
+    try:
+        edge_val = float(edge_ret or 0.0)
+    except Exception:
+        edge_val = 0.0
+    if edge_val <= 0.0 or bool(conformal_block) or bool(readiness_locked):
+        return "-", "blocked"
+    if conf_pct >= (float(NO_SIGNAL_CONF) * 100.0):
+        return direction, "finished"
+    if conf_pct >= float(TENTATIVE_DIRECTION_CONF_PCT):
+        return direction, "tentative"
+    return "-", "blocked"
 
 
 def _ensemble_predict_members(members, X):
@@ -2022,11 +2380,23 @@ def fallback_regime_probs(df: pd.DataFrame) -> dict:
     out["regime_conf"] = 0.3
     return out
 
-def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_effects: bool = True):
+def predict_4min(
+    models_dict,
+    df_latest,
+    instrument_key: str = None,
+    log_side_effects: bool = True,
+    now_utc: pd.Timestamp | None = None,
+    use_live_artifacts: bool = True,
+    readiness_override: dict | None = None,
+    live_calibration_override: dict | None = None,
+    feature_frame_override: pd.DataFrame | None = None,
+    stock_horizon_blend: bool = True,
+):
     results = {}
     if df_latest is None or df_latest.empty:
         return results
-    df_latest, partial_dropped = _drop_incomplete_last_bar(df_latest, instrument_key=instrument_key)
+    now_ref = _coerce_now_utc(now_utc)
+    df_latest, partial_dropped = _drop_incomplete_last_bar(df_latest, instrument_key=instrument_key, now_utc=now_ref)
     if df_latest is None or df_latest.empty:
         return {"error": "No complete bars available"}
     last_price = float(df_latest["close"].iloc[-1])
@@ -2045,10 +2415,22 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
     except Exception:
         return {"error": "Regime model invalid"}
 
-    live_cal = _load_live_calibration(instrument_key) if LIVE_CALIBRATION else None
+    if live_calibration_override is not None:
+        live_cal = dict(live_calibration_override)
+    elif use_live_artifacts and LIVE_CALIBRATION:
+        live_cal = _load_live_calibration(instrument_key)
+    else:
+        live_cal = None
     drift_flag = bool(live_cal.get("drift_flag", False) or live_cal.get("recent_drift_flag", False)) if live_cal else False
     cal_stale = bool(live_cal.get("_stale", False)) if live_cal else False
-    readiness_locked, readiness_reason, readiness_state = _readiness_locked_state(instrument_key or SYMBOL)
+    if readiness_override is not None:
+        readiness_state = dict(readiness_override)
+        readiness_locked = not (bool(readiness_state.get("live_ready")) and bool(readiness_state.get("fresh")))
+        readiness_reason = None if not readiness_locked else str(readiness_state.get("reason") or "readiness override blocked trading")
+    elif use_live_artifacts:
+        readiness_locked, readiness_reason, readiness_state = _readiness_locked_state(instrument_key or SYMBOL)
+    else:
+        readiness_locked, readiness_reason, readiness_state = False, None, {"live_ready": True, "fresh": True}
     if log_side_effects:
         try:
             _schedule_fast_retrain_on_drift(instrument_key or SYMBOL, live_cal)
@@ -2070,7 +2452,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
     if dom_prob == 0.0 and dominant_regime is not None and comp_probs is None:
         dom_prob = 0.6
 
-    stale = _staleness_info(df_latest, instrument_key=instrument_key)
+    stale = _staleness_info(df_latest, instrument_key=instrument_key, now_utc=now_ref)
     stale_factor = _stale_conf_factor(stale)
     critical_stale = _is_critical_stale(stale)
     stale_note = ""
@@ -2124,7 +2506,13 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             "pred_ret": 0.0,
             "sig_bucket": "Weak",
         }
-        results_out["horizon"] = {"h10_norm": None, "h30_norm": None, "align_score": 0.0}
+        results_out["horizon"] = {
+            "h10_norm": None,
+            "h30_norm": None,
+            "align_score": 0.0,
+            "support_stage": "unavailable",
+            "support_score": 0.0,
+        }
         results_out["_meta"]["critical_stale"] = True
         results_out["_meta"]["diversity"] = _prediction_diversity(results_out)
         if log_side_effects:
@@ -2135,7 +2523,12 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
     model_uncertainty_rets = []
 
     # base feature row for meta and sizing (compute once and cache)
-    feat_frame = _live_feature_frame(df_latest, instrument_key=instrument_key)
+    feat_frame = feature_frame_override if isinstance(feature_frame_override, pd.DataFrame) else _live_feature_frame(df_latest, instrument_key=instrument_key)
+    try:
+        if feat_frame is not None and not feat_frame.empty and len(feat_frame) > LIVE_MAX_BARS:
+            feat_frame = feat_frame.iloc[-LIVE_MAX_BARS:].copy()
+    except Exception:
+        pass
     feat_cache: dict = {}
     try:
         X_base_feat = _get_feature_row_cached(
@@ -2168,6 +2561,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         "predictable_now": bool(predictable_now),
         "scale": float(predictability_gate.get("scale")) if isinstance(predictability_gate, dict) and predictability_gate.get("scale") is not None else None,
         "quantile": float(predictability_gate.get("quantile")) if isinstance(predictability_gate, dict) and predictability_gate.get("quantile") is not None else None,
+        "role": str(predictability_gate.get("role")) if isinstance(predictability_gate, dict) and predictability_gate.get("role") is not None else None,
     }
 
     for key in ["base", "forest", "boost", "extra_trees"]:
@@ -2212,6 +2606,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
 
         perf = payload.get("performance", payload.get("performance_mae", {})) if payload else {}
         combined_summary = _ensemble_summary_for_payload(payload, X, dominant_regime, dom_prob, comp_probs=comp_probs)
+        used_fallback_summary = False
 
         # Require ensemble summary; fall back to single-model if available
         if combined_summary is None:
@@ -2224,11 +2619,15 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
                     pred_std_norm = float(payload.get("meta", {}).get("resid_std", 1e-6))
                     pred_std_norm = max(pred_std_norm, 1e-6)
                     combined_summary = {"mean": pred_norm, "std": pred_std_norm, "q10": 0.0, "q50": pred_norm, "q90": 0.0, "p_up": float(pred_norm >= 0)}
+                    used_fallback_summary = True
                 except Exception:
                     combined_summary = None
             if combined_summary is None:
                 results_out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Ensemble not trained"}
                 continue
+        if used_fallback_summary:
+            combined_summary = _restore_summary_target_mean(combined_summary, payload)
+            combined_summary = _apply_fallback_return_calibration(combined_summary, payload.get("calibration"))
 
         pred_norm = combined_summary["mean"]
         pred_std_norm = combined_summary["std"]
@@ -2281,6 +2680,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         p_up_sig = p_correct_sig if pred_norm_adj >= 0 else (1.0 - p_correct_sig)
         p_up = 0.7 * combined_summary["p_up"] + 0.3 * p_up_sig
         p_up = max(0.001, min(0.999, p_up))
+        uncertainty_scale = _uncertainty_scale_from_prob(p_correct_sig)
 
         pred_price = _round_to_tick(last_price * (1.0 + pred_ret_adj), instr_meta)
 
@@ -2335,17 +2735,13 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         if cal_stale:
             note_parts.append("Calibration stale")
         if not predictable_now:
-            pred_norm_adj = 0.0
-            pred_ret_adj = 0.0
-            pred_price = _round_to_tick(last_price, instr_meta)
-            direction = "-"
-            conf = min(conf, 0.35)
             note_parts.append("Outside 4min predictability gate")
         note = " | ".join(note_parts)
         try:
             std_ret = float(pred_std_norm * current_vol) if target_normed else float(pred_std_norm)
         except Exception:
             std_ret = 0.0
+        std_ret *= float(uncertainty_scale)
         band_fields = _prediction_bands(last_price, pred_ret_adj, std_ret, instr_meta=instr_meta)
         try:
             model_uncertainty_rets.append(abs(float(std_ret)))
@@ -2360,6 +2756,8 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             "pred_ret": float(pred_ret_adj),
             "pred_norm": float(pred_norm_adj),
             "pred_std_norm": float(pred_std_norm),
+            "reliability_prob": round(float(p_correct_sig), 4),
+            "uncertainty_scale": round(float(uncertainty_scale), 4),
             "sig_bucket": "Strong" if (abs(pred_norm_adj) / (pred_std_norm + 1e-12)) >= 1.5 else "Medium" if (abs(pred_norm_adj) / (pred_std_norm + 1e-12)) >= 0.5 else "Weak",
             **band_fields,
             **_direction_prob_fields(direction, conf_pct),
@@ -2444,6 +2842,11 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             pred_meta_norm = float(meta_payload["model"].predict(meta_X)[0])
             meta_resid = float(meta_payload.get("meta", {}).get("resid_std", 1e-6))
             meta_resid = max(meta_resid, 1e-6)
+            try:
+                if bool(meta_payload.get("meta", {}).get("demeaned")):
+                    pred_meta_norm += float(meta_payload.get("meta", {}).get("target_mean", 0.0) or 0.0)
+            except Exception:
+                pass
             # Bayesian shrinkage for meta
             try:
                 reg_conf = float(rp.get("regime_conf", 0.5))
@@ -2454,6 +2857,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             pred_meta_norm = pred_meta_norm * shrink
             p_up_meta = 0.5 * (1.0 + math.erf((pred_meta_norm / (meta_resid + 1e-12)) / math.sqrt(2.0)))
             conf_meta = max(0.01, min(0.99, p_up_meta if pred_meta_norm >= 0 else (1.0 - p_up_meta)))
+            meta_uncertainty_scale = _uncertainty_scale_from_prob(conf_meta)
             if stale.get("is_stale"):
                 conf_meta *= 0.5
             if drift_flag:
@@ -2481,6 +2885,7 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
                 meta_std_ret = float(meta_resid * meta_ewm_vol) if meta_normed else float(meta_resid)
             except Exception:
                 meta_std_ret = 0.0
+            meta_std_ret *= float(meta_uncertainty_scale)
             meta_band_fields = _prediction_bands(last_price, meta_ret, meta_std_ret, instr_meta=instr_meta)
             try:
                 model_uncertainty_rets.append(abs(float(meta_std_ret)))
@@ -2489,11 +2894,6 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             meta_note = "Meta ensemble" + (f" | Bias adj {meta_bias_adj * 10000.0:+.2f} bps" if abs(meta_bias_adj) > 1e-6 else "")
             meta_direction = "UP" if pred_meta_norm >= 0 else "DOWN"
             if not predictable_now:
-                pred_meta_norm = 0.0
-                meta_ret = 0.0
-                meta_price = _round_to_tick(last_price, instr_meta)
-                meta_direction = "-"
-                conf_meta = min(conf_meta, 0.35)
                 meta_note += " | Outside 4min predictability gate"
             meta_conf_pct = round(float(conf_meta * 100.0), 2)
             results_out["meta"] = {
@@ -2504,6 +2904,8 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
                 "pred_ret": float(meta_ret),
                 "pred_norm": float(pred_meta_norm),
                 "pred_std_norm": float(meta_resid),
+                "reliability_prob": round(float(conf_meta), 4),
+                "uncertainty_scale": round(float(meta_uncertainty_scale), 4),
                 "sig_bucket": "Strong" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 1.5 else "Medium" if (abs(pred_meta_norm) / (meta_resid + 1e-12)) >= 0.5 else "Weak",
                 **meta_band_fields,
                 **_direction_prob_fields(meta_direction, meta_conf_pct),
@@ -2568,21 +2970,13 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             consensus_conf *= 0.85
     except Exception:
         consensus_conf = 50.0
+    raw_consensus_conf = float(consensus_conf)
 
-    spread_frac = None
-    try:
-        if "ask" in df_latest.columns and "bid" in df_latest.columns:
-            spread = float(df_latest["ask"].iloc[-1] - df_latest["bid"].iloc[-1])
-            if spread > 0 and last_price > 0:
-                spread_frac = spread / last_price
-    except Exception:
-        spread_frac = None
-    cost_ret_est = 0.0
-    min_edge_floor = 0.0
-    try:
-        unc_mult = max(0.0, float(LIVE_UNCERTAINTY_EDGE_MULT))
-    except Exception:
-        unc_mult = 0.0
+    edge_inputs = _live_edge_floor_inputs(last_price, df_latest, instr_meta=instr_meta)
+    spread_frac = edge_inputs.get("spread_frac")
+    cost_ret_est = float(edge_inputs.get("cost_ret_est") or 0.0)
+    min_edge_floor = float(edge_inputs.get("min_edge_floor") or 0.0)
+    unc_mult = float(edge_inputs.get("uncertainty_mult") or 0.0)
     conformal_band = _conformal_abs_error_threshold(live_cal, quantile=0.80, min_n=40)
     live_abs_err_ret = _recent_live_abs_error(live_cal, min_n=20)
     live_uncertainty = None
@@ -2602,12 +2996,17 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
     except Exception:
         ensemble_uncertainty = float(member_uncertainty)
     combined_uncertainty = max(float(disagreement), float(ensemble_uncertainty))
-    if live_uncertainty is not None:
-        combined_uncertainty = float(math.sqrt((combined_uncertainty ** 2) + (float(live_uncertainty) ** 2)))
+    combined_uncertainty = _combine_uncertainty_estimates(
+        combined_uncertainty,
+        live_uncertainty,
+        reliability_prob=consensus_prob if "consensus_prob" in locals() else None,
+    )
+    raw_consensus_ret = float(consensus_ret)
     consensus_ret, shrink_factor = _posterior_shrink_return(consensus_ret, combined_uncertainty)
     combined_price = _round_to_tick(last_price * (1.0 + consensus_ret), instr_meta)
     uncertainty_penalty = unc_mult * max(0.0, combined_uncertainty)
-    edge_ret = abs(float(consensus_ret)) - uncertainty_penalty
+    raw_edge_ret = abs(float(raw_consensus_ret)) - (float(cost_ret_est) + float(uncertainty_penalty) + float(min_edge_floor))
+    edge_ret = abs(float(consensus_ret)) - (float(cost_ret_est) + float(uncertainty_penalty) + float(min_edge_floor))
     conformal_block = bool(conformal_band is not None and abs(float(consensus_ret)) <= float(conformal_band))
     if edge_ret <= 0.0:
         consensus_conf = min(float(consensus_conf), 35.0)
@@ -2615,9 +3014,9 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         edge_scale = edge_ret / max(1e-6, float(combined_uncertainty))
         conf_mult = max(0.35, min(1.15, 0.55 + (0.25 * edge_scale)))
         consensus_conf *= conf_mult
-    if not predictable_now:
-        edge_ret = min(float(edge_ret), 0.0)
-    consensus_conf *= (0.4 + (0.6 * max(0.0, min(1.0, shrink_factor))))
+    # Uncertainty already shrinks the return itself and is charged again in the live edge gate.
+    # Keep confidence sensitive to shrink, but avoid collapsing surviving signals a third time.
+    consensus_conf *= (0.60 + (0.40 * max(0.0, min(1.0, shrink_factor))))
     if conformal_block:
         consensus_conf = min(float(consensus_conf), 33.0)
         edge_ret = min(float(edge_ret), float(abs(consensus_ret) - float(conformal_band)))
@@ -2636,16 +3035,74 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         consensus_dir = "UP" if vote_dir > 0 else "DOWN"
     else:
         consensus_dir = "UP" if combined_price > last_price else "DOWN" if combined_price < last_price else "-"
-    if consensus_conf / 100.0 < NO_SIGNAL_CONF:
-        consensus_dir = "-"
-    if edge_ret <= 0.0:
-        consensus_dir = "-"
-    if conformal_block:
-        consensus_dir = "-"
-    if readiness_locked:
-        consensus_dir = "-"
-    if not predictable_now:
-        consensus_dir = "-"
+    raw_consensus_dir = str(consensus_dir or "-").upper()
+    if raw_consensus_dir not in {"UP", "DOWN"} and raw_consensus_ret != 0.0:
+        raw_consensus_dir = "UP" if raw_consensus_ret > 0.0 else "DOWN"
+    h10_summary = _predict_horizon_summary(
+        models_dict,
+        df_latest,
+        10,
+        instrument_key=instrument_key,
+        feature_frame=feat_frame,
+        feat_cache=feat_cache,
+    )
+    h30_summary = _predict_horizon_summary(
+        models_dict,
+        df_latest,
+        30,
+        instrument_key=instrument_key,
+        feature_frame=feat_frame,
+        feat_cache=feat_cache,
+    )
+    try:
+        h10 = None if not isinstance(h10_summary, dict) else float(h10_summary.get("mean"))
+    except Exception:
+        h10 = None
+    try:
+        h30 = None if not isinstance(h30_summary, dict) else float(h30_summary.get("mean"))
+    except Exception:
+        h30 = None
+    horizon_support = _stock_horizon_support(
+        raw_consensus_dir,
+        raw_consensus_ret,
+        meta_ewm_vol,
+        h10_summary,
+        h30_summary,
+    )
+    if bool(stock_horizon_blend) and edge_ret > 0.0:
+        try:
+            support_stage = str(horizon_support.get("stage") or "")
+        except Exception:
+            support_stage = ""
+        if support_stage in {"supportive", "confirmed"}:
+            consensus_conf += float(horizon_support.get("confidence_bonus", 0.0) or 0.0)
+    consensus_conf = max(1.0, min(99.0, float(consensus_conf)))
+    consensus_dir, direction_stage = _resolve_direction_stage(
+        raw_consensus_dir,
+        consensus_conf,
+        edge_ret,
+        conformal_block=conformal_block,
+        readiness_locked=readiness_locked,
+    )
+    try:
+        if bool(stock_horizon_blend):
+            align_score = float(horizon_support.get("align_score", 1.0) or 1.0)
+        else:
+            align = 0.0
+            align_models = 0
+            if h10 is not None:
+                align_models += 1
+                align += 1.0 if np.sign(h10) == np.sign(consensus_ret) else -1.0
+            if h30 is not None:
+                align_models += 1
+                align += 1.0 if np.sign(h30) == np.sign(consensus_ret) else -1.0
+            if align_models <= 0:
+                align_score = 1.0
+            else:
+                align_score = 0.5 + 0.25 * align
+                align_score = max(0.1, min(1.0, align_score))
+    except Exception:
+        align_score = 1.0
     consensus_note = "Weighted consensus"
     if stale_note:
         consensus_note += f" | {stale_note}"
@@ -2655,7 +3112,16 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         consensus_note += f" | Bias adj {consensus_bias_adj * 10000.0:+.2f} bps"
     if shrink_factor < 0.75:
         consensus_note += f" | Uncertainty shrink {shrink_factor:.2f}"
-    if consensus_dir == "-":
+    support_stage = str(horizon_support.get("stage") or "unavailable").lower()
+    if support_stage == "confirmed":
+        consensus_note += " | 10m/30m stock horizon confirms the lean"
+    elif support_stage == "supportive":
+        consensus_note += " | 10m/30m stock horizon supports the lean"
+    elif support_stage == "contrary":
+        consensus_note += " | 10m/30m stock horizon disagrees"
+    if direction_stage == "tentative":
+        consensus_note += " | Tentative direction only"
+    elif consensus_dir == "-":
         consensus_note += " | Low confidence"
     if edge_ret <= 0.0:
         consensus_note += " | Uncertainty-adjusted edge <= 0"
@@ -2669,33 +3135,6 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         consensus_note += f" | {readiness_reason}"
     if not predictable_now:
         consensus_note += " | Outside 4min predictability gate"
-    # Horizon alignment (optional)
-    h10 = _predict_horizon_norm(
-        models_dict,
-        df_latest,
-        10,
-        instrument_key=instrument_key,
-        feature_frame=feat_frame,
-        feat_cache=feat_cache
-    )
-    h30 = _predict_horizon_norm(
-        models_dict,
-        df_latest,
-        30,
-        instrument_key=instrument_key,
-        feature_frame=feat_frame,
-        feat_cache=feat_cache
-    )
-    try:
-        align = 0.0
-        if h10 is not None:
-            align += 1.0 if np.sign(h10) == np.sign(consensus_ret) else -1.0
-        if h30 is not None:
-            align += 1.0 if np.sign(h30) == np.sign(consensus_ret) else -1.0
-        align_score = 0.5 + 0.25 * align  # range roughly 0..1
-        align_score = max(0.1, min(1.0, align_score))
-    except Exception:
-        align_score = 0.5
 
     # Position sizing (vol targeting + regime confidence)
     try:
@@ -2716,9 +3155,18 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
         except Exception:
             signal_quality = 0.0
         quality_mult = max(0.0, min(1.0, signal_quality / (1.0 + signal_quality)))
+        quality_mult = max(0.25, min(1.0, math.sqrt(max(0.0, quality_mult))))
         position_size *= quality_mult
         if drift_flag:
             position_size *= 0.5
+        if bool(stock_horizon_blend):
+            try:
+                position_size *= float(horizon_support.get("size_mult", 1.0) or 1.0)
+            except Exception:
+                pass
+        raw_position_size = float(position_size)
+        if direction_stage == "tentative":
+            position_size *= float(TENTATIVE_DIRECTION_SIZE_MULT)
         if consensus_dir == "-":
             position_size = 0.0
         if edge_ret <= 0.0:
@@ -2727,43 +3175,67 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             position_size = 0.0
         if readiness_locked:
             position_size = 0.0
-        if not predictable_now:
-            position_size = 0.0
     except Exception:
         position_size = 0.0
+        raw_position_size = 0.0
 
     if readiness_locked:
         consensus_conf = min(float(consensus_conf), 33.0)
-    if not predictable_now:
-        consensus_ret = 0.0
-        combined_price = _round_to_tick(last_price, instr_meta)
-        consensus_conf = min(float(consensus_conf), 35.0)
     try:
         cons_std_ret = float(combined_uncertainty)
     except Exception:
         cons_std_ret = 0.0
     cons_band_fields = _prediction_bands(last_price, consensus_ret, cons_std_ret, instr_meta=instr_meta)
     consensus_conf_pct = round(float(consensus_conf), 2)
+    raw_consensus_conf_pct = round(float(raw_consensus_conf), 2)
+    raw_prob_fields = _direction_prob_fields(raw_consensus_dir, raw_consensus_conf_pct)
 
     results_out["consensus"] = {
         "direction": consensus_dir,
+        "direction_stage": direction_stage,
+        "raw_direction": raw_consensus_dir,
         "pred_price": float(round(combined_price, 4)),
         "confidence": consensus_conf_pct,
+        "raw_confidence": raw_consensus_conf_pct,
         "note": consensus_note,
         "position_size": round(float(position_size), 3),
+        "raw_position_size": round(float(raw_position_size), 3),
         "pred_ret": float(consensus_ret),
+        "raw_pred_ret": float(raw_consensus_ret),
         "edge_bps": round(float(edge_ret * 10000.0), 3),
+        "raw_edge_bps": round(float(raw_edge_ret * 10000.0), 3),
         "cost_bps_est": round(float(cost_ret_est * 10000.0), 3),
+        "uncertainty_penalty_bps": round(float(uncertainty_penalty * 10000.0), 3),
         "disagreement_bps": round(float(disagreement * 10000.0), 3),
         "model_uncertainty_bps": round(float(ensemble_uncertainty * 10000.0), 3),
         "uncertainty_bps": round(float(combined_uncertainty * 10000.0), 3),
         "effective_models": round(float(effective_models), 3) if effective_models else None,
         "shrink_factor": round(float(shrink_factor), 4),
+        "align_score": round(float(align_score), 3),
+        "horizon_support_stage": str(horizon_support.get("stage") or "unavailable"),
+        "horizon_support_score": round(float(horizon_support.get("score", 0.0) or 0.0), 4),
+        "horizon_support_direction": str(horizon_support.get("direction") or "-").upper(),
+        "horizon_blended_norm": round(float(horizon_support.get("blended_norm", 0.0) or 0.0), 4),
         "conformal_band_bps": round(float(conformal_band * 10000.0), 3) if conformal_band is not None else None,
         "live_abs_err_bps": round(float(live_abs_err_ret * 10000.0), 3) if live_abs_err_ret is not None else None,
         "sig_bucket": "Strong" if (abs(consensus_ret) / (combined_uncertainty + 1e-9)) >= 1.5 else "Medium" if (abs(consensus_ret) / (combined_uncertainty + 1e-9)) >= 0.5 else "Weak",
         **cons_band_fields,
         **_direction_prob_fields(consensus_dir, consensus_conf_pct),
+        "raw_p_up": raw_prob_fields.get("p_up"),
+        "raw_p_down": raw_prob_fields.get("p_down"),
+    }
+    results_out["_meta"]["signal_diagnostics"] = {
+        "raw_pred_ret_bps": round(float(raw_consensus_ret * 10000.0), 3),
+        "raw_edge_bps": round(float(raw_edge_ret * 10000.0), 3),
+        "post_shrink_pred_ret_bps": round(float(consensus_ret * 10000.0), 3),
+        "post_shrink_edge_bps": round(float(edge_ret * 10000.0), 3),
+        "cost_bps_est": round(float(cost_ret_est * 10000.0), 3),
+        "uncertainty_penalty_bps": round(float(uncertainty_penalty * 10000.0), 3),
+        "uncertainty_bps": round(float(combined_uncertainty * 10000.0), 3),
+        "shrink_factor": round(float(shrink_factor), 4),
+        "align_score": round(float(align_score), 3),
+        "horizon_support_stage": str(horizon_support.get("stage") or "unavailable"),
+        "horizon_support_score": round(float(horizon_support.get("score", 0.0) or 0.0), 4),
     }
 
     # Degenerate-output guard: near-identical model outputs are usually low-information snapshots.
@@ -2794,7 +3266,16 @@ def predict_4min(models_dict, df_latest, instrument_key: str = None, log_side_ef
             pass
 
     results_out["regime"] = rp
-    results_out["horizon"] = {"h10_norm": h10, "h30_norm": h30, "align_score": round(float(align_score), 3)}
+    results_out["horizon"] = {
+        "h10_norm": h10,
+        "h30_norm": h30,
+        "align_score": round(float(align_score), 3),
+        "support_stage": str(horizon_support.get("stage") or "unavailable"),
+        "support_direction": str(horizon_support.get("direction") or "-").upper(),
+        "support_score": round(float(horizon_support.get("score", 0.0) or 0.0), 4),
+        "blended_norm": round(float(horizon_support.get("blended_norm", 0.0) or 0.0), 4),
+        "rows": list(horizon_support.get("rows") or []),
+    }
     if log_side_effects:
         _log_prediction(instrument_key, last_price, results_out)
         # non-blocking calibration refresh to avoid latency spikes in prediction path
@@ -3456,6 +3937,7 @@ def _predict_mode_group(models_group, df_latest, instrument_key, rp, dominant_re
                 continue
         current_vol = max([v for v in vol_candidates if np.isfinite(v)] + [_vol_floor_from_meta(instr_meta)])
         combined_summary = _ensemble_summary_for_payload(payload, X, dominant_regime, dom_prob, comp_probs=comp_probs)
+        used_fallback_summary = False
         if combined_summary is None:
             fb = payload.get("fallback_model")
             if fb is None:
@@ -3466,11 +3948,15 @@ def _predict_mode_group(models_group, df_latest, instrument_key, rp, dominant_re
                     pred_std_norm = float(payload.get("meta", {}).get("resid_std", 1e-6))
                     pred_std_norm = max(pred_std_norm, 1e-6)
                     combined_summary = {"mean": pred_norm, "std": pred_std_norm, "q10": 0.0, "q50": pred_norm, "q90": 0.0, "p_up": float(pred_norm >= 0)}
+                    used_fallback_summary = True
                 except Exception:
                     combined_summary = None
             if combined_summary is None:
                 out[key] = {"direction": "-", "pred_price": "-", "confidence": "-", "note": "Ensemble not trained"}
                 continue
+        if used_fallback_summary:
+            combined_summary = _restore_summary_target_mean(combined_summary, payload)
+            combined_summary = _apply_fallback_return_calibration(combined_summary, payload.get("calibration"))
         pred_norm = combined_summary["mean"]
         pred_std_norm = combined_summary["std"]
         try:

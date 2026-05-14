@@ -1,0 +1,32 @@
+{
+  "cache_key": {
+    "bar_minutes": 2,
+    "cache_schema_version": 1,
+    "max_records": 500,
+    "slippage_pct": 0.0005,
+    "source": {
+      "mtime_ns": 1776446218862145092,
+      "path": "data/prices_QQQ.csv",
+      "size": 1001833
+    },
+    "source_window": {
+      "date_end": "2026-03-23T18:28:00+00:00",
+      "date_start": "2026-01-02T14:30:00+00:00",
+      "rows": 10348
+    },
+    "symbol": "QQQ",
+    "transaction_cost_per_trade": 0.0003
+  },
+  "cache_schema_version": 1,
+  "generated_at": "2026-05-06T17:11:11.580519+00:00",
+  "ledger_path": "data/model_experience_ledger_QQQ_sample.jsonl",
+  "quality": {
+    "records": 500,
+    "resolved": 499,
+    "unresolved": 1,
+    "verdict": "research_ready_small_sample"
+  },
+  "quality_report_path": "reports/model_experience_ledger_quality_QQQ.md",
+  "runner_status": "ok",
+  "status_report_path": "reports/model_experience_ledger_status.md"
+}

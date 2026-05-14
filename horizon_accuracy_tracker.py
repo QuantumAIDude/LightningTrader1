@@ -300,14 +300,9 @@ def _weekend_actual(prices: pd.DataFrame, instrument_key: str, target_week: str)
 def _append_history_rows(path: str, rows: list[dict]):
     if not rows:
         return
-    fieldnames = sorted(set().union(*(r.keys() for r in rows)))
-    write_header = (not os.path.exists(path)) or (os.path.getsize(path) == 0)
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if write_header:
-            writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k) for k in fieldnames})
+    existing = _read_history_rows_loose(path)
+    combined = list(existing) + list(rows)
+    _write_history_rows(path, combined)
 
 
 def _write_history_rows(path: str, rows: list[dict]):
@@ -322,11 +317,50 @@ def _write_history_rows(path: str, rows: list[dict]):
             writer.writerow({k: row.get(k) for k in fieldnames})
 
 
+def _read_history_rows_loose(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    out: list[dict] = []
+    try:
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            if not header:
+                return []
+            header = [str(col or "").strip() for col in header]
+            for row in reader:
+                if not row:
+                    continue
+                if len(row) == len(header):
+                    out.append({header[i]: row[i] for i in range(len(header))})
+                    continue
+                if "source" not in header and len(row) == len(header) + 1 and header[-1] == "target_key":
+                    payload = {header[i]: row[i] for i in range(len(header) - 1)}
+                    payload["source"] = row[-2]
+                    payload["target_key"] = row[-1]
+                    out.append(payload)
+                    continue
+                payload = {}
+                for i, key in enumerate(header):
+                    if i < len(header) - 1:
+                        payload[key] = row[i] if i < len(row) else None
+                    else:
+                        payload[key] = ",".join(row[i:]) if i < len(row) else None
+                out.append(payload)
+    except Exception:
+        logger.exception("Failed reading loose horizon history")
+        return []
+    return out
+
+
 def _load_history(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
     try:
-        df = pd.read_csv(path)
+        rows = _read_history_rows_loose(path)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
         if "resolved_ts" in df.columns:
             df["resolved_ts"] = pd.to_datetime(df["resolved_ts"], utc=True, errors="coerce")
         for col in ("abs_error", "pct_error", "signed_error", "pred_price", "actual_price"):

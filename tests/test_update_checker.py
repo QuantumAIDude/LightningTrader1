@@ -69,6 +69,46 @@ class UpdateCheckerTests(unittest.TestCase):
             uc._fetch_latest_release = old_fetch
             uc._read_cache = old_read
 
+    def test_select_release_asset_prefers_platform_asset(self):
+        release = {
+            "latest_version": "2.0.0",
+            "repo": "owner/repo",
+            "assets": [
+                {"name": "Lightning Trader Terminal-Windows-v2.0.0.zip", "browser_download_url": "https://example.com/win.zip"},
+                {"name": "Lightning Trader Terminal-macOS-v2.0.0.zip", "browser_download_url": "https://example.com/mac.zip"},
+            ],
+        }
+
+        asset = uc.select_release_asset(release, platform_name="darwin")
+
+        self.assertEqual(asset["kind"], "asset")
+        self.assertIn("macOS", asset["name"])
+        self.assertEqual(asset["url"], "https://example.com/mac.zip")
+
+    def test_download_latest_release_uses_asset_download(self):
+        old_fetch = uc._fetch_latest_release
+        old_dir = uc._download_dir
+        old_download = uc._download_url_to_file
+        try:
+            uc._fetch_latest_release = lambda: {
+                "latest_version": "9.9.9",
+                "release_url": "https://example.com/release",
+                "repo": "owner/repo",
+                "assets": [{"name": "Lightning-v9.9.9.zip", "browser_download_url": "https://example.com/app.zip", "size": 12}],
+            }
+            uc._download_dir = lambda: uc.Path(".")
+            uc._download_url_to_file = lambda url, destination: 12
+
+            result = uc.download_latest_release(force=True, platform_name="darwin")
+
+            self.assertEqual(result["status"], "downloaded")
+            self.assertEqual(result["latest_version"], "9.9.9")
+            self.assertTrue(result["path"].endswith("Lightning-v9.9.9.zip"))
+        finally:
+            uc._fetch_latest_release = old_fetch
+            uc._download_dir = old_dir
+            uc._download_url_to_file = old_download
+
 
 if __name__ == "__main__":
     unittest.main()

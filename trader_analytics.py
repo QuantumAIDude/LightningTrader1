@@ -13,14 +13,18 @@ from catalyst_providers import get_catalyst_provider_snapshot
 from config import DATA_DIR, DEFAULT_INSTRUMENT, INSTRUMENTS
 from execution_engine import get_execution_dashboard_snapshot
 from event_analytics import get_event_snapshot
+from instrument_profile import build_instrument_meta
 from liquidity_analytics import get_liquidity_snapshot
 from market_context import load_context_daily_history
 from macro_events import get_macro_event_snapshot
-from news_pipeline import load_recent_headlines, news_archive_coverage
+from news_pipeline import build_news_runtime_summary, get_news_health, load_recent_headlines, news_archive_coverage
+from onboarding_jobs import summarize_onboarding_state
 from options_analytics import get_options_snapshot
 from opportunity_scanner import get_opportunity_scan
 from performance_analytics import get_performance_snapshot
+from readiness_tracker import load_readiness_state, summarize_deployment_readiness
 from replay_engine import get_replay_dashboard_snapshot
+from symbol_lifecycle import build_symbol_lifecycle_snapshot, lifecycle_rows
 from trader_profiles import get_trader_profile
 
 
@@ -36,7 +40,7 @@ def _safe_float(value):
 
 def _instrument_meta(instrument_key: str | None) -> dict:
     key = str(instrument_key or DEFAULT_INSTRUMENT or "").upper()
-    return INSTRUMENTS.get(key, {})
+    return build_instrument_meta(key, overrides=INSTRUMENTS.get(key, {}))
 
 
 def _tz_index(index_like, tz: str):
@@ -124,6 +128,17 @@ def _news_info_rows(rows: list[tuple[str, str, str]] | None, reason: str) -> lis
     if rows:
         return rows
     return [("-", "info", _clean_reason_text(reason))]
+
+
+def _news_event_tag(item: dict) -> str:
+    tone = str(item.get("label") or item.get("signal_direction") or "neutral").lower()
+    event = str(item.get("event_label") or item.get("event_type") or "General").strip()
+    scope = str(item.get("relevance_scope_label") or item.get("relevance_scope") or "Relevant").strip()
+    impact = _safe_float(item.get("impact_score")) or 0.0
+    impact_label = "H" if impact >= 0.70 else "M" if impact >= 0.40 else "L"
+    event_short = event[:10]
+    scope_short = scope.split("/", 1)[0][:3]
+    return f"{tone[:3]}/{scope_short}/{event_short}/{impact_label}"
 
 
 def _avg_prediction_price(block: dict, key: str = "pred_price") -> float | None:
@@ -277,11 +292,21 @@ def _signal_rows(df: pd.DataFrame, instrument_key: str, options_snapshot: dict |
 
 def _stack_rows(df: pd.DataFrame, instrument_key: str, options_snapshot: dict | None = None, event_snapshot: dict | None = None) -> list[tuple[str, str, str]]:
     symbol = str(instrument_key or "").upper()
-    rows = []
-    intraday_rows = int(len(df)) if df is not None else 0
-    long_daily = _load_long_daily_history(instrument_key)
-    long_rows = int(len(long_daily)) if long_daily is not None else 0
-    rows.append(("History", f"{intraday_rows} bars", f"{long_rows} daily"))
+    try:
+        news_health = get_news_health(symbol)
+    except Exception:
+        news_health = {}
+    onboarding = summarize_onboarding_state(symbol)
+    readiness_state = load_readiness_state(symbol) or {}
+    deployment = summarize_deployment_readiness(symbol, state=readiness_state, news_health=news_health)
+    lifecycle = build_symbol_lifecycle_snapshot(
+        symbol,
+        runtime_bundle={"df": df, "news_health": news_health},
+        onboarding_summary=onboarding,
+        deployment_summary=deployment,
+        news_health=news_health,
+    )
+    rows = lifecycle_rows(lifecycle)
     try:
         coverage = news_archive_coverage(symbol)
     except Exception:
@@ -290,33 +315,10 @@ def _stack_rows(df: pd.DataFrame, instrument_key: str, options_snapshot: dict | 
         cov_ratio = _safe_float(coverage.get("coverage_ratio"))
         active = coverage.get("active_days")
         relevant = coverage.get("relevant_rows")
-        rows.append(("News Depth", f"{active or 0} days", f"Cov {_fmt_pct(cov_ratio)} | Rows {relevant or 0}"))
-    meta = _instrument_meta(instrument_key)
-    ctx_symbols = meta.get("context_daily_symbols", {}) if isinstance(meta, dict) else {}
-    ctx_available = 0
-    ctx_total = 0
-    for role in ("market", "sector", "vol", "lead_fut", "rates"):
-        if role not in ctx_symbols:
-            continue
-        ctx_total += 1
-        hist = load_context_daily_history(symbol, role, allow_remote=False)
-        if hist is not None and not hist.empty:
-            ctx_available += 1
-    rows.append(("Context Feeds", f"{ctx_available}/{max(1, ctx_total)}", "Ready" if ctx_available == ctx_total and ctx_total > 0 else "Partial"))
-    opt_status = str((options_snapshot or {}).get("status") or "unavailable")
-    opt_source = str((options_snapshot or {}).get("source") or "-")
-    rows.append(("Options Feed", opt_status, opt_source))
-    event = event_snapshot if isinstance(event_snapshot, dict) else get_event_snapshot(symbol)
-    evt_ts = event.get("next_earnings") if isinstance(event, dict) else None
-    evt_dte = _safe_float((event or {}).get("days_to_earnings")) if isinstance(event, dict) else None
-    if evt_ts:
-        try:
-            evt_label = pd.Timestamp(evt_ts).strftime("%Y-%m-%d")
-        except Exception:
-            evt_label = str(evt_ts)
-        rows.append(("Next Earnings", evt_label, f"{evt_dte:.1f}d" if evt_dte is not None else str(event.get("source", "-"))))
-    aliases = meta.get("news_aliases", []) if isinstance(meta, dict) else []
-    rows.append(("News Query", str(len(aliases)) if isinstance(aliases, list) else "1", str(aliases[0])[:20] if aliases else symbol))
+        rows.insert(
+            1,
+            ("News Depth", f"{active or 0} days", f"Cov {_fmt_pct(cov_ratio)} | Rows {relevant or 0}"),
+        )
     return rows[:6]
 
 
@@ -512,6 +514,7 @@ def _options_rows(symbol: str, spot_price: float | None) -> tuple[dict, list[tup
         rows.append(("IV Skew", _fmt_pct(snap.get("iv_skew_put_minus_call")), "Put IV - Call IV"))
         rows.append(("IV Rank / Pctl", f"{_fmt_pct(snap.get('iv_rank'))} / {_fmt_pct(snap.get('iv_percentile'))}", f"IV/RV20 {(_safe_float(snap.get('iv_vs_rv20')) or 0.0):.2f}x | hist {int(_safe_float(snap.get('history_points')) or 0)}"))
         rows.append(("Call / Put Wall", f"{_fmt_dollar(snap.get('call_wall_oi'))} / {_fmt_dollar(snap.get('put_wall_oi'))}", f"Max pain {_fmt_dollar(snap.get('max_pain'))}"))
+        rows.append(("Autonomy Use", "Context only", "Use the options panel for context; stock is the only autonomy-ready intraday path right now"))
     else:
         reason = str(snap.get("reason") or snap.get("status") or "unavailable")
         if "Could not resolve host" in reason or "curl:" in reason:
@@ -519,28 +522,58 @@ def _options_rows(symbol: str, spot_price: float | None) -> tuple[dict, list[tup
         elif len(reason) > 48:
             reason = reason[:45] + "..."
         rows.append(("Options", "-", f"{reason} | {str(snap.get('source_kind') or snap.get('source') or 'unavailable')}"))
+        rows.append(("Autonomy Use", "Blocked", "Without a valid options surface, options should not influence automated expression choice"))
     return snap, rows, card
 
 
-def _news_rows(symbol: str, headlines: list[dict] | None = None) -> tuple[list[tuple[str, str, str]], str]:
+def _news_rows(
+    symbol: str,
+    headlines: list[dict] | None = None,
+    news_health: dict | None = None,
+    news_meta: dict | None = None,
+    news_runtime: dict | None = None,
+) -> tuple[list[tuple[str, str, str]], str, str]:
     headlines = headlines if headlines is not None else load_recent_headlines(symbol, limit=6)
     rows = []
+    health = news_health if isinstance(news_health, dict) else get_news_health(symbol)
+    meta = news_meta if isinstance(news_meta, dict) else {}
+    runtime = news_runtime if isinstance(news_runtime, dict) else build_news_runtime_summary(symbol, headlines=headlines, news_health=health)
+    layer_a = dict(runtime.get("layer_a") or {})
+    layer_b = dict(runtime.get("layer_b") or {})
+    profile = dict(runtime.get("profile") or {})
+    headline_state = str((health or {}).get("headline_state") or "missing")
+    history_state = str((health or {}).get("history_state") or "missing")
     if not headlines:
-        return rows, "News: unavailable"
+        card = "News: unavailable" if headline_state in {"missing", "failed"} else f"News: {headline_state.replace('_', ' ')}"
+        detail = str(meta.get("summary") or layer_a.get("summary") or f"{headline_state.replace('_', ' ').title()} | hist {history_state.replace('_', ' ')}")
+        return rows, card, detail
     scores = []
     fresh_hours = []
     political = []
+    impact_scores = []
+    high_impact = 0
     for item in headlines:
         ts = item.get("published_at")
         age = _age_text(ts)
-        label = str(item.get("label") or "neutral").lower()
+        label = _news_event_tag(item)
         head = str(item.get("headline") or "").strip()
         if len(head) > 88:
             head = f"{head[:85]}..."
-        rows.append((age, label[:8] or "-", head))
+        event_label = str(item.get("event_label") or item.get("event_type") or "").strip()
+        horizon = str(item.get("impact_horizon") or "").strip()
+        scope = str(item.get("relevance_scope_label") or item.get("relevance_scope") or "").strip()
+        note = str(item.get("signal_note") or "").strip()
+        tail = " | ".join(part for part in (scope, event_label, horizon, note[:40] if note else "") if part)
+        headline_text = head if not tail else f"{head} [{tail}]"
+        rows.append((age, label[:16] or "-", headline_text))
         sc = _safe_float(item.get("score"))
         if sc is not None:
             scores.append(sc)
+        impact = _safe_float(item.get("impact_score"))
+        if impact is not None:
+            impact_scores.append(impact)
+            if impact >= 0.45:
+                high_impact += 1
         political.append(1.0 if (_safe_float(item.get("political_relevance")) or 0.0) >= 0.25 else 0.0)
         try:
             tsv = pd.Timestamp(ts)
@@ -552,44 +585,74 @@ def _news_rows(symbol: str, headlines: list[dict] | None = None) -> tuple[list[t
     sent_mean = float(np.mean(scores)) if scores else None
     fresh = min(fresh_hours) if fresh_hours else None
     pol_share = float(np.mean(political)) if political else None
+    impact_mean = float(np.mean(impact_scores)) if impact_scores else None
+    headline_label = "News"
+    if headline_state not in {"ok", "thin"}:
+        headline_label = f"News {headline_state.replace('_', ' ').title()}"
+    elif high_impact > 0:
+        headline_label = f"News {high_impact} hi-impact"
     if fresh is not None:
-        meta = f"News {len(rows)} | Sent {_fmt_pct(sent_mean)} | Pol {_fmt_pct(pol_share)} | Fresh {fresh:.1f}h"
+        card = f"{headline_label} | Fresh {fresh:.1f}h"
     else:
-        meta = f"News {len(rows)} items"
-    return rows, meta
+        card = f"{headline_label} | {len(rows)} items"
+    detail_bits = []
+    if sent_mean is not None:
+        detail_bits.append(f"sent {_fmt_pct(sent_mean)}")
+    if impact_mean is not None:
+        detail_bits.append(f"impact {_fmt_pct(impact_mean)}")
+    detail_bits.append(f"pol {_fmt_pct(pol_share)}")
+    if layer_a.get("summary"):
+        detail_bits.append(str(layer_a.get("summary")))
+    if str(layer_b.get("status") or "disabled") != "disabled":
+        detail_bits.append(f"layer B {str(layer_b.get('status') or '-')}")
+    detail_bits.append(f"{str(profile.get('instrument_kind') or 'equity').title()} / {str(profile.get('sector') or 'Broad Market')}")
+    if history_state != "ready":
+        detail_bits.append(f"hist {history_state.replace('_', ' ')}")
+    summary = str(meta.get("summary") or "")
+    if summary:
+        detail_bits.append(summary)
+    return rows, card, " | ".join(bit for bit in detail_bits if bit)
 
 
 def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: dict | None = None, profile_name: str | None = None) -> dict:
     if df is None or df.empty:
+        lifecycle = build_symbol_lifecycle_snapshot(str(instrument_key or "").upper())
+        stack_rows = lifecycle_rows(lifecycle)
+        quality_rows = [
+            ("Operator State", lifecycle.get("operator_state_label") or "-", lifecycle.get("operator_state_detail") or "-"),
+            ("Evidence State", lifecycle.get("evidence_state_label") or "-", lifecycle.get("evidence_state_detail") or "-"),
+            ("Next Requirement", lifecycle.get("next_requirement_category") or "-", lifecycle.get("primary_next_requirement") or lifecycle.get("onboarding_summary") or "-"),
+        ]
         return {
-            "setup_card": "Alignment: unavailable",
-            "setup_detail": "No data",
+            "setup_card": f"Lifecycle: {lifecycle.get('lifecycle_label') or 'Unavailable'}",
+            "setup_detail": lifecycle.get("lifecycle_detail") or "No local data",
             "vol_card": "Volatility: unavailable",
-            "vol_detail": "No data",
+            "vol_detail": lifecycle.get("data_state_detail") or "No data",
             "options_card": "Options: unavailable",
-            "options_detail": "No data",
-            "news_card": "News: unavailable",
-            "news_detail": "No data",
-            "market_rows": [],
-            "breadth_rows": [],
-            "macro_rows": [],
-            "liquidity_rows": [],
-            "catalyst_rows": [],
-            "signal_rows": [],
-            "stack_rows": [],
+            "options_detail": lifecycle.get("model_state_detail") or "No data",
+            "news_card": f"News: {lifecycle.get('news_state_label') or 'unavailable'}",
+            "news_detail": lifecycle.get("news_state_detail") or "No data",
+            "market_rows": [("Status", "-", lifecycle.get("data_state_detail") or "No local data loaded")],
+            "breadth_rows": [("Status", "-", lifecycle.get("evidence_state_detail") or "No breadth context available")],
+            "macro_rows": [("Status", "-", lifecycle.get("operator_state_detail") or "No macro context available")],
+            "liquidity_rows": [("Status", "-", lifecycle.get("data_state_detail") or "No liquidity context available")],
+            "catalyst_rows": [("Status", "-", lifecycle.get("news_state_detail") or "No catalyst context available")],
+            "signal_rows": [("Ticker Lifecycle", lifecycle.get("lifecycle_label") or "-", lifecycle.get("workspace_summary") or "-")],
+            "stack_rows": stack_rows,
             "levels_rows": [],
             "options_rows": [],
-            "news_rows": [],
-            "action_card": "Action: unavailable",
-            "action_detail": "No data",
-            "quality_card": "Quality: unavailable",
-            "quality_detail": "No data",
+            "news_rows": [("-", "info", lifecycle.get("news_state_detail") or "No news context staged")],
+            "action_card": f"Action: {lifecycle.get('operator_state_label') or 'Unavailable'}",
+            "action_detail": lifecycle.get("operator_state_detail") or "No data",
+            "quality_card": f"Quality: {lifecycle.get('evidence_state_label') or 'Unavailable'}",
+            "quality_detail": lifecycle.get("evidence_state_detail") or "No data",
             "probability_rows": [],
-            "quality_rows": [],
-            "setup_rows": [],
+            "quality_rows": quality_rows,
+            "setup_rows": [("Next Requirement", lifecycle.get("next_requirement_category") or "-", lifecycle.get("primary_next_requirement") or lifecycle.get("onboarding_summary") or "-")],
+            "decision_rows": [],
             "scenario_rows": [],
             "invalidation_rows": [],
-            "reliability_rows": [],
+            "reliability_rows": [("Deployment", lifecycle.get("stage_label") or "-", f"{lifecycle.get('rollout_label') or '-'} | {lifecycle.get('symbol_maturity_label') or '-'}")],
             "execution_rows": [],
             "portfolio_rows": [],
             "performance_rows": [],
@@ -597,12 +660,12 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
             "alerts_rows": [],
             "opportunity_rows": [],
             "profile_card": "Profile: unavailable",
-            "profile_detail": "No data",
+            "profile_detail": lifecycle.get("workspace_summary") or "No data",
             "broker_card": "Broker: unavailable",
-            "broker_detail": "No data",
+            "broker_detail": lifecycle.get("operator_state_detail") or "No data",
             "replay_card": "Replay: unavailable",
             "replay_detail": "No data",
-            "advisory_meta": {},
+            "advisory_meta": {"deployment_meta": lifecycle},
             "execution_meta": {},
             "performance_meta": {},
             "replay_meta": {},
@@ -683,14 +746,16 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
     except Exception as exc:
         section_errors["news"] = _clean_reason_text(exc, "News store unavailable")
         news_items = []
-
     try:
-        news_rows, news_card = _news_rows(symbol, headlines=news_items)
+        news_health = get_news_health(symbol)
     except Exception as exc:
-        section_errors["news"] = _clean_reason_text(exc, "News summary unavailable")
-        news_rows, news_card = [], "News: unavailable"
-    news_rows = _news_info_rows(news_rows, section_errors.get("news", "No local headlines yet; feed will populate after refresh"))
-    news_detail = str(news_rows[0][2]) if news_rows else "No local headlines yet"
+        section_errors["news_health"] = _clean_reason_text(exc, "News health unavailable")
+        news_health = {"status": "error", "headline_state": "failed", "history_state": "missing", "last_reason": section_errors["news_health"]}
+    try:
+        news_runtime = build_news_runtime_summary(symbol, headlines=news_items, news_health=news_health)
+    except Exception as exc:
+        section_errors["news_runtime"] = _clean_reason_text(exc, "News routing summary unavailable")
+        news_runtime = {}
 
     try:
         signal_rows = _signal_rows(df, instrument_key, options_snapshot=opt_snap)
@@ -714,6 +779,7 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
             options_snapshot=opt_snap,
             event_snapshot=event_snapshot,
             news_items=news_items,
+            news_health=news_health,
             macro_snapshot=macro_snapshot,
             breadth_snapshot=breadth_snapshot,
             liquidity_snapshot=liquidity_snapshot,
@@ -729,6 +795,7 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
             "probability_rows": [],
             "quality_rows": [],
             "setup_rows": [],
+            "decision_rows": [],
             "scenario_rows": [],
             "invalidation_rows": [],
             "reliability_rows": [],
@@ -739,11 +806,41 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
             "quality_meta": {},
             "plan_meta": {},
             "pred_state": {},
+            "news_meta": {},
             "macro_meta": macro_snapshot if isinstance(macro_snapshot, dict) else {},
             "breadth_meta": breadth_snapshot if isinstance(breadth_snapshot, dict) else {},
             "liquidity_meta": liquidity_snapshot if isinstance(liquidity_snapshot, dict) else {},
             "catalyst_meta": catalyst_snapshot if isinstance(catalyst_snapshot, dict) else {},
+            "signal_translation": {},
         }
+    signal_translation = dict(advisory.get("signal_translation") or {})
+    if signal_translation:
+        signal_rows = [
+            (
+                "Trader Lens",
+                str(signal_translation.get("headline") or "-"),
+                str(signal_translation.get("detail") or "-"),
+            )
+        ] + list(signal_rows or [])
+
+    try:
+        news_rows, news_card, news_detail = _news_rows(
+            symbol,
+            headlines=news_items,
+            news_health=news_health,
+            news_meta=advisory.get("news_meta"),
+            news_runtime=news_runtime or advisory.get("news_runtime"),
+        )
+    except Exception as exc:
+        section_errors["news"] = _clean_reason_text(exc, "News summary unavailable")
+        news_rows, news_card, news_detail = [], "News: unavailable", section_errors["news"]
+    news_rows = _news_info_rows(
+        news_rows,
+        section_errors.get("news")
+        or str((news_health or {}).get("last_reason") or "No local headlines yet; feed will populate after refresh"),
+    )
+    if not news_detail:
+        news_detail = str(news_rows[0][2]) if news_rows else "No local headlines yet"
 
     try:
         execution_snapshot = get_execution_dashboard_snapshot(symbol, current_price=price, advisory=advisory, profile_name=profile.get("key"))
@@ -847,8 +944,9 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
         "Signal Quality",
         section_errors.get("advisory", "Quality analysis unavailable right now"),
     )
+    decision_rows = list(advisory.get("decision_rows") or [])
     setup_rows = _info_rows(
-        list(advisory.get("setup_rows") or []),
+        decision_rows + list(advisory.get("setup_rows") or []),
         "Trade Plan",
         section_errors.get("advisory", "No actionable setup summary yet"),
     )
@@ -925,6 +1023,7 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
         "probability_rows": probability_rows,
         "quality_rows": quality_rows,
         "setup_rows": setup_rows,
+        "decision_rows": decision_rows,
         "scenario_rows": scenario_rows,
         "invalidation_rows": invalidation_rows,
         "reliability_rows": reliability_rows,
@@ -941,6 +1040,7 @@ def build_trader_dashboard(df: pd.DataFrame, instrument_key: str, predictions: d
         "replay_card": replay_snapshot.get("card", "Replay: unavailable"),
         "replay_detail": replay_snapshot.get("detail", "No replay session"),
         "advisory_meta": advisory,
+        "deployment_meta": advisory.get("deployment_meta") or summarize_deployment_readiness(symbol, state=load_readiness_state(symbol) or {}),
         "execution_meta": execution_snapshot,
         "performance_meta": performance_snapshot,
         "replay_meta": replay_snapshot,

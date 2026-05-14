@@ -10,24 +10,11 @@ import os
 
 from config import INSTRUMENTS_FILE, INSTRUMENTS
 from instrument_onboarding import ensure_runtime_instruments
+from instrument_profile import build_instrument_meta
 
 
 def _default_equity_meta(symbol: str) -> dict:
-    sym = str(symbol or "").upper()
-    return {
-        "type": "equity",
-        "alpaca": sym,
-        "yahoo": sym,
-        "tz": "America/New_York",
-        "session_open_minute": 9 * 60 + 30,
-        "session_close_minute": 16 * 60,
-        "tick_size": 0.01,
-        "vol_floor": 0.00025,
-        "max_abs_ret_mult": 6.0,
-        "stale_multiplier": 3.5,
-        "closed_max_stale_hours": 80.0,
-        "target_vol": 0.004,
-    }
+    return build_instrument_meta(symbol)
 
 
 def _load_file(path: str) -> dict:

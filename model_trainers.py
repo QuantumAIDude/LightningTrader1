@@ -412,7 +412,8 @@ def train_all_models(
         max_runtime_sec: float = None,
         train_horizons: bool = True,
         progress_cb=None,
-        modes_filter: list[str] | None = None
+        modes_filter: list[str] | None = None,
+        persist: bool = True,
 ):
     """ Train models across configured windows and save payloads. """
     start_ts = None
@@ -1431,39 +1432,40 @@ def train_all_models(
         except Exception:
             pass
         # Persist models & regime payload
-        try:
-            # Instrument-scoped model files (avoid cross-instrument overwrite)
-            _atomic_joblib_dump(models["base"], _model_path("base", mode, instr_key))
-            _atomic_joblib_dump(models["forest"], _model_path("forest", mode, instr_key))
-            _atomic_joblib_dump(models["boost"], _model_path("boost", mode, instr_key))
-            _atomic_joblib_dump(models["extra_trees"], _model_path("extra_trees", mode, instr_key))
+        if persist:
+            try:
+                # Instrument-scoped model files (avoid cross-instrument overwrite)
+                _atomic_joblib_dump(models["base"], _model_path("base", mode, instr_key))
+                _atomic_joblib_dump(models["forest"], _model_path("forest", mode, instr_key))
+                _atomic_joblib_dump(models["boost"], _model_path("boost", mode, instr_key))
+                _atomic_joblib_dump(models["extra_trees"], _model_path("extra_trees", mode, instr_key))
 
-            # Optional backward-compatible legacy filenames for DEFAULT instrument only
-            if instr_key == DEFAULT_INSTRUMENT and SAVE_LEGACY_MODEL_FILES:
-                try:
-                    _atomic_joblib_dump(models["base"], os.path.join(MODEL_DIR, f"base_{mode}.pkl"))
-                    _atomic_joblib_dump(models["forest"], os.path.join(MODEL_DIR, f"forest_{mode}.pkl"))
-                    _atomic_joblib_dump(models["boost"], os.path.join(MODEL_DIR, f"boost_{mode}.pkl"))
-                    _atomic_joblib_dump(models["extra_trees"], os.path.join(MODEL_DIR, f"extra_trees_{mode}.pkl"))
-                    if mode == "4min":
-                        _atomic_joblib_dump(models["base"], os.path.join(MODEL_DIR, BASE_MODEL_FILE))
-                        _atomic_joblib_dump(models["forest"], os.path.join(MODEL_DIR, FOREST_MODEL_FILE))
-                        _atomic_joblib_dump(models["boost"], os.path.join(MODEL_DIR, BOOST_MODEL_FILE))
-                        _atomic_joblib_dump(models["extra_trees"], os.path.join(MODEL_DIR, EXTRA_TREES_MODEL_FILE))
-                except Exception:
-                    logger.exception("Failed to persist legacy model filenames")
-
-            if meta_payload is not None:
-                meta_path = _model_path("meta", "4min", instr_key) if mode == "4min" else os.path.join(MODEL_DIR, META_MODEL_FILE)
-                _atomic_joblib_dump(meta_payload, meta_path)
-            if mode == "4min" and regime_payload is not None:
-                regime_path = _model_path("regime", "4min", instr_key)
-                _atomic_joblib_dump(regime_payload, regime_path)
-                # optional legacy regime path for default instrument
+                # Optional backward-compatible legacy filenames for DEFAULT instrument only
                 if instr_key == DEFAULT_INSTRUMENT and SAVE_LEGACY_MODEL_FILES:
-                    _atomic_joblib_dump(regime_payload, os.path.join(MODEL_DIR, REGIME_MODEL_FILE))
-        except Exception:
-            logger.exception("Failed to persist models")
+                    try:
+                        _atomic_joblib_dump(models["base"], os.path.join(MODEL_DIR, f"base_{mode}.pkl"))
+                        _atomic_joblib_dump(models["forest"], os.path.join(MODEL_DIR, f"forest_{mode}.pkl"))
+                        _atomic_joblib_dump(models["boost"], os.path.join(MODEL_DIR, f"boost_{mode}.pkl"))
+                        _atomic_joblib_dump(models["extra_trees"], os.path.join(MODEL_DIR, f"extra_trees_{mode}.pkl"))
+                        if mode == "4min":
+                            _atomic_joblib_dump(models["base"], os.path.join(MODEL_DIR, BASE_MODEL_FILE))
+                            _atomic_joblib_dump(models["forest"], os.path.join(MODEL_DIR, FOREST_MODEL_FILE))
+                            _atomic_joblib_dump(models["boost"], os.path.join(MODEL_DIR, BOOST_MODEL_FILE))
+                            _atomic_joblib_dump(models["extra_trees"], os.path.join(MODEL_DIR, EXTRA_TREES_MODEL_FILE))
+                    except Exception:
+                        logger.exception("Failed to persist legacy model filenames")
+
+                if meta_payload is not None:
+                    meta_path = _model_path("meta", "4min", instr_key) if mode == "4min" else os.path.join(MODEL_DIR, META_MODEL_FILE)
+                    _atomic_joblib_dump(meta_payload, meta_path)
+                if mode == "4min" and regime_payload is not None:
+                    regime_path = _model_path("regime", "4min", instr_key)
+                    _atomic_joblib_dump(regime_payload, regime_path)
+                    # optional legacy regime path for default instrument
+                    if instr_key == DEFAULT_INSTRUMENT and SAVE_LEGACY_MODEL_FILES:
+                        _atomic_joblib_dump(regime_payload, os.path.join(MODEL_DIR, REGIME_MODEL_FILE))
+            except Exception:
+                logger.exception("Failed to persist models")
 
         if meta_payload is not None:
             models["meta"] = meta_payload
@@ -1540,6 +1542,7 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
     price_mae_dollars = []
     price_window_ratio = []
     price_window_hit_rate = []
+    fold_details = []
 
     def _optimize_signal_threshold(pred_train, y_train_arr, default_thr: float) -> float:
         try:
@@ -1963,6 +1966,46 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
                 sharpes.append(float("nan"))
         except Exception:
             sharpes.append(float("nan"))
+        try:
+            test_index = pd.to_datetime(DF.iloc[test_start:test_end].index, utc=True, errors="coerce")
+            instr_meta = INSTRUMENTS.get(str(instrument_key or DEFAULT_INSTRUMENT).upper(), {}) if isinstance(INSTRUMENTS, dict) else {}
+            tz = str(instr_meta.get("tz") or "America/New_York")
+            local_index = test_index.tz_convert(tz)
+            bucket_returns = {"AM": 0.0, "Midday": 0.0, "PM": 0.0}
+            for idx_local, gross_ret in zip(local_index, np.asarray(pos * realized, dtype=float)):
+                if pd.isna(idx_local):
+                    continue
+                hour = int(idx_local.hour)
+                bucket = "AM" if hour < 11 else "Midday" if hour < 14 else "PM"
+                bucket_returns[bucket] = float(bucket_returns.get(bucket, 0.0) + float(gross_ret))
+        except Exception:
+            bucket_returns = {"AM": float("nan"), "Midday": float("nan"), "PM": float("nan")}
+        try:
+            long_return = float(np.nansum(np.where(np.asarray(pos) > 0.0, np.asarray(pos) * realized, 0.0)))
+            short_return = float(np.nansum(np.where(np.asarray(pos) < 0.0, np.asarray(pos) * realized, 0.0)))
+        except Exception:
+            long_return = float("nan")
+            short_return = float("nan")
+        fold_details.append(
+            {
+                "fold": int(i),
+                "train_end": str(DF.index[train_end_purged - 1]) if train_end_purged - 1 >= 0 else None,
+                "test_start": str(DF.index[test_start]) if test_start < len(DF.index) else None,
+                "test_end": str(DF.index[test_end - 1]) if test_end - 1 < len(DF.index) else None,
+                "signal_family": best_name,
+                "signal_threshold": float(best_thr),
+                "net_return": float(net_return),
+                "trade_count": int(st_test.get("trades") or 0),
+                "active_fraction": float(st_test.get("active") or 0.0),
+                "directional_acc": float(st_test.get("dir_acc") or 0.0),
+                "long_return": long_return,
+                "short_return": short_return,
+                "time_bucket_returns": bucket_returns,
+                "price_mae_dollars": price_mae_dollars[-1] if price_mae_dollars else float("nan"),
+                "price_window_ratio": price_window_ratio[-1] if price_window_ratio else float("nan"),
+                "price_window_hit_rate": price_window_hit_rate[-1] if price_window_hit_rate else float("nan"),
+            }
+        )
     return {
         "folds": len(mae_base),
         "mae_base": mae_base,
@@ -1980,4 +2023,5 @@ def walk_forward_validate(df, n_splits=10, include_transaction_costs=True, instr
         "majority_direction_acc": majority_direction_acc,
         "majority_direction_samples": majority_direction_samples,
         "majority_direction_ties": majority_direction_ties,
+        "fold_details": fold_details,
     }

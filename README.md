@@ -1,4 +1,4 @@
-# Lightning Trader Terminal
+# Lightning Trader Terminal v2.00.0
 
 Lightning Trader Terminal is a desktop trading workstation with paper-safe broker defaults, replay, advisory context, and a beginner-friendly Alpaca setup flow.
 
@@ -7,7 +7,7 @@ The app is designed to be usable without terminal setup on normal launches:
 - paper trading is the safe default
 - Alpaca keys can be entered and saved from inside the GUI
 - replay is clearly labeled as simulation
-- update checks use GitHub Releases and never self-update silently
+- update checks and downloads use GitHub Releases and never self-update silently
 
 ## What Normal Users Do
 
@@ -16,7 +16,19 @@ The app is designed to be usable without terminal setup on normal launches:
 3. Keep paper mode on unless you intentionally want live routing.
 4. Watch the `Broker` card to confirm whether orders route to `Local Paper` or `Alpaca Paper`.
 5. Use `Replay` to practice safely without touching live markets.
-6. Use `Check for Updates` from the app menu or Settings screen.
+6. Use `Check for Updates` or `Download Update` from the app menu or Settings screen.
+7. Add new stocks from `Add Stock`; the app registers the profile, news aliases, data context, and onboarding pipeline for that symbol.
+
+## Autonomy Modes
+
+The auto-trading controller separates the route from the decision style:
+
+- `Full Autonomy`: the app uses the model stack, regime model, news model, risk gates, and readiness evidence to decide whether to trade.
+- `Strategy Autonomy`: the operator selects a known strategy for a stock while the same regime, news, broker, readiness, and risk gates remain active.
+
+The built-in strategy list covers common algorithmic families: trend following, momentum, mean reversion, breakout, VWAP reversion, opening range breakout, volatility breakout, and pairs/statistical arbitrage. Pairs/stat arb stays blocked until a pair feed is configured.
+
+Use `Auto Risk` to set the controller stop loss. If realized plus tracked open autonomous PnL breaches that dollar or percentage limit, the controller turns on the kill switch and attempts to flatten any tracked autonomous position.
 
 ## Broker Modes
 
@@ -64,11 +76,11 @@ The replay panels show current bar, replay timestamp, replay-paper route, PnL, a
 
 ## Updates
 
-The app checks GitHub Releases and compares the installed version to the latest published release.
+The app checks GitHub Releases and compares the installed version to the latest published release. It can also download the latest release asset or source archive into the local app updates folder; installation remains an explicit human step.
 
 - current version comes from [app_meta.py](/Users/quinnesser/IdeaProjects/LightningTrader4000/app_meta.py)
 - update checks are handled by [update_checker.py](/Users/quinnesser/IdeaProjects/LightningTrader4000/update_checker.py)
-- the current build opens the Releases page for manual download instead of attempting self-update
+- downloads are handled by [update_checker.py](/Users/quinnesser/IdeaProjects/LightningTrader4000/update_checker.py) and surfaced in the GUI as `Download Update`
 
 ## Packaging And Release Notes
 
@@ -86,11 +98,11 @@ Artifacts are written to `dist/` when PyInstaller is installed and the build com
 Current macOS release outputs:
 
 - `dist/Lightning Trader Terminal.app`
-- `dist/Lightning Trader Terminal-macOS-v<version>.zip`
+- `dist/Lightning Trader Terminal-macOS-v2.00.0.zip`
 
 Windows release output:
 
-- `dist/Lightning Trader Terminal-Windows-v<version>.zip`
+- `dist/Lightning Trader Terminal-Windows-v2.00.0.zip`
 
 The Windows zip is built automatically on GitHub Actions when a GitHub Release is published, using the same PyInstaller entrypoint and runtime asset manifest as the macOS build.
 

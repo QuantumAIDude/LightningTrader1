@@ -118,9 +118,9 @@ Expected release flow:
 2. build and test the app
 3. publish a GitHub Release whose tag matches the version
 4. users choose `Check for Updates` inside the app
-5. if a newer release exists, the app opens the Releases page for manual download
+5. if a newer release exists, users can download the matched release asset/source archive from inside the app
 
-Current implementation is intentionally manual-update only. It does not self-patch installed binaries.
+Current implementation is intentionally manual-install only. It can download a GitHub release artifact, but it does not self-patch installed binaries.
 
 ## Human Release Checklist
 

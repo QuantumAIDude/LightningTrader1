@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 from config import INSTRUMENTS, DATA_DIR
 from instrument_onboarding import ensure_runtime_instruments
-from readiness_tracker import update_readiness_state
+from readiness_tracker import update_readiness_state, summarize_deployment_readiness
 from system_checkup import _check_instrument
 
 
@@ -107,6 +107,7 @@ def main():
                 readiness = update_readiness_state(instr, online=args.online)
             except Exception:
                 readiness = {"error": "readiness_update_failed"}
+        deployment = summarize_deployment_readiness(instr, state=readiness or {})
         status = str(rep.get("status", "fail")).lower()
         drift_flag = bool(rep.get("calibration", {}).get("drift_flag", False))
         horizon_drift = bool(rep.get("horizon_accuracy", {}).get("drift_flag", False))
@@ -134,6 +135,10 @@ def main():
             "last_ts": rep.get("data", {}).get("last_ts"),
             "latency_4min_s": rep.get("predictions", {}).get("4min_latency_s"),
             "readiness": readiness,
+            "deployment_stage_key": deployment.get("stage_key"),
+            "deployment_stage_label": deployment.get("stage_label"),
+            "deployment_summary": deployment.get("summary"),
+            "deployment_primary_blocker": deployment.get("primary_blocker"),
         }
         _append_jsonl(args.event_log, event)
 
@@ -156,6 +161,8 @@ def main():
             _append_alert(args.alert_log, f"{instr} READINESS_LOCK live gate not satisfied")
         if degenerate:
             _append_alert(args.alert_log, f"{instr} DEGENERATE_SPREAD near-identical model outputs")
+        if not bool(deployment.get("shadow_ready", False)):
+            _append_alert(args.alert_log, f"{instr} DEPLOYMENT_STAGE {deployment.get('stage_label')} | {deployment.get('primary_blocker') or deployment.get('summary')}")
 
     if any_fail:
         raise SystemExit(2)

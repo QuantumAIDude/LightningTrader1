@@ -18,6 +18,7 @@ from config import (
 )
 from event_analytics import get_event_snapshot
 from instrument_onboarding import ensure_runtime_instruments
+from symbol_pipeline import ensure_daily_long_history
 from market_context import maybe_refresh_context_data
 from macro_events import maybe_refresh_macro_events
 from news_pipeline import maybe_refresh_news
@@ -797,5 +798,14 @@ def update_price_data(instr_key: str = None):
 
         # Persist active dataset
         _write_csv(data_file_active, df_active)
+        try:
+            _daily_long_df, daily_long_summary = ensure_daily_long_history(
+                instr_key,
+                recent_df=df_active,
+                persist=True,
+            )
+            df_active.attrs["daily_long_summary"] = dict(daily_long_summary or {})
+        except Exception:
+            logger.debug("Daily long-history assembly failed", exc_info=True)
 
         return df_active

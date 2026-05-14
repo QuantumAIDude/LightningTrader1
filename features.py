@@ -53,7 +53,7 @@ DEFAULT_FEATURES = [
     "range_1", "body_1", "dollar_vol_z", "roll_max_dist", "roll_min_dist", "cusum_intensity", "event_time_since",
     # normalization and session/futures-specific
     "ret_1_norm", "overnight_gap", "session_volatility", "session_ret_from_open",
-    # QQQ news sentiment context (lag-safe daily aggregates)
+    # Per-stock news sentiment context (lag-safe daily aggregates)
     "news_sent_mean_d1", "news_sent_sum_d3", "news_headline_count_d1", "news_pos_ratio_d3", "news_neg_ratio_d3",
     "news_sent_ewm_d7", "news_intensity_ewm_d7", "news_entropy_d3", "news_relevance_mean_d3", "news_sent_surprise_d1",
     "news_political_count_d3", "news_political_sent_d3", "news_political_relevance_d3",
@@ -296,25 +296,30 @@ def _attach_news_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Da
         if c not in df.columns:
             df[c] = 0.0
     if not NEWS_PIPELINE_ENABLED:
+        df.attrs["news_feature_status"] = "disabled"
         return df
     symbol = str(instrument_key or DEFAULT_INSTRUMENT or "").upper()
     meta = _get_instrument_meta(instrument_key)
     if not symbol or not bool(meta.get("news_enabled", True)):
+        df.attrs["news_feature_status"] = "disabled"
         return df
     if load_news_features_for_index is None:
+        df.attrs["news_feature_status"] = "unavailable"
         return df
     try:
         instr_meta = _get_instrument_meta(instrument_key)
         tz = instr_meta.get("tz", "America/New_York")
         aligned = load_news_features_for_index(symbol=symbol, index_utc=df.index, tz=tz)
         if aligned is None or aligned.empty:
+            df.attrs["news_feature_status"] = "missing"
             return df
         for c in cols:
             if c in aligned.columns:
                 df[c] = pd.to_numeric(aligned[c], errors="coerce").reindex(df.index).fillna(0.0)
+        df.attrs["news_feature_status"] = "ok"
     except Exception:
         # Keep feature contract stable even when news ingestion fails.
-        pass
+        df.attrs["news_feature_status"] = "error"
     return df
 
 def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.DataFrame:
@@ -710,7 +715,7 @@ def _build_base_features(df: pd.DataFrame, instrument_key: str = None) -> pd.Dat
         df["cusum_intensity"] = 0.0
         df["event_time_since"] = 0.0
 
-    # News-driven context (QQQ only). Values remain zero for other symbols.
+    # News-driven context per workspace. Values remain zero when the news layer is unavailable.
     df = _attach_news_features(df, instrument_key=instrument_key)
     if add_context_features is not None:
         # Intraday forecasts only get prior daily context, never same-day close information.

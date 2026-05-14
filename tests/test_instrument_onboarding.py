@@ -5,6 +5,7 @@ import unittest
 import pandas as pd
 
 import instrument_onboarding as io
+import symbol_pipeline as sp
 
 
 class InstrumentOnboardingTests(unittest.TestCase):
@@ -16,8 +17,10 @@ class InstrumentOnboardingTests(unittest.TestCase):
             old_failed_dir = io.NEW_INSTRUMENTS_FAILED_DIR
             old_instruments_file = io.INSTRUMENTS_FILE
             old_instruments = dict(io.INSTRUMENTS)
+            old_symbol_pipeline_data_dir = sp.DATA_DIR
             try:
                 io.DATA_DIR = tmp
+                sp.DATA_DIR = tmp
                 io.NEW_INSTRUMENTS_DIR = os.path.join(tmp, "new_instruments")
                 io.NEW_INSTRUMENTS_PROCESSED_DIR = os.path.join(io.NEW_INSTRUMENTS_DIR, "processed")
                 io.NEW_INSTRUMENTS_FAILED_DIR = os.path.join(io.NEW_INSTRUMENTS_DIR, "failed")
@@ -54,9 +57,19 @@ class InstrumentOnboardingTests(unittest.TestCase):
 
                 rep = io.process_staged_instrument_files(auto_train=False, full_train=False)
                 self.assertEqual(len(rep.get("processed", [])), 1)
+                processed = rep["processed"][0]
                 self.assertIn("ABC", io.INSTRUMENTS)
                 self.assertEqual(io.INSTRUMENTS["ABC"].get("display_name"), "ABC Corp")
+                self.assertEqual(processed["new_rows"], 4)
+                self.assertTrue(processed["profile_resolved"])
+                self.assertIn(processed["history_status"], {"Insufficient history", "Features partially ready"})
+                self.assertEqual(processed["eligible_modes"], [])
+                self.assertIn("Advance intraday history", processed["primary_next_requirement"])
+                self.assertEqual(processed["status"], "processed")
                 self.assertTrue(os.path.exists(os.path.join(tmp, "prices_ABC.csv")))
+                self.assertTrue(os.path.exists(os.path.join(tmp, "prices_ABC_daily_long.csv")))
+                self.assertGreaterEqual(processed["daily_long_rows"], 1)
+                self.assertTrue(processed["daily_long_sources"])
                 self.assertTrue(os.path.exists(os.path.join(tmp, "news_ABC.csv")))
                 self.assertTrue(os.path.exists(io.INSTRUMENTS_FILE))
             finally:
@@ -67,6 +80,7 @@ class InstrumentOnboardingTests(unittest.TestCase):
                 io.INSTRUMENTS_FILE = old_instruments_file
                 io.INSTRUMENTS.clear()
                 io.INSTRUMENTS.update(old_instruments)
+                sp.DATA_DIR = old_symbol_pipeline_data_dir
                 npipe.DATA_DIR = old_news_data_dir
                 npipe.NEW_INSTRUMENTS_DIR = old_news_stage_dir
 
@@ -78,8 +92,10 @@ class InstrumentOnboardingTests(unittest.TestCase):
             old_failed_dir = io.NEW_INSTRUMENTS_FAILED_DIR
             old_instruments_file = io.INSTRUMENTS_FILE
             old_instruments = dict(io.INSTRUMENTS)
+            old_symbol_pipeline_data_dir = sp.DATA_DIR
             try:
                 io.DATA_DIR = tmp
+                sp.DATA_DIR = tmp
                 io.NEW_INSTRUMENTS_DIR = os.path.join(tmp, "new_instruments")
                 io.NEW_INSTRUMENTS_PROCESSED_DIR = os.path.join(io.NEW_INSTRUMENTS_DIR, "processed")
                 io.NEW_INSTRUMENTS_FAILED_DIR = os.path.join(io.NEW_INSTRUMENTS_DIR, "failed")
@@ -107,6 +123,7 @@ class InstrumentOnboardingTests(unittest.TestCase):
                 io.INSTRUMENTS_FILE = old_instruments_file
                 io.INSTRUMENTS.clear()
                 io.INSTRUMENTS.update(old_instruments)
+                sp.DATA_DIR = old_symbol_pipeline_data_dir
 
 
 if __name__ == "__main__":

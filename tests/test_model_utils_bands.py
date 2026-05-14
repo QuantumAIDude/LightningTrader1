@@ -5,10 +5,13 @@ import pandas as pd
 
 from model_utils import (
     _apply_horizon_overlay_block,
+    _combine_uncertainty_estimates,
     _effective_model_count,
     _posterior_shrink_return,
     _prediction_band,
+    _resolve_direction_stage,
     _resolve_predictability_gate,
+    _stock_horizon_support,
 )
 
 
@@ -45,6 +48,44 @@ class PredictionBandTests(unittest.TestCase):
         gate = _resolve_predictability_gate(payloads)
         self.assertIsInstance(gate, dict)
         self.assertAlmostEqual(float(gate["scale"]), 1.25, places=6)
+
+    def test_combine_uncertainty_estimates_avoids_rss_double_count(self):
+        combined = _combine_uncertainty_estimates(0.0012, 0.0016, reliability_prob=0.62)
+        self.assertGreater(combined, 0.0012)
+        self.assertLess(combined, 0.0020)
+
+    def test_resolve_direction_stage_keeps_tentative_direction_when_edge_survives(self):
+        direction, stage = _resolve_direction_stage("UP", 24.0, 0.00008)
+        self.assertEqual(direction, "UP")
+        self.assertEqual(stage, "tentative")
+
+    def test_resolve_direction_stage_blocks_low_confidence_direction(self):
+        direction, stage = _resolve_direction_stage("DOWN", 14.0, 0.00008)
+        self.assertEqual(direction, "-")
+        self.assertEqual(stage, "blocked")
+
+    def test_stock_horizon_support_flags_confirmed_alignment(self):
+        support = _stock_horizon_support(
+            "UP",
+            0.0008,
+            0.0012,
+            {"mean": 1.4, "direction": "UP", "strength": 0.8},
+            {"mean": 1.1, "direction": "UP", "strength": 0.7},
+        )
+        self.assertEqual(support["stage"], "confirmed")
+        self.assertEqual(support["direction"], "UP")
+        self.assertGreater(support["confidence_bonus"], 0.0)
+
+    def test_stock_horizon_support_flags_contrary_alignment(self):
+        support = _stock_horizon_support(
+            "DOWN",
+            -0.0006,
+            0.0010,
+            {"mean": 1.2, "direction": "UP", "strength": 0.9},
+            {"mean": 1.0, "direction": "UP", "strength": 0.8},
+        )
+        self.assertEqual(support["stage"], "contrary")
+        self.assertEqual(support["direction"], "-")
 
     def test_apply_horizon_overlay_block_copies_weekly_high_low(self):
         hist = pd.DataFrame({"close": [100.0]}, index=pd.DatetimeIndex(["2026-03-10T20:58:00Z"]))

@@ -6,7 +6,16 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 
-from config import DATA_DIR, INTERVAL, CALIBRATION_MAX_AGE_DAYS, LIVE_CALIBRATION, CALIBRATION_HALF_LIFE_DAYS, DRIFT_ACC_THRESHOLD, DRIFT_MIN_SAMPLES
+from config import (
+    DATA_DIR,
+    INTERVAL,
+    CALIBRATION_MAX_AGE_DAYS,
+    CALIBRATION_EVIDENCE_MAX_AGE_DAYS,
+    LIVE_CALIBRATION,
+    CALIBRATION_HALF_LIFE_DAYS,
+    DRIFT_ACC_THRESHOLD,
+    DRIFT_MIN_SAMPLES,
+)
 from accuracy_windows import price_window_threshold_dollars
 
 logger = logging.getLogger(__name__)
@@ -69,12 +78,17 @@ def _load_price_history(instrument_key: str):
 def _calibration_state_path(instrument_key: str) -> str:
     return os.path.join(DATA_DIR, f"calibration_live_{instrument_key}.json")
 
+def _calibration_history_path(instrument_key: str) -> str:
+    return os.path.join(DATA_DIR, f"calibration_history_{instrument_key}.jsonl")
+
 def _load_state(instrument_key: str):
     path = _calibration_state_path(instrument_key)
     if not os.path.exists(path):
         return {
             "last_processed": None,
             "last_update": None,
+            "last_check": None,
+            "last_resolved_target_ts": None,
             "by_model": {},
             "by_model_stats": {},
             "global": {},
@@ -84,22 +98,38 @@ def _load_state(instrument_key: str):
             "recent_price_window_ratios": [],
             "recent_price_window_hits": [],
             "recent_price_window_thresholds": [],
+            "pending_unresolved_rows": 0,
+            "pending_unresolved_oldest_prediction_ts": None,
+            "pending_unresolved_newest_prediction_ts": None,
+            "pending_unresolved_oldest_target_ts": None,
+            "pending_unresolved_newest_target_ts": None,
+            "skip_breakdown": {},
         }
     try:
         with open(path, "r") as f:
             state = json.load(f)
+        state.setdefault("last_check", None)
+        state.setdefault("last_resolved_target_ts", None)
         state.setdefault("recent_outcomes", [])
         state.setdefault("recent_abs_errors", [])
         state.setdefault("recent_price_abs_errors", [])
         state.setdefault("recent_price_window_ratios", [])
         state.setdefault("recent_price_window_hits", [])
         state.setdefault("recent_price_window_thresholds", [])
+        state.setdefault("pending_unresolved_rows", 0)
+        state.setdefault("pending_unresolved_oldest_prediction_ts", None)
+        state.setdefault("pending_unresolved_newest_prediction_ts", None)
+        state.setdefault("pending_unresolved_oldest_target_ts", None)
+        state.setdefault("pending_unresolved_newest_target_ts", None)
+        state.setdefault("skip_breakdown", {})
         return state
     except Exception:
         logger.exception("Failed to read calibration state")
         return {
             "last_processed": None,
             "last_update": None,
+            "last_check": None,
+            "last_resolved_target_ts": None,
             "by_model": {},
             "by_model_stats": {},
             "global": {},
@@ -109,6 +139,12 @@ def _load_state(instrument_key: str):
             "recent_price_window_ratios": [],
             "recent_price_window_hits": [],
             "recent_price_window_thresholds": [],
+            "pending_unresolved_rows": 0,
+            "pending_unresolved_oldest_prediction_ts": None,
+            "pending_unresolved_newest_prediction_ts": None,
+            "pending_unresolved_oldest_target_ts": None,
+            "pending_unresolved_newest_target_ts": None,
+            "skip_breakdown": {},
         }
 
 def _save_state(instrument_key: str, state: dict):
@@ -126,6 +162,163 @@ def _save_state(instrument_key: str, state: dict):
                 os.remove(tmp_path)
         except Exception:
             pass
+
+def _append_history_row(instrument_key: str, row: dict):
+    path = _calibration_history_path(instrument_key)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(row, sort_keys=True))
+            f.write("\n")
+    except Exception:
+        logger.exception("Failed to append calibration history")
+
+
+def _coerce_ts(value):
+    try:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def _tail_streak(values, success: int = 1) -> int:
+    streak = 0
+    target = int(success)
+    for raw in reversed(list(values or [])):
+        try:
+            value = int(raw)
+        except Exception:
+            break
+        if value != target:
+            break
+        streak += 1
+    return int(streak)
+
+
+def _finalize_state(
+    instrument_key: str,
+    state: dict,
+    now: datetime,
+    *,
+    updated: int,
+    skipped: int,
+    pending_prediction_ts: list | None = None,
+    pending_target_ts: list | None = None,
+    skip_breakdown: dict | None = None,
+) -> dict:
+    state = dict(state or {})
+    state["last_check"] = now.isoformat()
+    state["resolved_rows_last_run"] = int(updated)
+    state["skipped_rows_last_run"] = int(skipped)
+    state["skip_breakdown"] = {
+        "flat": int((skip_breakdown or {}).get("flat", 0) or 0),
+        "invalid": int((skip_breakdown or {}).get("invalid", 0) or 0),
+        "unresolved": int((skip_breakdown or {}).get("unresolved", 0) or 0),
+    }
+    pred_ts = sorted(ts for ts in (_coerce_ts(v) for v in (pending_prediction_ts or [])) if ts is not None)
+    tgt_ts = sorted(ts for ts in (_coerce_ts(v) for v in (pending_target_ts or [])) if ts is not None)
+    state["pending_unresolved_rows"] = int(len(pred_ts))
+    state["pending_unresolved_oldest_prediction_ts"] = pred_ts[0].isoformat() if pred_ts else None
+    state["pending_unresolved_newest_prediction_ts"] = pred_ts[-1].isoformat() if pred_ts else None
+    state["pending_unresolved_oldest_target_ts"] = tgt_ts[0].isoformat() if tgt_ts else None
+    state["pending_unresolved_newest_target_ts"] = tgt_ts[-1].isoformat() if tgt_ts else None
+
+    try:
+        total = float(state.get("global", {}).get("total", 0.0))
+        wins = float(state.get("global", {}).get("wins", 0.0))
+        acc = wins / total if total > 0 else 1.0
+        state["drift_score"] = float(acc)
+        global_drift = bool(total >= DRIFT_MIN_SAMPLES and acc < DRIFT_ACC_THRESHOLD)
+        recent_outcomes = [int(x) for x in state.get("recent_outcomes", []) if str(x) in ("0", "1")]
+        recent_min = max(24, int(DRIFT_MIN_SAMPLES // 3))
+        recent_window = max(40, int(DRIFT_MIN_SAMPLES))
+        recent_slice = recent_outcomes[-recent_window:] if recent_outcomes else []
+        recent_total = len(recent_slice)
+        recent_acc = (float(np.mean(recent_slice)) if recent_total > 0 else 1.0)
+        recent_thresh = min(0.55, float(DRIFT_ACC_THRESHOLD) + 0.05)
+        recent_drift = bool(recent_total >= recent_min and recent_acc < recent_thresh)
+        recent_hits = [int(x) for x in state.get("recent_price_window_hits", []) if str(x) in ("0", "1")]
+        recent_hit_slice = recent_hits[-recent_window:] if recent_hits else []
+        recent_hit_total = len(recent_hit_slice)
+        recent_hit_rate = float(np.mean(recent_hit_slice)) if recent_hit_total > 0 else 1.0
+        price_drift = bool(recent_hit_total >= recent_min and recent_hit_rate < 0.52)
+        state["recent_acc"] = float(recent_acc)
+        state["recent_total"] = int(recent_total)
+        state["recent_drift_flag"] = bool(recent_drift)
+        state["recent_price_window_hit_rate"] = float(recent_hit_rate)
+        state["recent_price_window_total"] = int(recent_hit_total)
+        state["recent_price_drift_flag"] = bool(price_drift)
+        state["recent_recovery_streak"] = _tail_streak(recent_slice, success=1)
+        state["recent_price_recovery_streak"] = _tail_streak(recent_hit_slice, success=1)
+        state["recent_failure_streak"] = _tail_streak(recent_slice, success=0)
+        state["recent_price_failure_streak"] = _tail_streak(recent_hit_slice, success=0)
+        state["drift_components"] = {
+            "global": bool(global_drift),
+            "recent_accuracy": bool(recent_drift),
+            "recent_price_window": bool(price_drift),
+        }
+        state["drift_flag"] = bool(global_drift or recent_drift or price_drift)
+    except Exception:
+        state["drift_flag"] = False
+        state["recent_drift_flag"] = False
+        state["recent_price_drift_flag"] = False
+        state["drift_components"] = {
+            "global": False,
+            "recent_accuracy": False,
+            "recent_price_window": False,
+        }
+
+    evidence_anchor = _coerce_ts(state.get("last_resolved_target_ts")) or _coerce_ts(state.get("last_processed"))
+    evidence_age_hours = None
+    if evidence_anchor is not None:
+        try:
+            evidence_age_hours = max(0.0, float((now - evidence_anchor.to_pydatetime()).total_seconds()) / 3600.0)
+        except Exception:
+            evidence_age_hours = None
+    state["evidence_age_hours"] = round(float(evidence_age_hours), 2) if evidence_age_hours is not None else None
+    state["evidence_stale"] = bool(
+        evidence_age_hours is None or evidence_age_hours > (24.0 * float(CALIBRATION_EVIDENCE_MAX_AGE_DAYS))
+    )
+    state["recovery_ready"] = bool(
+        not bool(state.get("recent_drift_flag"))
+        and not bool(state.get("recent_price_drift_flag"))
+        and int(state.get("recent_recovery_streak") or 0) >= 6
+        and (
+            int(state.get("recent_price_window_total") or 0) < max(24, int(DRIFT_MIN_SAMPLES // 3))
+            or int(state.get("recent_price_recovery_streak") or 0) >= 4
+        )
+    )
+    _save_state(instrument_key, state)
+    _append_history_row(
+        instrument_key,
+        {
+            "ts": now.isoformat(),
+            "instrument": str(instrument_key or "").upper(),
+            "updated": int(updated),
+            "skipped": int(skipped),
+            "last_processed": state.get("last_processed"),
+            "last_resolved_target_ts": state.get("last_resolved_target_ts"),
+            "evidence_age_hours": state.get("evidence_age_hours"),
+            "evidence_stale": bool(state.get("evidence_stale")),
+            "drift_flag": bool(state.get("drift_flag")),
+            "recent_drift_flag": bool(state.get("recent_drift_flag")),
+            "recent_price_drift_flag": bool(state.get("recent_price_drift_flag")),
+            "drift_score": state.get("drift_score"),
+            "recent_acc": state.get("recent_acc"),
+            "recent_total": state.get("recent_total"),
+            "recent_price_window_hit_rate": state.get("recent_price_window_hit_rate"),
+            "recent_price_window_total": state.get("recent_price_window_total"),
+            "recent_recovery_streak": state.get("recent_recovery_streak"),
+            "recent_price_recovery_streak": state.get("recent_price_recovery_streak"),
+            "pending_unresolved_rows": state.get("pending_unresolved_rows"),
+            "pending_unresolved_newest_prediction_ts": state.get("pending_unresolved_newest_prediction_ts"),
+            "skip_breakdown": dict(state.get("skip_breakdown") or {}),
+        },
+    )
+    return state
 
 def _bucket_from_sig(sig):
     if sig in ("Weak", "Medium", "Strong"):
@@ -230,25 +423,40 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
     if last_proc is not None:
         preds = preds[preds["timestamp"] > last_proc]
 
-    if preds.empty:
-        return {"updated": 0, "skipped": 0}
-
     model_keys = ["base", "forest", "boost", "extra_trees", "meta", "consensus"]
     gui_model_keys = {"base", "forest", "boost", "extra_trees"}
     updated = 0
     skipped = 0
+    skip_breakdown = {"flat": 0, "invalid": 0, "unresolved": 0}
     processed_timestamps = []
+    processed_target_timestamps = []
+    pending_prediction_ts = []
+    pending_target_ts = []
     _apply_decay(state, now)
     state.setdefault("global", {}).setdefault("wins", 0.0)
     state.setdefault("global", {}).setdefault("total", 0.0)
     state.setdefault("by_model_stats", {})
+    if preds.empty:
+        _finalize_state(
+            instrument_key,
+            state,
+            now,
+            updated=0,
+            skipped=0,
+            pending_prediction_ts=[],
+            pending_target_ts=[],
+            skip_breakdown=skip_breakdown,
+        )
+        return {"updated": 0, "skipped": 0, "unresolved": 0}
     for _, row in preds.iterrows():
         if _is_flat_prediction_row(row, model_keys):
             skipped += 1
+            skip_breakdown["flat"] += 1
             continue
         ts = row.get("timestamp")
         if pd.isna(ts):
             skipped += 1
+            skip_breakdown["invalid"] += 1
             continue
         target_ts = ts + pd.Timedelta(minutes=horizon_minutes)
         # find closest price at or after target_ts
@@ -256,15 +464,20 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
             idx_pos = prices.index.searchsorted(target_ts)
             if idx_pos >= len(prices.index):
                 skipped += 1
+                skip_breakdown["unresolved"] += 1
+                pending_prediction_ts.append(ts)
+                pending_target_ts.append(target_ts)
                 continue
             actual_price = float(prices["close"].iloc[idx_pos])
             last_price = float(row.get("last_price", actual_price))
             if last_price == 0 or not pd.notna(actual_price):
                 skipped += 1
+                skip_breakdown["invalid"] += 1
                 continue
             actual_ret = (actual_price / last_price) - 1.0
         except Exception:
             skipped += 1
+            skip_breakdown["invalid"] += 1
             continue
 
         row_used = False
@@ -386,8 +599,13 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
                 pass
             updated += 1
             processed_timestamps.append(ts)
+            try:
+                processed_target_timestamps.append(prices.index[idx_pos])
+            except Exception:
+                pass
         else:
             skipped += 1
+            skip_breakdown["invalid"] += 1
 
     # update last_processed
     try:
@@ -395,40 +613,20 @@ def update_live_calibration(instrument_key: str, horizon_minutes: int = 4):
             latest_ts = pd.to_datetime(max(processed_timestamps), utc=True, errors="coerce")
             if pd.notna(latest_ts):
                 state["last_processed"] = latest_ts.isoformat()
+        if processed_target_timestamps:
+            latest_target_ts = pd.to_datetime(max(processed_target_timestamps), utc=True, errors="coerce")
+            if pd.notna(latest_target_ts):
+                state["last_resolved_target_ts"] = latest_target_ts.isoformat()
     except Exception:
         logger.debug("Failed to advance last_processed", exc_info=True)
-
-    # drift detection
-    try:
-        total = float(state["global"].get("total", 0.0))
-        wins = float(state["global"].get("wins", 0.0))
-        acc = wins / total if total > 0 else 1.0
-        state["drift_score"] = float(acc)
-        global_drift = bool(total >= DRIFT_MIN_SAMPLES and acc < DRIFT_ACC_THRESHOLD)
-        recent_outcomes = [int(x) for x in state.get("recent_outcomes", []) if str(x) in ("0", "1")]
-        recent_min = max(24, int(DRIFT_MIN_SAMPLES // 3))
-        recent_window = max(40, int(DRIFT_MIN_SAMPLES))
-        recent_slice = recent_outcomes[-recent_window:] if recent_outcomes else []
-        recent_total = len(recent_slice)
-        recent_acc = (float(np.mean(recent_slice)) if recent_total > 0 else 1.0)
-        # Slightly stricter threshold for recent window so we react earlier to sharp degradation.
-        recent_thresh = min(0.55, float(DRIFT_ACC_THRESHOLD) + 0.05)
-        recent_drift = bool(recent_total >= recent_min and recent_acc < recent_thresh)
-        recent_hits = [int(x) for x in state.get("recent_price_window_hits", []) if str(x) in ("0", "1")]
-        recent_hit_slice = recent_hits[-recent_window:] if recent_hits else []
-        recent_hit_total = len(recent_hit_slice)
-        recent_hit_rate = float(np.mean(recent_hit_slice)) if recent_hit_total > 0 else 1.0
-        price_drift = bool(recent_hit_total >= recent_min and recent_hit_rate < 0.52)
-        state["recent_acc"] = float(recent_acc)
-        state["recent_total"] = int(recent_total)
-        state["recent_drift_flag"] = bool(recent_drift)
-        state["recent_price_window_hit_rate"] = float(recent_hit_rate)
-        state["recent_price_window_total"] = int(recent_hit_total)
-        state["recent_price_drift_flag"] = bool(price_drift)
-        state["drift_flag"] = bool(global_drift or recent_drift or price_drift)
-    except Exception:
-        state["drift_flag"] = False
-        state["recent_drift_flag"] = False
-        state["recent_price_drift_flag"] = False
-    _save_state(instrument_key, state)
-    return {"updated": updated, "skipped": skipped}
+    _finalize_state(
+        instrument_key,
+        state,
+        now,
+        updated=updated,
+        skipped=skipped,
+        pending_prediction_ts=pending_prediction_ts,
+        pending_target_ts=pending_target_ts,
+        skip_breakdown=skip_breakdown,
+    )
+    return {"updated": updated, "skipped": skipped, "unresolved": int(len(pending_prediction_ts))}

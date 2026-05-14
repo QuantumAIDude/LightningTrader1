@@ -46,6 +46,11 @@ class CalibrationIntegrityTests(unittest.TestCase):
 
                 state = calibration_tracker._load_state(instr)
                 self.assertIsNone(state.get("last_processed"))
+                self.assertEqual(int(state.get("pending_unresolved_rows") or 0), 1)
+                self.assertTrue(bool(state.get("evidence_stale")))
+                self.assertEqual(int((state.get("skip_breakdown") or {}).get("unresolved") or 0), 1)
+                hist_path = os.path.join(tmp, f"calibration_history_{instr}.jsonl")
+                self.assertTrue(os.path.exists(hist_path))
             finally:
                 calibration_tracker.DATA_DIR = old_data_dir
 
@@ -208,6 +213,8 @@ class CalibrationIntegrityTests(unittest.TestCase):
                 self.assertEqual(len(state.get("recent_price_window_ratios", [])), 1)
                 self.assertEqual(len(state.get("recent_price_window_hits", [])), 1)
                 self.assertEqual(len(state.get("recent_price_window_thresholds", [])), 1)
+                self.assertIsNotNone(state.get("last_resolved_target_ts"))
+                self.assertFalse(bool(state.get("evidence_stale")))
             finally:
                 calibration_tracker.DATA_DIR = old_data_dir
 

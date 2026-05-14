@@ -79,6 +79,7 @@ class TraderAnalyticsTests(unittest.TestCase):
         old_get_macro = ta.get_macro_event_snapshot
         old_get_catalysts = ta.get_catalyst_provider_snapshot
         old_get_liquidity = ta.get_liquidity_snapshot
+        old_get_news_health = ta.get_news_health
         old_instruments = dict(ta.INSTRUMENTS)
         old_adv_news = ae.load_recent_headlines
         old_adv_event = ae.get_event_snapshot
@@ -87,6 +88,7 @@ class TraderAnalyticsTests(unittest.TestCase):
         old_adv_breadth = ae.get_breadth_snapshot
         old_adv_catalysts = ae.get_catalyst_provider_snapshot
         old_adv_liquidity = ae.get_liquidity_snapshot
+        old_adv_news_health = ae.get_news_health
         old_exec = ta.get_execution_dashboard_snapshot
         old_perf = ta.get_performance_snapshot
         old_replay = ta.get_replay_dashboard_snapshot
@@ -95,9 +97,10 @@ class TraderAnalyticsTests(unittest.TestCase):
         try:
             ta._load_long_daily_history = lambda instrument_key: daily_long.copy()
             ta.load_context_daily_history = lambda instrument_key, role, allow_remote=False: market_hist.copy()
+            ta.get_news_health = lambda symbol: {"status": "ok", "headline_state": "ok", "history_state": "insufficient_history", "high_impact_recent": 1}
             ta.load_recent_headlines = lambda symbol, limit=6: [
-                {"published_at": pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=2), "headline": "Chip demand improves", "label": "positive", "score": 0.4},
-                {"published_at": pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=4), "headline": "Treasury yields ease", "label": "neutral", "score": 0.1},
+                {"published_at": pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=2), "headline": "Chip demand improves", "label": "positive", "score": 0.4, "event_label": "Guidance", "impact_score": 0.68, "impact_horizon": "multi-day", "importance_score": 0.55, "signal_note": "Guidance changes can matter for several sessions"},
+                {"published_at": pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=4), "headline": "Treasury yields ease", "label": "neutral", "score": 0.1, "event_label": "Macro", "impact_score": 0.42, "impact_horizon": "intraday", "importance_score": 0.28, "signal_note": "Macro moves need tape confirmation"},
             ]
             ta.get_options_snapshot = lambda symbol, spot_price=None: {
                 "status": "ok",
@@ -143,8 +146,15 @@ class TraderAnalyticsTests(unittest.TestCase):
                     "label": "positive",
                     "score": 0.3,
                     "political_relevance": 0.5,
+                    "event_label": "Macro",
+                    "impact_score": 0.61,
+                    "impact_horizon": "intraday",
+                    "importance_score": 0.46,
+                    "direction_score": 0.16,
+                    "signal_note": "Macro headlines can dominate intraday tape",
                 }
             ]
+            ae.get_news_health = lambda symbol: {"status": "ok", "headline_state": "ok", "history_state": "insufficient_history", "high_impact_recent": 1}
             ae.get_event_snapshot = lambda symbol: {
                 "status": "ok",
                 "next_earnings": "2026-03-28T00:00:00+00:00",
@@ -232,7 +242,11 @@ class TraderAnalyticsTests(unittest.TestCase):
             self.assertTrue(out["breadth_rows"])
             self.assertTrue(out["macro_rows"])
             self.assertTrue(out["signal_rows"])
+            self.assertEqual(out["signal_rows"][0][0], "Trader Lens")
             self.assertTrue(out["stack_rows"])
+            self.assertTrue(any(row[0] == "Lifecycle" for row in out["stack_rows"]))
+            self.assertTrue(any(row[0] == "Operator Posture" for row in out["stack_rows"]))
+            self.assertTrue(any(row[0] == "Models" for row in out["stack_rows"]))
             self.assertTrue(out["probability_rows"])
             self.assertTrue(out["quality_rows"])
             self.assertTrue(out["liquidity_rows"])
@@ -266,6 +280,7 @@ class TraderAnalyticsTests(unittest.TestCase):
             ta.get_macro_event_snapshot = old_get_macro
             ta.get_catalyst_provider_snapshot = old_get_catalysts
             ta.get_liquidity_snapshot = old_get_liquidity
+            ta.get_news_health = old_get_news_health
             ta.INSTRUMENTS.clear()
             ta.INSTRUMENTS.update(old_instruments)
             ae.load_recent_headlines = old_adv_news
@@ -275,6 +290,7 @@ class TraderAnalyticsTests(unittest.TestCase):
             ae.get_breadth_snapshot = old_adv_breadth
             ae.get_catalyst_provider_snapshot = old_adv_catalysts
             ae.get_liquidity_snapshot = old_adv_liquidity
+            ae.get_news_health = old_adv_news_health
             ta.get_execution_dashboard_snapshot = old_exec
             ta.get_performance_snapshot = old_perf
             ta.get_replay_dashboard_snapshot = old_replay
@@ -309,6 +325,7 @@ class TraderAnalyticsTests(unittest.TestCase):
         old_load_long = ta._load_long_daily_history
         old_get_options = ta.get_options_snapshot
         old_load_news = ta.load_recent_headlines
+        old_get_news_health = ta.get_news_health
         old_build_advisory = ta.build_advisory_snapshot
         old_exec = ta.get_execution_dashboard_snapshot
         old_perf = ta.get_performance_snapshot
@@ -319,6 +336,7 @@ class TraderAnalyticsTests(unittest.TestCase):
             ta._load_long_daily_history = lambda instrument_key: daily_long.copy()
             ta.get_options_snapshot = _boom
             ta.load_recent_headlines = _boom
+            ta.get_news_health = lambda symbol: {"status": "missing", "headline_state": "missing", "history_state": "missing"}
             ta.build_advisory_snapshot = _boom
             ta.get_execution_dashboard_snapshot = _boom
             ta.get_performance_snapshot = lambda symbol=None: {"summary": "No closed paper trades yet", "rows": []}
@@ -340,6 +358,7 @@ class TraderAnalyticsTests(unittest.TestCase):
             ta._load_long_daily_history = old_load_long
             ta.get_options_snapshot = old_get_options
             ta.load_recent_headlines = old_load_news
+            ta.get_news_health = old_get_news_health
             ta.build_advisory_snapshot = old_build_advisory
             ta.get_execution_dashboard_snapshot = old_exec
             ta.get_performance_snapshot = old_perf

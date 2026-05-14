@@ -2,7 +2,7 @@
 """
 news_pipeline.py
 
-QQQ-focused headline ingestion + sentiment features.
+Multi-stock headline ingestion + sentiment features.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import os
 import re
 import ssl
 from datetime import datetime, timezone
+from typing import Callable
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
@@ -38,8 +39,10 @@ from config import (
     NEWS_PIPELINE_SYMBOL,
     NEWS_REFRESH_COOLDOWN_SEC,
 )
+from instrument_profile import build_instrument_meta, normalize_symbol
 
 logger = logging.getLogger(__name__)
+_OPTIONAL_NEWS_SCORERS: dict[str, Callable[[str, list[dict], dict], list[dict] | dict | None]] = {}
 
 
 def _safe_float(value):
@@ -50,6 +53,18 @@ def _safe_float(value):
     if not np.isfinite(out):
         return None
     return float(out)
+
+
+def _coerce_utc_ts(value) -> pd.Timestamp | None:
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
 
 _POS_WORDS = {
     "beat", "beats", "surge", "surges", "record", "gain", "gains", "upgrade", "upgrades",
@@ -76,6 +91,49 @@ _TECH_ENTITIES = {
     "apple", "microsoft", "nvidia", "amazon", "alphabet", "google", "meta", "tesla",
     "amd", "intel", "broadcom", "qualcomm", "adobe", "oracle", "salesforce", "netflix", "qqq",
 }
+_COMMUNICATIONS_KEYWORDS = {
+    "telecom", "streaming", "advertising", "media", "social", "wireless", "broadband", "carrier",
+}
+_CONSUMER_KEYWORDS = {
+    "retail", "consumer", "shopping", "apparel", "restaurant", "travel", "leisure", "ecommerce",
+    "e-commerce", "warehouse", "membership",
+}
+_HEALTHCARE_KEYWORDS = {
+    "biotech", "biotechnology", "pharma", "pharmaceutical", "drug", "medical", "hospital", "device",
+    "fda", "medicare", "therapy",
+}
+_FINANCIALS_KEYWORDS = {
+    "bank", "banking", "lender", "loan", "loans", "credit", "card", "payments", "insurance", "brokerage",
+    "asset manager", "net interest income",
+}
+_INDUSTRIALS_KEYWORDS = {
+    "airline", "airlines", "aerospace", "defense", "rail", "railroad", "logistics", "freight", "machinery",
+    "manufacturing", "factory", "industrial",
+}
+_ENERGY_KEYWORDS = {
+    "oil", "gas", "crude", "opec", "refinery", "refining", "drilling", "pipeline", "lng", "shale",
+}
+_MATERIALS_KEYWORDS = {
+    "chemical", "chemicals", "mining", "metals", "steel", "copper", "aluminum", "lithium", "fertilizer",
+}
+_UTILITIES_KEYWORDS = {
+    "utility", "utilities", "power", "grid", "electricity", "natural gas utility", "water utility",
+}
+_REAL_ESTATE_KEYWORDS = {
+    "reit", "real estate", "property", "housing", "mortgage", "commercial real estate", "office market",
+}
+_SECTOR_THEME_KEYWORDS = {
+    "technology": _TECH_KEYWORDS | _TECH_ENTITIES,
+    "communications": _COMMUNICATIONS_KEYWORDS,
+    "consumer": _CONSUMER_KEYWORDS,
+    "healthcare": _HEALTHCARE_KEYWORDS,
+    "financials": _FINANCIALS_KEYWORDS,
+    "industrials": _INDUSTRIALS_KEYWORDS,
+    "energy": _ENERGY_KEYWORDS,
+    "materials": _MATERIALS_KEYWORDS,
+    "utilities": _UTILITIES_KEYWORDS,
+    "real_estate": _REAL_ESTATE_KEYWORDS,
+}
 _MARKET_KEYWORDS = {
     "etf", "etfs", "fund", "funds", "equity", "equities", "future", "futures", "market", "markets",
     "sector", "sectors", "stock", "stocks", "index", "indexes", "midday", "bell",
@@ -99,6 +157,28 @@ _POLITICAL_ENTITIES = {
 }
 _DIRECT_QQQ_PHRASES = {
     "qqq", "invesco qqq", "nasdaq 100", "nasdaq-100",
+}
+_THEME_ALIAS_BY_SECTOR = {
+    "technology": "technology",
+    "communication services": "communications",
+    "consumer discretionary": "consumer",
+    "consumer staples": "consumer",
+    "healthcare": "healthcare",
+    "financials": "financials",
+    "industrials": "industrials",
+    "energy": "energy",
+    "materials": "materials",
+    "utilities": "utilities",
+    "real estate": "real_estate",
+    "broad market": "broad_market",
+}
+_SCOPE_LABELS = {
+    "symbol_specific": "Symbol-specific",
+    "sector_specific": "Sector-specific",
+    "macro_political_regulatory": "Macro / political / regulatory",
+    "broad_market": "Broad market",
+    "low_value_noise": "Low-value / noise",
+    "opinion_commentary": "Opinion / commentary",
 }
 
 _POS_PHRASES = {
@@ -169,6 +249,194 @@ _POLITICAL_NEG_PHRASES = {
     "war escalation": -1.10,
 }
 
+_STOPWORDS = {
+    "a", "an", "and", "as", "at", "be", "but", "by", "for", "from", "has", "have", "in", "into",
+    "is", "it", "its", "of", "on", "or", "the", "their", "this", "to", "was", "will", "with",
+}
+_SOURCE_WEIGHT_OVERRIDES = {
+    "reuters": 1.20,
+    "associated press": 1.16,
+    "dow jones": 1.18,
+    "mt newswires": 1.12,
+    "benzinga": 0.94,
+    "yahoo finance": 0.94,
+    "zacks": 0.76,
+    "motley fool": 0.62,
+    "24/7 wall st": 0.58,
+    "247wallst": 0.58,
+    "the daily upside": 0.78,
+    "investorplace": 0.60,
+    "seeking alpha": 0.74,
+}
+_LOW_SIGNAL_SOURCE_MARKERS = {
+    "motley fool",
+    "24/7 wall st",
+    "247wallst",
+    "investorplace",
+}
+_LOW_SIGNAL_PHRASES = {
+    "should you buy",
+    "clear answer",
+    "id own",
+    "i d own",
+    "never look back",
+    "top stock",
+    "top stocks",
+    "best etf",
+    "what to know",
+    "why this stock",
+    "bullish asymmetric reward",
+}
+_MARKET_WRAP_PHRASES = {
+    "pre bell",
+    "pre-bell",
+    "midday",
+    "after hours",
+    "before the bell",
+    "equity futures",
+    "markets open",
+    "point higher",
+    "point lower",
+}
+_EVENT_TYPE_PROFILES = [
+    (
+        "guidance",
+        {
+            "label": "Guidance",
+            "horizon": "multi-day",
+            "base_impact": 0.92,
+            "patterns": (
+                "raises guidance", "raise guidance", "cuts guidance", "cut guidance",
+                "guidance", "outlook", "forecast", "sales outlook", "revenue outlook",
+            ),
+            "note": "Guidance changes often reset expectations for multiple sessions.",
+        },
+    ),
+    (
+        "earnings",
+        {
+            "label": "Earnings",
+            "horizon": "multi-day",
+            "base_impact": 0.88,
+            "patterns": (
+                "earnings", "quarter results", "quarterly results", "beats estimates",
+                "misses estimates", "revenue beat", "eps beat", "profit warning",
+            ),
+            "note": "Earnings headlines can shift the next few sessions, not just the next bar.",
+        },
+    ),
+    (
+        "macro",
+        {
+            "label": "Macro",
+            "horizon": "intraday",
+            "base_impact": 0.82,
+            "patterns": (
+                "cpi", "inflation", "ppi", "pce", "fed", "fomc", "payrolls", "jobs report",
+                "retail sales", "consumer confidence", "treasury yields", "treasury yield",
+            ),
+            "note": "Macro releases can dominate intraday tape even when single-name news is quiet.",
+        },
+    ),
+    (
+        "regulatory",
+        {
+            "label": "Regulatory",
+            "horizon": "multi-day",
+            "base_impact": 0.80,
+            "patterns": (
+                "antitrust", "doj", "ftc", "sec", "probe", "investigation", "lawsuit",
+                "regulatory", "approval", "settlement", "ban", "crackdown",
+            ),
+            "note": "Regulatory headlines can reprice risk and compress multiples for days.",
+        },
+    ),
+    (
+        "geopolitical",
+        {
+            "label": "Geopolitical",
+            "horizon": "intraday",
+            "base_impact": 0.78,
+            "patterns": (
+                "sanctions", "tariff", "tariffs", "war", "ceasefire", "china",
+                "export controls", "trade deal", "trade war", "iran", "ukraine",
+            ),
+            "note": "Geopolitical headlines usually matter through cross-asset and sector shock transmission.",
+        },
+    ),
+    (
+        "analyst",
+        {
+            "label": "Analyst",
+            "horizon": "intraday",
+            "base_impact": 0.66,
+            "patterns": (
+                "upgrade", "upgrades", "downgrade", "downgrades", "price target",
+                "initiates", "initiation", "coverage", "outperform", "underperform",
+            ),
+            "note": "Analyst actions can matter tactically but usually need tape confirmation.",
+        },
+    ),
+    (
+        "merger",
+        {
+            "label": "M&A",
+            "horizon": "multi-day",
+            "base_impact": 0.84,
+            "patterns": (
+                "merger", "acquisition", "acquire", "acquires", "buyout", "takeover", "deal",
+            ),
+            "note": "Deal headlines often change valuation anchors and event-risk immediately.",
+        },
+    ),
+    (
+        "product",
+        {
+            "label": "Product",
+            "horizon": "multi-day",
+            "base_impact": 0.56,
+            "patterns": (
+                "launch", "launches", "unveil", "unveils", "introduces", "announces new",
+                "platform", "product rollout", "roadmap",
+            ),
+            "note": "Product headlines matter when the tape confirms demand or margin implications.",
+        },
+    ),
+    (
+        "capital_flows",
+        {
+            "label": "Flows",
+            "horizon": "multi-day",
+            "base_impact": 0.34,
+            "patterns": (
+                "position in", "stake in", "inflows", "outflows", "holding", "initiates position",
+                "etf", "fund",
+            ),
+            "note": "Flow headlines are usually slower-burn context unless size or source is exceptional.",
+        },
+    ),
+    (
+        "market_wrap",
+        {
+            "label": "Market Wrap",
+            "horizon": "intraday",
+            "base_impact": 0.26,
+            "patterns": tuple(_MARKET_WRAP_PHRASES),
+            "note": "Market-color headlines are useful context but rarely a standalone edge.",
+        },
+    ),
+    (
+        "opinion",
+        {
+            "label": "Opinion",
+            "horizon": "intraday",
+            "base_impact": 0.18,
+            "patterns": tuple(_LOW_SIGNAL_PHRASES),
+            "note": "Opinion headlines carry low tradable information density.",
+        },
+    ),
+]
+
 
 def _news_path(symbol: str) -> str:
     return os.path.join(DATA_DIR, f"news_{symbol.upper()}.csv")
@@ -178,11 +446,15 @@ def _state_path(symbol: str) -> str:
     return os.path.join(DATA_DIR, f"news_state_{symbol.upper()}.json")
 
 
-def _archive_query(symbol: str) -> str:
-    sym = str(symbol or "").upper()
-    meta = INSTRUMENTS.get(sym, {}) if isinstance(INSTRUMENTS, dict) else {}
+def _instrument_meta(symbol: str | None) -> dict:
+    sym = normalize_symbol(symbol)
+    return build_instrument_meta(sym, overrides=INSTRUMENTS.get(sym, {}) if sym else {})
+
+
+def _alias_terms(symbol: str | None) -> list[str]:
+    meta = _instrument_meta(symbol)
     aliases = []
-    for raw in [sym, meta.get("display_name"), meta.get("company_name")] + list(meta.get("news_aliases", []) or []):
+    for raw in [symbol, meta.get("display_name"), meta.get("company_name"), *list(meta.get("news_aliases", []) or [])]:
         text = str(raw or "").strip()
         if text:
             aliases.append(text)
@@ -194,9 +466,51 @@ def _archive_query(symbol: str) -> str:
             continue
         seen.add(key)
         deduped.append(item)
-    if sym == "QQQ":
-        return '("invesco qqq" OR "nasdaq 100" OR "nasdaq-100" OR qqq OR nvidia OR microsoft OR apple OR amazon OR alphabet OR meta OR semiconductor OR ai)'
-    terms = [f'"{item}"' if " " in item else item for item in deduped[:8]]
+    return deduped
+
+
+def _theme_terms_for_symbol(symbol: str | None, meta: dict | None = None) -> list[str]:
+    payload = dict(meta or _instrument_meta(symbol))
+    weights = dict(payload.get("news_theme_weights") or {})
+    terms = []
+    ranked = sorted(weights.items(), key=lambda item: float(item[1]), reverse=True)
+    theme_seed = {
+        "technology": ["technology", "semiconductor", "ai"],
+        "communications": ["media", "telecom", "streaming"],
+        "consumer": ["retail", "consumer", "e-commerce"],
+        "healthcare": ["healthcare", "pharma", "biotech"],
+        "financials": ["banking", "payments", "credit"],
+        "industrials": ["industrial", "defense", "transport"],
+        "energy": ["oil", "gas", "energy"],
+        "materials": ["metals", "mining", "materials"],
+        "utilities": ["utilities", "power", "grid"],
+        "real_estate": ["real estate", "reit", "property"],
+        "broad_market": ["stocks", "market", "futures"],
+    }
+    for theme, score in ranked[:2]:
+        if float(score) < 0.55:
+            continue
+        terms.extend(theme_seed.get(str(theme), []))
+    sector_etf = str((payload.get("context_daily_symbols") or {}).get("sector") or "").strip()
+    if sector_etf and sector_etf.upper() != normalize_symbol(symbol):
+        terms.append(sector_etf.upper())
+    return terms[:8]
+
+
+def _archive_query(symbol: str) -> str:
+    sym = normalize_symbol(symbol)
+    meta = _instrument_meta(sym)
+    aliases = _alias_terms(sym)
+    theme_terms = _theme_terms_for_symbol(sym, meta=meta)
+    deduped = []
+    seen = set()
+    for item in aliases + theme_terms:
+        key = str(item or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(str(item).strip())
+    terms = [f'"{item}"' if " " in item else item for item in deduped[:10]]
     return "(" + " OR ".join(terms or [f'"{sym}"']) + ")"
 
 
@@ -219,6 +533,11 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"[A-Za-z]+", str(text or "").lower())
 
 
+def _normalized_headline_signature(text: str) -> str:
+    toks = [tok for tok in _tokenize(text) if len(tok) > 2 and tok not in _STOPWORDS]
+    return " ".join(toks[:12])
+
+
 def _phrase_score(text_norm: str) -> float:
     score = 0.0
     for phrase, w in _POS_PHRASES.items():
@@ -230,66 +549,226 @@ def _phrase_score(text_norm: str) -> float:
     return float(score)
 
 
-def _feed_relevance_prior(instrument_symbol: str | None, text_norm: str, toks: list[str]) -> float:
-    sym = str(instrument_symbol or "").upper()
+def _source_weight(source: str | None) -> float:
+    src = str(source or "").strip().lower()
+    if not src:
+        return 0.85
+    for marker, weight in _SOURCE_WEIGHT_OVERRIDES.items():
+        if marker in src:
+            return float(weight)
+    return 0.88
+
+
+def _noise_score(headline: str, source: str | None = None) -> float:
+    text = str(headline or "").strip().lower()
+    score = 0.0
+    for phrase in _LOW_SIGNAL_PHRASES:
+        if phrase in text:
+            score += 0.42
+    for phrase in _MARKET_WRAP_PHRASES:
+        if phrase in text:
+            score += 0.16
+    src = str(source or "").strip().lower()
+    if any(marker in src for marker in _LOW_SIGNAL_SOURCE_MARKERS):
+        score += 0.20
+    if "opinion" in text or "editorial" in text:
+        score += 0.18
+    return float(max(0.0, min(0.95, score)))
+
+
+def _headline_event_detail(headline: str, source: str | None = None, instrument_symbol: str | None = None) -> dict:
+    text = str(headline or "").strip()
+    if not text:
+        return {
+            "event_type": "general",
+            "event_label": "General",
+            "impact_score": 0.18,
+            "impact_horizon": "intraday",
+            "source_weight": _source_weight(source),
+            "noise_score": 0.0,
+            "signal_note": "No structured event tag could be inferred from the headline.",
+            "headline_signature": "",
+        }
+    raw_lower = text.lower()
+    signature = _normalized_headline_signature(text)
+    toks = _tokenize(text)
+    symbol_specific = _symbol_specific_relevance(text, toks, instrument_symbol=instrument_symbol)
+    theme_scores = _theme_relevance_scores(text, toks, instrument_symbol=instrument_symbol)
+    best = None
+    best_score = -1.0
+    for event_type, profile in _EVENT_TYPE_PROFILES:
+        hits = [pat for pat in profile["patterns"] if pat and pat in raw_lower]
+        if not hits:
+            continue
+        score = float(profile["base_impact"] + (0.07 * min(3, len(hits))))
+        if symbol_specific >= 0.55:
+            score += 0.06
+        if max(list(theme_scores.values()) or [0.0]) >= 0.45:
+            score += 0.03
+        if score > best_score:
+            best_score = score
+            best = (event_type, profile)
+    if best is None:
+        best = (
+            "general",
+            {
+                "label": "General",
+                "horizon": "intraday",
+                "base_impact": 0.24,
+                "note": "General sector-tone headline; use only as low-conviction context.",
+            },
+        )
+    event_type, profile = best
+    source_weight = _source_weight(source)
+    noise_score = _noise_score(text, source=source)
+    impact_score = float(profile["base_impact"])
+    if any(phrase in raw_lower for phrase in ("raises guidance", "cuts guidance", "beats estimates", "misses estimates", "antitrust probe", "export controls", "profit warning")):
+        impact_score += 0.08
+    if noise_score >= 0.55:
+        impact_score *= 0.75
+    impact_score = float(max(0.10, min(1.0, impact_score)))
+    note = str(profile.get("note") or "")
+    if noise_score >= 0.60:
+        note = "Opinion or market-color headline; treat it as low-conviction context unless tape confirms."
+    return {
+        "event_type": str(event_type),
+        "event_label": str(profile.get("label") or event_type.title()),
+        "impact_score": impact_score,
+        "impact_horizon": str(profile.get("horizon") or "intraday"),
+        "source_weight": float(max(0.45, min(1.30, source_weight))),
+        "noise_score": noise_score,
+        "signal_note": note,
+        "headline_signature": signature,
+    }
+
+
+def _novelty_scores(frame: pd.DataFrame) -> pd.Series:
+    if frame is None or frame.empty:
+        return pd.Series(dtype=float)
+    if "headline_signature" in frame.columns:
+        signature = frame["headline_signature"].fillna("").astype(str)
+    else:
+        signature = frame.get("headline", pd.Series("", index=frame.index)).fillna("").astype(str).map(_normalized_headline_signature)
+    ts = pd.to_datetime(frame.get("published_at"), utc=True, errors="coerce")
+    if ts is None or len(ts) != len(frame):
+        ts = pd.Series(pd.Timestamp.now(tz="UTC"), index=frame.index)
+    order = np.argsort(ts.fillna(pd.Timestamp.now(tz="UTC")).astype("int64", copy=False).to_numpy())
+    out = np.ones(len(frame), dtype=float)
+    seen: dict[str, list[pd.Timestamp]] = {}
+    for pos in order:
+        idx = frame.index[pos]
+        sig = str(signature.loc[idx]).strip()
+        cur_ts = ts.loc[idx]
+        if pd.isna(cur_ts) or not sig:
+            out[pos] = 1.0
+            continue
+        cur_ts = pd.Timestamp(cur_ts)
+        history = [item for item in seen.get(sig, []) if (cur_ts - item).total_seconds() <= 7 * 86400.0]
+        dup_recent = [item for item in history if (cur_ts - item).total_seconds() <= 72 * 3600.0]
+        dup_count = len(dup_recent)
+        if dup_count <= 0:
+            novelty = 1.0
+        elif dup_count == 1:
+            novelty = 0.72
+        elif dup_count == 2:
+            novelty = 0.52
+        else:
+            novelty = 0.36
+        out[pos] = novelty
+        history.append(cur_ts)
+        seen[sig] = history[-8:]
+    return pd.Series(out, index=frame.index, dtype=float)
+
+
+def _alias_hit_score(text: str, aliases: list[str]) -> float:
+    text_lower = str(text or "").lower()
+    best = 0.0
+    for alias in aliases:
+        raw = str(alias or "").strip()
+        if not raw:
+            continue
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(raw.lower())}(?![A-Za-z0-9])"
+        if re.search(pattern, text_lower):
+            best = max(best, 0.96 if len(raw) <= 6 else 0.88)
+    return float(max(0.0, min(1.0, best)))
+
+
+def _theme_relevance_scores(headline: str, toks: list[str], instrument_symbol: str | None = None) -> dict[str, float]:
+    text = str(headline or "").lower()
+    text_norm = " ".join(toks)
+    meta = _instrument_meta(instrument_symbol)
+    weights = dict(meta.get("news_theme_weights") or {})
+    sector = str(meta.get("sector") or "").lower()
+    sector_theme = _THEME_ALIAS_BY_SECTOR.get(sector)
+    scores: dict[str, float] = {}
+    token_set = set(toks)
+    for theme, keywords in _SECTOR_THEME_KEYWORDS.items():
+        hits = 0.0
+        for term in keywords:
+            term_text = str(term or "").lower()
+            if not term_text:
+                continue
+            if " " in term_text:
+                if term_text in text:
+                    hits += 1.0
+            elif term_text in token_set:
+                hits += 1.0
+        base = 0.18 * min(4.0, hits)
+        if sector_theme == theme and hits > 0:
+            base += 0.28
+        if str((meta.get("context_daily_symbols") or {}).get("sector") or "").lower() in text:
+            base += 0.18 if sector_theme == theme else 0.08
+        if theme == "technology" and any(p in text for p in _DIRECT_QQQ_PHRASES):
+            base = max(base, 0.78)
+        weight = _safe_float(weights.get(theme)) or 0.0
+        scores[theme] = float(max(0.0, min(1.0, base * (0.50 + 0.50 * weight))))
+    scores["broad_market"] = float(
+        max(0.0, min(1.0, (0.16 * min(4.0, sum(1 for t in toks if t in _MARKET_KEYWORDS))) * (0.45 + 0.55 * (_safe_float(weights.get("broad_market")) or 0.55))))
+    )
+    return scores
+
+
+def _symbol_specific_relevance(headline: str, toks: list[str], instrument_symbol: str | None = None) -> float:
+    sym = normalize_symbol(instrument_symbol)
     if not sym:
         return 0.0
-    base = 0.0
-    if sym == "QQQ":
-        direct = any(p in text_norm for p in _DIRECT_QQQ_PHRASES)
+    meta = _instrument_meta(sym)
+    aliases = _alias_terms(sym)
+    score = _alias_hit_score(headline, aliases)
+    if sym == "QQQ" and any(p in str(headline or "").lower() for p in _DIRECT_QQQ_PHRASES):
+        score = max(score, 0.96)
+    sector_theme = _THEME_ALIAS_BY_SECTOR.get(str(meta.get("sector") or "").lower())
+    weights = dict(meta.get("news_theme_weights") or {})
+    if sector_theme == "technology" and score < 0.55:
+        tech_hits = sum(1 for t in toks if t in _TECH_KEYWORDS or t in _TECH_ENTITIES)
+        if tech_hits >= 3 and sym in {"QQQ", "SMH", "SOXX"}:
+            score = max(score, 0.58)
+    if str(meta.get("instrument_kind") or "").lower() == "etf" and score < 0.55:
         market_hits = sum(1 for t in toks if t in _MARKET_KEYWORDS)
-        if direct:
-            base = 0.72
-        elif market_hits >= 2:
-            base = 0.30
-        else:
-            base = 0.18
-        if any(t in _MACRO_KEYWORDS for t in toks) and base >= 0.25:
-            base = min(1.0, base + 0.10)
-    return float(max(0.0, min(1.0, base)))
+        if market_hits >= 2:
+            score = max(score, 0.22 + 0.38 * (_safe_float(weights.get("broad_market")) or 0.6))
+    return float(max(0.0, min(1.0, score)))
 
 
 def _tech_relevance(headline: str, toks: list[str], instrument_symbol: str | None = None) -> float:
-    text = str(headline or "").lower()
-    text_norm = " ".join(toks)
-    hit_terms = sum(1 for t in toks if t in _TECH_KEYWORDS or t in _TECH_ENTITIES)
-    entity_hits = sum(1 for e in _TECH_ENTITIES if e in text)
-    market_hits = sum(1 for t in toks if t in _MARKET_KEYWORDS)
-    macro_hits = sum(1 for t in toks if t in _MACRO_KEYWORDS)
-    base = _feed_relevance_prior(instrument_symbol, text_norm, toks)
-    if hit_terms > 0 or entity_hits > 0:
-        base = min(1.0, base + 0.22 * float(hit_terms) + 0.26 * float(entity_hits))
-    if market_hits >= 2 and (hit_terms > 0 or entity_hits > 0):
-        base = min(1.0, base + 0.10)
-    if macro_hits > 0 and (base >= 0.25 or market_hits >= 2):
-        base = min(1.0, base + 0.08 * min(2.0, float(macro_hits)))
-    if any(p in text for p in _DIRECT_QQQ_PHRASES):
-        base = max(base, 0.75)
-    if "exchange traded funds" in text_norm or "equity futures" in text_norm:
-        base = min(1.0, max(base, 0.30) + 0.08)
-    return float(max(0.0, min(1.0, base)))
+    theme_scores = _theme_relevance_scores(headline, toks, instrument_symbol=instrument_symbol)
+    return float(max(theme_scores.get("technology", 0.0), theme_scores.get("communications", 0.0) * 0.60))
 
 
 def _political_relevance(headline: str, toks: list[str], instrument_symbol: str | None = None) -> float:
     text = str(headline or "").lower()
     text_norm = " ".join(toks)
+    meta = _instrument_meta(instrument_symbol)
     policy_hits = sum(1 for t in toks if t in _POLITICAL_KEYWORDS)
     entity_hits = sum(1 for e in _POLITICAL_ENTITIES if e in text)
-    tech_hits = sum(1 for t in toks if t in _TECH_KEYWORDS or t in _TECH_ENTITIES)
     macro_hits = sum(1 for t in toks if t in _MACRO_KEYWORDS)
-    market_hits = sum(1 for t in toks if t in _MARKET_KEYWORDS)
     phrase_hits = sum(1 for p in set(_POLITICAL_POS_PHRASES) | set(_POLITICAL_NEG_PHRASES) if p in text_norm)
-    base = 0.0
-    if policy_hits > 0 or entity_hits > 0 or phrase_hits > 0:
-        base = 0.16 * float(policy_hits) + 0.22 * float(entity_hits) + 0.16 * float(phrase_hits)
-    if tech_hits > 0:
-        base += 0.14 * min(2.0, float(tech_hits))
-    if market_hits > 0:
-        base += 0.08 * min(2.0, float(market_hits))
+    base = (0.15 * min(4.0, float(policy_hits))) + (0.20 * min(3.0, float(entity_hits))) + (0.14 * min(3.0, float(phrase_hits)))
     if macro_hits > 0:
-        base += 0.06 * min(2.0, float(macro_hits))
-    if str(instrument_symbol or "").upper() == "QQQ" and (tech_hits > 0 or any(p in text for p in _DIRECT_QQQ_PHRASES)):
-        base += 0.10
+        base += 0.08 * min(3.0, float(macro_hits))
+    base *= (0.40 + 0.60 * max(_safe_float(meta.get("macro_sensitivity")) or 0.0, _safe_float(meta.get("regulatory_sensitivity")) or 0.0))
+    if _symbol_specific_relevance(headline, toks, instrument_symbol=instrument_symbol) >= 0.55 and ("sec" in toks or "ftc" in toks or "doj" in toks):
+        base = max(base, 0.62)
     return float(max(0.0, min(1.0, base)))
 
 
@@ -439,6 +918,19 @@ def _headline_sentiment_detail(headline: str, instrument_symbol: str | None = No
             "tech_relevant": False,
             "political_relevance": 0.0,
             "political_relevant": False,
+            "symbol_specific_relevance": 0.0,
+            "sector_relevance": 0.0,
+            "macro_relevance": 0.0,
+            "broad_market_relevance": 0.0,
+            "relevance_scope": "low_value_noise",
+            "relevance_scope_label": _SCOPE_LABELS["low_value_noise"],
+            "theme_bucket": "broad_market",
+            "theme_relevance": 0.0,
+            "symbol_specific": False,
+            "sector_specific": False,
+            "macro_relevant": False,
+            "broad_market_relevant": False,
+            "opinionated": False,
         }
 
     text_norm = " ".join(toks)
@@ -463,15 +955,41 @@ def _headline_sentiment_detail(headline: str, instrument_symbol: str | None = No
 
     norm = max(2.0, float(len(toks)) ** 0.65)
     score = float(score_raw / norm)
-    tech_relevance = _tech_relevance(headline, toks, instrument_symbol=instrument_symbol)
+    theme_scores = _theme_relevance_scores(headline, toks, instrument_symbol=instrument_symbol)
+    theme_items = sorted(theme_scores.items(), key=lambda item: float(item[1]), reverse=True)
+    theme_bucket, theme_relevance = theme_items[0] if theme_items else ("broad_market", 0.0)
+    symbol_specific_relevance = _symbol_specific_relevance(headline, toks, instrument_symbol=instrument_symbol)
+    sector_values = [value for key, value in theme_scores.items() if key != "broad_market"]
+    sector_relevance = float(max(sector_values or [0.0]))
+    broad_market_relevance = float(theme_scores.get("broad_market", 0.0))
     political_relevance = _political_relevance(headline, toks, instrument_symbol=instrument_symbol)
-    relevance = float(max(tech_relevance, (0.85 * political_relevance) + (0.15 * tech_relevance)))
+    opinion_like = bool(_noise_score(headline) >= 0.60 or "opinion" in text_norm or "editorial" in text_norm)
+    relevance = float(max(symbol_specific_relevance, sector_relevance, political_relevance, broad_market_relevance))
+    if opinion_like and symbol_specific_relevance < 0.55:
+        relevance *= 0.72
     if relevance <= 0.0:
         score = 0.0
     else:
         # Downweight weakly relevant stories.
         score *= (0.45 + 0.55 * relevance)
     score = float(max(-1.0, min(1.0, score)))
+    scope = "low_value_noise"
+    scope_score = 0.0
+    if opinion_like and symbol_specific_relevance < 0.55 and sector_relevance < 0.45 and political_relevance < 0.35:
+        scope = "opinion_commentary"
+        scope_score = max(relevance, 0.20)
+    if symbol_specific_relevance >= max(sector_relevance, political_relevance, broad_market_relevance, 0.52):
+        scope = "symbol_specific"
+        scope_score = symbol_specific_relevance
+    elif sector_relevance >= max(political_relevance, broad_market_relevance, 0.42):
+        scope = "sector_specific"
+        scope_score = sector_relevance
+    elif political_relevance >= max(broad_market_relevance, 0.35):
+        scope = "macro_political_regulatory"
+        scope_score = political_relevance
+    elif broad_market_relevance >= 0.28:
+        scope = "broad_market"
+        scope_score = broad_market_relevance
     if score > 0.15:
         label = "positive"
     elif score < -0.15:
@@ -482,9 +1000,23 @@ def _headline_sentiment_detail(headline: str, instrument_symbol: str | None = No
         "score": float(score),
         "label": label,
         "relevance": float(relevance),
-        "tech_relevant": bool(tech_relevance >= 0.25),
+        "tech_relevant": bool(_tech_relevance(headline, toks, instrument_symbol=instrument_symbol) >= 0.25),
         "political_relevance": float(political_relevance),
         "political_relevant": bool(political_relevance >= 0.25),
+        "symbol_specific_relevance": float(symbol_specific_relevance),
+        "sector_relevance": float(sector_relevance),
+        "macro_relevance": float(political_relevance),
+        "broad_market_relevance": float(broad_market_relevance),
+        "relevance_scope": scope,
+        "relevance_scope_label": _SCOPE_LABELS.get(scope, "Relevant"),
+        "scope_score": float(scope_score),
+        "theme_bucket": str(theme_bucket),
+        "theme_relevance": float(theme_relevance),
+        "symbol_specific": bool(symbol_specific_relevance >= 0.52),
+        "sector_specific": bool(sector_relevance >= 0.42),
+        "macro_relevant": bool(political_relevance >= 0.25),
+        "broad_market_relevant": bool(broad_market_relevance >= 0.28),
+        "opinionated": opinion_like,
     }
 
 
@@ -526,9 +1058,13 @@ def _normalize_news_frame(df: pd.DataFrame, default_symbol: str | None = None) -
     if float(rel_existing.abs().sum()) == 0.0:
         need_relevance = True
     details = []
-    for headline, sym in zip(out["headline"].astype(str).tolist(), out["symbol"].astype(str).tolist()):
+    event_details = []
+    sources = out.get("source", pd.Series("", index=out.index)).fillna("").astype(str).tolist()
+    for headline, sym, source in zip(out["headline"].astype(str).tolist(), out["symbol"].astype(str).tolist(), sources):
         details.append(_headline_sentiment_detail(headline, instrument_symbol=sym or default_symbol))
+        event_details.append(_headline_event_detail(headline, source=source, instrument_symbol=sym or default_symbol))
     det_df = pd.DataFrame(details, index=out.index)
+    evt_df = pd.DataFrame(event_details, index=out.index)
     if need_sentiment:
         out["sentiment_score"] = pd.to_numeric(det_df.get("score"), errors="coerce").fillna(0.0).clip(-1.0, 1.0)
         out["sentiment_label"] = det_df.get("label", "neutral").astype(str).str.lower()
@@ -553,6 +1089,101 @@ def _normalize_news_frame(df: pd.DataFrame, default_symbol: str | None = None) -
         det_df.get("political_relevant", out.get("political_relevant")),
         errors="coerce",
     ).fillna(0).astype(int)
+    out["symbol_specific_relevance"] = pd.to_numeric(
+        det_df.get("symbol_specific_relevance", out.get("symbol_specific_relevance")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["sector_relevance_score"] = pd.to_numeric(
+        det_df.get("sector_relevance", out.get("sector_relevance_score")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["macro_relevance_score"] = pd.to_numeric(
+        det_df.get("macro_relevance", out.get("macro_relevance_score")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["broad_market_relevance_score"] = pd.to_numeric(
+        det_df.get("broad_market_relevance", out.get("broad_market_relevance_score")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["symbol_specific"] = pd.to_numeric(
+        det_df.get("symbol_specific", out.get("symbol_specific")),
+        errors="coerce",
+    ).fillna(0).astype(int)
+    out["sector_specific"] = pd.to_numeric(
+        det_df.get("sector_specific", out.get("sector_specific")),
+        errors="coerce",
+    ).fillna(0).astype(int)
+    out["macro_relevant"] = pd.to_numeric(
+        det_df.get("macro_relevant", out.get("macro_relevant")),
+        errors="coerce",
+    ).fillna(0).astype(int)
+    out["broad_market_relevant"] = pd.to_numeric(
+        det_df.get("broad_market_relevant", out.get("broad_market_relevant")),
+        errors="coerce",
+    ).fillna(0).astype(int)
+    out["opinionated"] = pd.to_numeric(
+        det_df.get("opinionated", out.get("opinionated")),
+        errors="coerce",
+    ).fillna(0).astype(int)
+    out["relevance_scope"] = det_df.get("relevance_scope", out.get("relevance_scope", "low_value_noise")).astype(str)
+    out["relevance_scope_label"] = det_df.get("relevance_scope_label", out.get("relevance_scope_label", "Low-value / noise")).astype(str)
+    out["scope_score"] = pd.to_numeric(
+        det_df.get("scope_score", out.get("scope_score")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["theme_bucket"] = det_df.get("theme_bucket", out.get("theme_bucket", "broad_market")).astype(str)
+    out["theme_relevance_score"] = pd.to_numeric(
+        det_df.get("theme_relevance", out.get("theme_relevance_score")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["event_type"] = evt_df.get("event_type", out.get("event_type", "general")).astype(str).str.lower()
+    out["event_label"] = evt_df.get("event_label", out.get("event_label", "General")).astype(str)
+    out["impact_score"] = pd.to_numeric(
+        evt_df.get("impact_score", out.get("impact_score")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["impact_horizon"] = evt_df.get("impact_horizon", out.get("impact_horizon", "intraday")).astype(str).str.lower()
+    out["source_weight"] = pd.to_numeric(
+        evt_df.get("source_weight", out.get("source_weight")),
+        errors="coerce",
+    ).fillna(0.85).clip(0.45, 1.30)
+    out["noise_score"] = pd.to_numeric(
+        evt_df.get("noise_score", out.get("noise_score")),
+        errors="coerce",
+    ).fillna(0.0).clip(0.0, 1.0)
+    out["signal_note"] = evt_df.get("signal_note", out.get("signal_note", "")).astype(str)
+    out["headline_signature"] = evt_df.get("headline_signature", out.get("headline_signature", "")).astype(str)
+    novelty = _novelty_scores(out)
+    if novelty is None or novelty.empty:
+        out["novelty_score"] = 1.0
+    else:
+        out["novelty_score"] = pd.to_numeric(novelty, errors="coerce").reindex(out.index).fillna(1.0).clip(0.0, 1.0)
+    relevance = pd.to_numeric(out.get("relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    sentiment = pd.to_numeric(out.get("sentiment_score"), errors="coerce").fillna(0.0).clip(-1.0, 1.0)
+    scope_score = pd.to_numeric(out.get("scope_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    symbol_specific = pd.to_numeric(out.get("symbol_specific"), errors="coerce").fillna(0).astype(int)
+    opinionated = pd.to_numeric(out.get("opinionated"), errors="coerce").fillna(0).astype(int)
+    base_importance = (0.30 + 0.70 * out["impact_score"]) * (0.30 + 0.70 * relevance)
+    importance = (
+        base_importance
+        * (0.45 + 0.55 * scope_score)
+        * (1.10 + 0.20 * symbol_specific)
+        * out["source_weight"]
+        * out["novelty_score"]
+        * (1.0 - (0.65 * out["noise_score"]))
+        * (0.80 + 0.20 * sentiment.abs())
+    )
+    low_value_mask = out["event_type"].isin({"opinion", "market_wrap", "capital_flows"}) & (relevance < 0.45)
+    importance = importance.where(~low_value_mask, importance * 0.65)
+    importance = importance.where(opinionated <= 0, importance * (0.78 + 0.22 * symbol_specific))
+    out["importance_score"] = pd.to_numeric(importance, errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    direction_score = sentiment * (0.35 + 0.65 * out["impact_score"]) * out["source_weight"] * out["novelty_score"] * (1.0 - 0.45 * out["noise_score"])
+    out["direction_score"] = pd.to_numeric(direction_score, errors="coerce").fillna(0.0).clip(-1.0, 1.0)
+    out["signal_direction"] = np.where(
+        out["direction_score"] > 0.05,
+        "bullish",
+        np.where(out["direction_score"] < -0.05, "bearish", "neutral"),
+    )
     return out
 
 
@@ -591,6 +1222,7 @@ def _parse_item(item: dict, symbol: str) -> dict | None:
     if pd.isna(ts):
         ts = pd.Timestamp.now(tz="UTC")
     sent = _headline_sentiment_detail(title, instrument_symbol=symbol)
+    event = _headline_event_detail(title, source=source, instrument_symbol=symbol)
     uid = str(base.get("id") or item.get("id") or item.get("uuid") or "") or None
     if uid is None:
         uid = f"{ts.isoformat()}|{title[:120]}"
@@ -607,6 +1239,28 @@ def _parse_item(item: dict, symbol: str) -> dict | None:
         "tech_relevant": int(1 if sent["tech_relevant"] else 0),
         "political_relevance_score": float(sent.get("political_relevance", 0.0)),
         "political_relevant": int(1 if sent.get("political_relevant") else 0),
+        "symbol_specific_relevance": float(sent.get("symbol_specific_relevance", 0.0)),
+        "sector_relevance_score": float(sent.get("sector_relevance", 0.0)),
+        "macro_relevance_score": float(sent.get("macro_relevance", 0.0)),
+        "broad_market_relevance_score": float(sent.get("broad_market_relevance", 0.0)),
+        "symbol_specific": int(1 if sent.get("symbol_specific") else 0),
+        "sector_specific": int(1 if sent.get("sector_specific") else 0),
+        "macro_relevant": int(1 if sent.get("macro_relevant") else 0),
+        "broad_market_relevant": int(1 if sent.get("broad_market_relevant") else 0),
+        "opinionated": int(1 if sent.get("opinionated") else 0),
+        "relevance_scope": str(sent.get("relevance_scope") or "low_value_noise"),
+        "relevance_scope_label": str(sent.get("relevance_scope_label") or _SCOPE_LABELS["low_value_noise"]),
+        "scope_score": float(sent.get("scope_score", 0.0)),
+        "theme_bucket": str(sent.get("theme_bucket") or "broad_market"),
+        "theme_relevance_score": float(sent.get("theme_relevance", 0.0)),
+        "event_type": str(event.get("event_type") or "general"),
+        "event_label": str(event.get("event_label") or "General"),
+        "impact_score": float(event.get("impact_score") or 0.0),
+        "impact_horizon": str(event.get("impact_horizon") or "intraday"),
+        "source_weight": float(event.get("source_weight") or 0.85),
+        "noise_score": float(event.get("noise_score") or 0.0),
+        "signal_note": str(event.get("signal_note") or ""),
+        "headline_signature": str(event.get("headline_signature") or ""),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -766,13 +1420,15 @@ def _parse_archive_item(item: dict, symbol: str) -> dict | None:
         return None
     ts = _archive_timestamp(item.get("seendate") or item.get("date") or item.get("seenDate"))
     sent = _headline_sentiment_detail(title, instrument_symbol=symbol)
+    src = str(item.get("domain") or item.get("sourcecountry") or "archive")
+    event = _headline_event_detail(title, source=src, instrument_symbol=symbol)
     uid = f"archive|{url}|{ts.isoformat()}"
     return {
         "symbol": symbol.upper(),
         "headline_id": uid,
         "published_at": ts.isoformat(),
         "headline": str(title),
-        "source": str(item.get("domain") or item.get("sourcecountry") or "archive"),
+        "source": src,
         "url": str(url),
         "sentiment_score": float(sent["score"]),
         "sentiment_label": str(sent["label"]),
@@ -780,6 +1436,28 @@ def _parse_archive_item(item: dict, symbol: str) -> dict | None:
         "tech_relevant": int(1 if sent["tech_relevant"] else 0),
         "political_relevance_score": float(sent.get("political_relevance", 0.0)),
         "political_relevant": int(1 if sent.get("political_relevant") else 0),
+        "symbol_specific_relevance": float(sent.get("symbol_specific_relevance", 0.0)),
+        "sector_relevance_score": float(sent.get("sector_relevance", 0.0)),
+        "macro_relevance_score": float(sent.get("macro_relevance", 0.0)),
+        "broad_market_relevance_score": float(sent.get("broad_market_relevance", 0.0)),
+        "symbol_specific": int(1 if sent.get("symbol_specific") else 0),
+        "sector_specific": int(1 if sent.get("sector_specific") else 0),
+        "macro_relevant": int(1 if sent.get("macro_relevant") else 0),
+        "broad_market_relevant": int(1 if sent.get("broad_market_relevant") else 0),
+        "opinionated": int(1 if sent.get("opinionated") else 0),
+        "relevance_scope": str(sent.get("relevance_scope") or "low_value_noise"),
+        "relevance_scope_label": str(sent.get("relevance_scope_label") or _SCOPE_LABELS["low_value_noise"]),
+        "scope_score": float(sent.get("scope_score", 0.0)),
+        "theme_bucket": str(sent.get("theme_bucket") or "broad_market"),
+        "theme_relevance_score": float(sent.get("theme_relevance", 0.0)),
+        "event_type": str(event.get("event_type") or "general"),
+        "event_label": str(event.get("event_label") or "General"),
+        "impact_score": float(event.get("impact_score") or 0.0),
+        "impact_horizon": str(event.get("impact_horizon") or "intraday"),
+        "source_weight": float(event.get("source_weight") or 0.85),
+        "noise_score": float(event.get("noise_score") or 0.0),
+        "signal_note": str(event.get("signal_note") or ""),
+        "headline_signature": str(event.get("headline_signature") or ""),
         "ingested_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -825,31 +1503,38 @@ def fetch_archive_headlines(symbol: str = "QQQ", start=None, end=None,
     return out
 
 
-def fetch_latest_headlines(symbol: str = "QQQ", max_items: int = 200) -> list[dict]:
+def _fetch_latest_headlines_result(symbol: str = "QQQ", max_items: int = 200) -> tuple[list[dict], str | None]:
     if not NEWS_PIPELINE_ENABLED:
-        return []
+        return [], "disabled"
     try:
         ticker = yf.Ticker(symbol)
         raw = ticker.news or []
-    except Exception:
+    except Exception as exc:
         logger.debug("News fetch failed for %s", symbol, exc_info=True)
-        return []
+        return [], str(exc)
     out = []
     for item in raw[:max_items]:
         parsed = _parse_item(item, symbol=symbol)
         if parsed:
             out.append(parsed)
-    return out
+    return out, None
+
+
+def fetch_latest_headlines(symbol: str = "QQQ", max_items: int = 200) -> list[dict]:
+    rows, _ = _fetch_latest_headlines_result(symbol=symbol, max_items=max_items)
+    return rows
 
 
 def update_news_store(symbol: str = "QQQ", max_items: int = 200) -> dict:
     symbol = str(symbol or "QQQ").upper()
     path = _news_path(symbol)
     current = _load_existing_news(path)
-    rows = fetch_latest_headlines(symbol=symbol, max_items=max_items)
+    rows, fetch_error = _fetch_latest_headlines_result(symbol=symbol, max_items=max_items)
     incoming = pd.DataFrame(rows)
     if incoming.empty:
-        return {"symbol": symbol, "added": 0, "rows": int(len(current))}
+        status = "error" if fetch_error else "ok"
+        reason = fetch_error or "no_new_headlines"
+        return {"symbol": symbol, "status": status, "reason": reason, "added": 0, "rows": int(len(current))}
     incoming = _normalize_news_frame(incoming, default_symbol=symbol)
     if current is None or current.empty:
         merged = incoming
@@ -863,7 +1548,7 @@ def update_news_store(symbol: str = "QQQ", max_items: int = 200) -> dict:
     merged = merged.sort_values("published_at")
     _save_news(path, merged)
     added = max(0, int(len(merged) - len(current)))
-    return {"symbol": symbol, "added": added, "rows": int(len(merged))}
+    return {"symbol": symbol, "status": "ok", "added": added, "rows": int(len(merged))}
 
 
 def backfill_news_archive(symbol: str = "QQQ", lookback_days: int = NEWS_ARCHIVE_LOOKBACK_DAYS,
@@ -958,15 +1643,43 @@ def maybe_refresh_news(symbol: str = None) -> dict:
     if pd.notna(last):
         age = (now - last).total_seconds()
         if age < max(60, int(NEWS_REFRESH_COOLDOWN_SEC)):
-            return {"symbol": symbol, "skipped": True, "reason": "cooldown"}
+            health = get_news_health(symbol)
+            return {
+                "symbol": symbol,
+                "skipped": True,
+                "reason": "cooldown",
+                "status": str(st.get("last_status") or "cooldown"),
+                "health": health,
+            }
     out = update_news_store(symbol=symbol, max_items=200)
+    local_import = None
+    coverage = news_archive_coverage(symbol)
+    try:
+        last_local_import = pd.to_datetime(st.get("last_local_import"), utc=True, errors="coerce")
+    except Exception:
+        last_local_import = pd.NaT
+    import_due = pd.isna(last_local_import) or (now - last_local_import).total_seconds() >= max(6 * 3600, int(NEWS_REFRESH_COOLDOWN_SEC) * 4)
+    if not bool((coverage or {}).get("sufficient_long_horizon", False)) and import_due:
+        local_import = import_local_historical_news(symbol=symbol)
+        coverage = (local_import or {}).get("coverage") or news_archive_coverage(symbol)
+        st["last_local_import"] = now.isoformat()
     st["last_refresh"] = now.isoformat()
     st["last_rows"] = out.get("rows")
+    st["last_status"] = str(out.get("status") or "ok")
+    st["last_reason"] = str(out.get("reason") or "")
+    st["history_ready"] = bool((coverage or {}).get("sufficient_long_horizon", False))
+    st["coverage_ratio"] = _safe_float((coverage or {}).get("coverage_ratio"))
     _save_state(symbol, st)
+    health = get_news_health(symbol)
+    out["coverage"] = coverage
+    out["history_ready"] = bool((coverage or {}).get("sufficient_long_horizon", False))
+    out["local_import"] = local_import
+    out["backfill_recommended"] = not bool((coverage or {}).get("sufficient_long_horizon", False))
+    out["health"] = health
     return out
 
 
-def news_archive_coverage(symbol: str = "QQQ", trading_dates=None, tz: str = "America/New_York") -> dict:
+def news_archive_coverage(symbol: str = "QQQ", trading_dates=None, tz: str = "America/New_York", as_of=None) -> dict:
     symbol = str(symbol or "QQQ").upper()
     path = _news_path(symbol)
     if not os.path.exists(path):
@@ -1004,6 +1717,9 @@ def news_archive_coverage(symbol: str = "QQQ", trading_dates=None, tz: str = "Am
         }
     df["published_at"] = pd.to_datetime(df.get("published_at"), utc=True, errors="coerce")
     df = df.dropna(subset=["published_at"])
+    cutoff_ts = _coerce_utc_ts(as_of)
+    if cutoff_ts is not None:
+        df = df[df["published_at"] <= cutoff_ts].copy()
     if df.empty:
         return {
             "symbol": symbol,
@@ -1041,6 +1757,9 @@ def news_archive_coverage(symbol: str = "QQQ", trading_dates=None, tz: str = "Am
     else:
         trading_idx = pd.DatetimeIndex(pd.to_datetime(trading_dates, utc=True, errors="coerce")).tz_convert(tz)
         trading_idx = pd.DatetimeIndex(pd.to_datetime(trading_idx.date)).unique().sort_values()
+    if cutoff_ts is not None and len(trading_idx):
+        cutoff_local = cutoff_ts.tz_convert(tz)
+        trading_idx = trading_idx[trading_idx <= pd.Timestamp(cutoff_local.date())]
     trading_days = int(len(trading_idx))
     if trading_days <= 0:
         coverage = 0.0
@@ -1062,6 +1781,101 @@ def news_archive_coverage(symbol: str = "QQQ", trading_dates=None, tz: str = "Am
         "end": active_dates.max().strftime("%Y-%m-%d") if len(active_dates) else None,
         "sufficient_long_horizon": sufficient,
     }
+
+
+def get_news_health(symbol: str = "QQQ", trading_dates=None, tz: str = "America/New_York", as_of=None) -> dict:
+    symbol = str(symbol or "QQQ").upper()
+    out = {
+        "symbol": symbol,
+        "enabled": bool(NEWS_PIPELINE_ENABLED),
+        "status": "disabled" if not NEWS_PIPELINE_ENABLED else "missing",
+        "headline_state": "disabled" if not NEWS_PIPELINE_ENABLED else "missing",
+        "history_state": "missing",
+        "signal_ready": False,
+        "history_ready": False,
+    }
+    if not NEWS_PIPELINE_ENABLED:
+        return out
+    path = _news_path(symbol)
+    state = _load_state(symbol)
+    coverage = news_archive_coverage(symbol, trading_dates=trading_dates, tz=tz, as_of=as_of)
+    out["coverage"] = coverage
+    out["history_ready"] = bool((coverage or {}).get("sufficient_long_horizon", False))
+    out["history_state"] = "ready" if out["history_ready"] else "insufficient_history"
+    out["last_refresh"] = state.get("last_refresh")
+    out["last_status"] = state.get("last_status")
+    out["last_reason"] = state.get("last_reason")
+    if not os.path.exists(path):
+        if str(state.get("last_status") or "").lower() == "error":
+            out["status"] = "failed"
+            out["headline_state"] = "failed"
+        return out
+    try:
+        df = _normalize_news_frame(pd.read_csv(path), default_symbol=symbol)
+    except Exception as exc:
+        out["status"] = "error"
+        out["headline_state"] = "failed"
+        out["last_reason"] = str(exc)
+        return out
+    if df is None or df.empty:
+        return out
+    df["published_at"] = pd.to_datetime(df.get("published_at"), utc=True, errors="coerce")
+    df = df.dropna(subset=["published_at"]).copy()
+    now_utc = _coerce_utc_ts(as_of) or pd.Timestamp.now(tz="UTC")
+    df = df[df["published_at"] <= now_utc].copy()
+    if df.empty:
+        return out
+    df["importance_score"] = pd.to_numeric(df.get("importance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["direction_score"] = pd.to_numeric(df.get("direction_score"), errors="coerce").fillna(0.0).clip(-1.0, 1.0)
+    df["relevance_score"] = pd.to_numeric(df.get("relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    meaningful = df[(df["importance_score"] >= 0.18) | (df["relevance_score"] >= 0.25) | (df["direction_score"].abs() >= 0.08)].copy()
+    last_ts = meaningful["published_at"].max() if not meaningful.empty else df["published_at"].max()
+    age_hours = float((now_utc - last_ts).total_seconds() / 3600.0) if pd.notna(last_ts) else None
+    freshness_limit = 96.0 if int(now_utc.dayofweek) >= 5 else 72.0
+    unique_days = int(df["published_at"].dt.floor("D").nunique())
+    meaningful_days = int(meaningful["published_at"].dt.floor("D").nunique()) if not meaningful.empty else 0
+    importance_std = float(df["importance_score"].std()) if len(df) else 0.0
+    direction_std = float(df["direction_score"].std()) if len(df) else 0.0
+    high_impact_recent = 0
+    if not meaningful.empty:
+        fresh_mask = (now_utc - meaningful["published_at"]).dt.total_seconds() <= 24 * 3600.0
+        high_impact_recent = int((meaningful.loc[fresh_mask, "importance_score"] >= 0.40).sum())
+    signal_ready = bool(
+        age_hours is not None
+        and age_hours <= freshness_limit
+        and meaningful_days >= 3
+        and max(importance_std, direction_std) > 1e-6
+        and len(meaningful) >= 3
+    )
+    headline_state = "ok"
+    if len(meaningful) <= 0:
+        headline_state = "no_meaningful_news"
+    elif age_hours is not None and age_hours > freshness_limit:
+        headline_state = "stale"
+    elif str(state.get("last_status") or "").lower() == "error" and age_hours is not None and age_hours > 24.0:
+        headline_state = "failed"
+    elif not signal_ready:
+        headline_state = "thin"
+    status = "ok" if headline_state == "ok" else "degraded"
+    if headline_state in {"failed", "stale"}:
+        status = headline_state
+    out.update(
+        {
+            "status": status,
+            "headline_state": headline_state,
+            "signal_ready": signal_ready,
+            "rows": int(len(df)),
+            "meaningful_rows": int(len(meaningful)),
+            "unique_days": unique_days,
+            "meaningful_days": meaningful_days,
+            "last_published_at": last_ts.isoformat() if pd.notna(last_ts) else None,
+            "age_hours": round(age_hours, 2) if age_hours is not None else None,
+            "importance_std": round(importance_std, 6),
+            "direction_std": round(direction_std, 6),
+            "high_impact_recent": int(high_impact_recent),
+        }
+    )
+    return out
 
 
 def _hawkes_intensity(ts_ns: np.ndarray, weights: np.ndarray, half_life_hours: float = 6.0) -> np.ndarray:
@@ -1163,23 +1977,47 @@ def load_news_features_for_index(
     df["sentiment_label"] = df.get("sentiment_label", "neutral").astype(str).str.lower()
     df["relevance_score"] = pd.to_numeric(df.get("relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
     df["tech_relevant"] = pd.to_numeric(df.get("tech_relevant"), errors="coerce").fillna(0).astype(int)
+    df["symbol_specific"] = pd.to_numeric(df.get("symbol_specific"), errors="coerce").fillna(0).astype(int)
+    df["sector_specific"] = pd.to_numeric(df.get("sector_specific"), errors="coerce").fillna(0).astype(int)
+    df["macro_relevant"] = pd.to_numeric(df.get("macro_relevant"), errors="coerce").fillna(0).astype(int)
+    df["broad_market_relevant"] = pd.to_numeric(df.get("broad_market_relevant"), errors="coerce").fillna(0).astype(int)
     df["political_relevance_score"] = pd.to_numeric(df.get("political_relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
     df["political_relevant"] = pd.to_numeric(df.get("political_relevant"), errors="coerce").fillna(0).astype(int)
-    # Keep only relevant stories for QQQ signal extraction.
+    df["importance_score"] = pd.to_numeric(df.get("importance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["impact_score"] = pd.to_numeric(df.get("impact_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["source_weight"] = pd.to_numeric(df.get("source_weight"), errors="coerce").fillna(0.85).clip(0.45, 1.30)
+    df["novelty_score"] = pd.to_numeric(df.get("novelty_score"), errors="coerce").fillna(1.0).clip(0.0, 1.0)
+    df["noise_score"] = pd.to_numeric(df.get("noise_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    # Keep only stories that are relevant for the active workspace profile.
     df = df[
-        (df["tech_relevant"] > 0)
+        (df["symbol_specific"] > 0)
+        | (df["sector_specific"] > 0)
+        | (df["macro_relevant"] > 0)
+        | (df["broad_market_relevant"] > 0)
+        | (df["tech_relevant"] > 0)
         | (df["political_relevant"] > 0)
-        | (df["relevance_score"] >= 0.25)
+        | (df["relevance_score"] >= 0.22)
     ].copy()
     if df.empty:
         return pd.DataFrame(0.0, index=index_utc, columns=cols)
-    # Relevance-weighted score reduces noise from loosely related articles.
-    df["sentiment_score"] = df["sentiment_score"] * (0.5 + 0.5 * df["relevance_score"])
-    df["political_sentiment_score"] = df["sentiment_score"] * df["political_relevance_score"]
+    # Combine relevance, event impact, novelty and source quality into the live signal weight.
+    signal_weight = (
+        (0.30 + 0.70 * df["relevance_score"])
+        * (0.35 + 0.65 * df["importance_score"])
+        * (0.40 + 0.60 * df["impact_score"])
+        * (0.45 + 0.55 * df["novelty_score"])
+        * (0.60 + 0.40 * df["source_weight"])
+        * (1.0 - 0.50 * df["noise_score"])
+    ).clip(lower=0.0)
+    df["sentiment_score"] = df["sentiment_score"] * signal_weight
+    df["political_sentiment_score"] = df["sentiment_score"] * df["political_relevance_score"] * (0.70 + 0.30 * df["importance_score"])
     df["event_weight"] = (
-        (0.45 + 0.55 * df["relevance_score"])
+        (0.35 + 0.65 * df["importance_score"])
+        * (0.35 + 0.65 * df["impact_score"])
         * (1.0 + df["sentiment_score"].abs())
         * (1.0 + (0.35 * df["political_relevance_score"]))
+        * (0.55 + 0.45 * df["source_weight"])
+        * (1.0 - 0.35 * df["noise_score"])
     )
     ts_ns = df["published_at"].astype("int64", copy=False).to_numpy()
     df["hawkes_intensity"] = _hawkes_intensity(ts_ns, df["event_weight"].to_numpy(dtype=float), half_life_hours=6.0)
@@ -1251,7 +2089,7 @@ def load_news_features_for_index(
     return aligned[cols]
 
 
-def load_recent_headlines(symbol: str = "QQQ", limit: int = 8) -> list[dict]:
+def load_recent_headlines(symbol: str = "QQQ", limit: int = 8, as_of=None) -> list[dict]:
     path = _news_path(symbol.upper())
     if not os.path.exists(path):
         return []
@@ -1262,7 +2100,19 @@ def load_recent_headlines(symbol: str = "QQQ", limit: int = 8) -> list[dict]:
         return []
     if df is None or df.empty:
         return []
-    df = df.sort_values("published_at", ascending=False).head(max(1, int(limit))).copy()
+    df["published_at"] = pd.to_datetime(df.get("published_at"), utc=True, errors="coerce")
+    now = _coerce_utc_ts(as_of) or pd.Timestamp.now(tz="UTC")
+    df = df[df["published_at"] <= now].copy()
+    if df.empty:
+        return []
+    age_hours = ((now - df["published_at"]).dt.total_seconds() / 3600.0).clip(lower=0.0)
+    df["importance_score"] = pd.to_numeric(df.get("importance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["impact_score"] = pd.to_numeric(df.get("impact_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["noise_score"] = pd.to_numeric(df.get("noise_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    df["scope_score"] = pd.to_numeric(df.get("scope_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    freshness = np.exp(-(age_hours / 36.0))
+    df["rank_score"] = (df["importance_score"] * freshness) + (0.20 * df["impact_score"]) + (0.15 * df["scope_score"]) - (0.10 * df["noise_score"])
+    df = df.sort_values(["rank_score", "published_at"], ascending=[False, False]).head(max(1, int(limit))).copy()
     rows = []
     for _, row in df.iterrows():
         rows.append(
@@ -1273,8 +2123,259 @@ def load_recent_headlines(symbol: str = "QQQ", limit: int = 8) -> list[dict]:
                 "label": str(row.get("sentiment_label") or "").strip(),
                 "relevance": _safe_float(row.get("relevance_score")),
                 "political_relevance": _safe_float(row.get("political_relevance_score")),
+                "symbol_specific_relevance": _safe_float(row.get("symbol_specific_relevance")),
+                "sector_relevance": _safe_float(row.get("sector_relevance_score")),
+                "macro_relevance": _safe_float(row.get("macro_relevance_score")),
+                "broad_market_relevance": _safe_float(row.get("broad_market_relevance_score")),
                 "source": str(row.get("source") or "").strip(),
                 "url": str(row.get("url") or "").strip(),
+                "event_type": str(row.get("event_type") or "general").strip(),
+                "event_label": str(row.get("event_label") or "General").strip(),
+                "impact_score": _safe_float(row.get("impact_score")),
+                "impact_horizon": str(row.get("impact_horizon") or "").strip(),
+                "source_weight": _safe_float(row.get("source_weight")),
+                "novelty_score": _safe_float(row.get("novelty_score")),
+                "noise_score": _safe_float(row.get("noise_score")),
+                "importance_score": _safe_float(row.get("importance_score")),
+                "direction_score": _safe_float(row.get("direction_score")),
+                "signal_direction": str(row.get("signal_direction") or "").strip(),
+                "signal_note": str(row.get("signal_note") or "").strip(),
+                "relevance_scope": str(row.get("relevance_scope") or "low_value_noise").strip(),
+                "relevance_scope_label": str(row.get("relevance_scope_label") or _SCOPE_LABELS["low_value_noise"]).strip(),
+                "theme_bucket": str(row.get("theme_bucket") or "broad_market").strip(),
+                "theme_relevance_score": _safe_float(row.get("theme_relevance_score")),
             }
         )
     return rows
+
+
+def register_optional_news_scorer(name: str, scorer: Callable[[str, list[dict], dict], list[dict] | dict | None]):
+    scorer_name = str(name or "").strip().lower()
+    if not scorer_name:
+        raise ValueError("A scorer name is required.")
+    _OPTIONAL_NEWS_SCORERS[scorer_name] = scorer
+
+
+def unregister_optional_news_scorer(name: str):
+    _OPTIONAL_NEWS_SCORERS.pop(str(name or "").strip().lower(), None)
+
+
+def list_optional_news_scorers() -> list[str]:
+    return sorted(_OPTIONAL_NEWS_SCORERS.keys())
+
+
+def _profile_exposure_summary(meta: dict | None) -> dict:
+    payload = dict(meta or {})
+    weights = dict(payload.get("news_theme_weights") or {})
+    ranked_themes = [
+        {"theme": str(theme), "weight": float(score)}
+        for theme, score in sorted(weights.items(), key=lambda item: float(item[1]), reverse=True)
+        if _safe_float(score) is not None
+    ]
+    context_symbols = []
+    seen_context = set()
+    for raw in list((payload.get("context_daily_symbols") or {}).values()):
+        symbol = normalize_symbol(raw)
+        if symbol and symbol not in seen_context:
+            seen_context.add(symbol)
+            context_symbols.append(symbol)
+    aliases = []
+    seen_alias = set()
+    for raw in list(payload.get("news_aliases") or []):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen_alias:
+            continue
+        seen_alias.add(key)
+        aliases.append(text)
+    return {
+        "aliases": aliases[:6],
+        "context_symbols": context_symbols,
+        "dominant_themes": ranked_themes[:3],
+        "macro_sensitivity": _safe_float(payload.get("macro_sensitivity")),
+        "regulatory_sensitivity": _safe_float(payload.get("regulatory_sensitivity")),
+        "broad_market_sensitivity": _safe_float(payload.get("broad_market_sensitivity")),
+    }
+
+
+def _layer_b_candidate_score(item: dict, meta: dict | None = None) -> float:
+    payload = dict(meta or {})
+    weights = dict(payload.get("news_theme_weights") or {})
+    scope = str(item.get("relevance_scope") or "low_value_noise").strip() or "low_value_noise"
+    theme = str(item.get("theme_bucket") or "broad_market").strip() or "broad_market"
+    relevance = _safe_float(item.get("relevance")) or _safe_float(item.get("relevance_score")) or 0.0
+    impact = _safe_float(item.get("impact_score")) or 0.0
+    importance = _safe_float(item.get("importance_score")) or 0.0
+    scope_score = _safe_float(item.get("scope_score")) or 0.0
+    theme_score = _safe_float(item.get("theme_relevance")) or _safe_float(item.get("theme_relevance_score")) or 0.0
+    theme_weight = _safe_float(weights.get(theme)) or _safe_float(weights.get("broad_market")) or 0.0
+    macro_weight = max(_safe_float(payload.get("macro_sensitivity")) or 0.0, _safe_float(weights.get("macro")) or 0.0)
+    regulatory_weight = max(_safe_float(payload.get("regulatory_sensitivity")) or 0.0, _safe_float(weights.get("regulatory")) or 0.0)
+    broad_weight = max(_safe_float(payload.get("broad_market_sensitivity")) or 0.0, _safe_float(weights.get("broad_market")) or 0.0)
+    instrument_kind = str(payload.get("instrument_kind") or payload.get("type") or "equity").strip().lower()
+    scope_boost = 0.55
+    if scope == "symbol_specific":
+        scope_boost = 1.28
+    elif scope == "sector_specific":
+        scope_boost = 0.92 + 0.38 * max(theme_weight, theme_score)
+    elif scope == "macro_political_regulatory":
+        scope_boost = 0.95 + 0.40 * max(macro_weight, regulatory_weight)
+    elif scope == "broad_market":
+        scope_boost = 0.88 + 0.32 * broad_weight
+    elif scope == "opinion_commentary":
+        scope_boost = 0.42
+    if instrument_kind == "etf" and scope in {"macro_political_regulatory", "broad_market"}:
+        scope_boost += 0.08
+    if bool(item.get("opinionated")) and scope != "symbol_specific":
+        scope_boost *= 0.82
+    base = (0.42 * max(importance, impact, relevance)) + (0.24 * scope_score) + (0.18 * theme_score) + (0.16 * relevance)
+    return float(max(0.0, base * scope_boost))
+
+
+def build_news_runtime_summary(
+    symbol: str,
+    *,
+    headlines: list[dict] | None = None,
+    news_health: dict | None = None,
+    as_of=None,
+    include_optional: bool = True,
+    optional_limit: int = 3,
+) -> dict:
+    sym = str(symbol or NEWS_PIPELINE_SYMBOL or "QQQ").upper()
+    meta = _instrument_meta(sym)
+    profile_exposures = _profile_exposure_summary(meta)
+    health = dict(news_health or get_news_health(sym, as_of=as_of))
+    items = list(headlines if headlines is not None else load_recent_headlines(sym, limit=10, as_of=as_of))
+    scope_counts = {
+        "symbol_specific": 0,
+        "sector_specific": 0,
+        "macro_political_regulatory": 0,
+        "broad_market": 0,
+        "low_value_noise": 0,
+        "opinion_commentary": 0,
+    }
+    theme_counts: dict[str, int] = {}
+    top_scope = ""
+    top_scope_score = -1.0
+    top_item: dict = {}
+    high_impact = 0
+    ranked_items: list[tuple[float, dict]] = []
+    for item in items:
+        scope = str(item.get("relevance_scope") or "low_value_noise").strip() or "low_value_noise"
+        scope_counts[scope] = int(scope_counts.get(scope) or 0) + 1
+        theme = str(item.get("theme_bucket") or "broad_market").strip() or "broad_market"
+        theme_counts[theme] = int(theme_counts.get(theme) or 0) + 1
+        score = max(
+            _safe_float(item.get("relevance")) or 0.0,
+            _safe_float(item.get("impact_score")) or 0.0,
+            _safe_float(item.get("importance_score")) or 0.0,
+            _safe_float(item.get("scope_score")) or 0.0,
+        )
+        ranked_items.append((score, item))
+        if score > top_scope_score:
+            top_scope_score = float(score)
+            top_scope = scope
+            top_item = dict(item)
+        if (_safe_float(item.get("impact_score")) or 0.0) >= 0.45:
+            high_impact += 1
+    ranked_items.sort(key=lambda pair: float(pair[0]), reverse=True)
+    scope_leaderboard = [
+        {"scope": key, "label": _SCOPE_LABELS.get(key, key.replace("_", " ").title()), "count": int(value)}
+        for key, value in sorted(scope_counts.items(), key=lambda item: (int(item[1]), item[0]), reverse=True)
+        if int(value) > 0
+    ]
+    summary_bits = []
+    if top_scope:
+        summary_bits.append(str(_SCOPE_LABELS.get(top_scope, top_scope.replace("_", " ").title())))
+    if theme_counts:
+        theme = max(theme_counts.items(), key=lambda item: item[1])[0]
+        summary_bits.append(f"theme {theme.replace('_', ' ')}")
+    if high_impact:
+        summary_bits.append(f"{int(high_impact)} high-impact")
+    layer_a_summary = " | ".join(summary_bits) if summary_bits else "No structured headlines"
+
+    candidate_rows = []
+    for _rank_score, item in ranked_items:
+        candidate_rows.append((_layer_b_candidate_score(item, meta), item))
+    candidate_rows = [row for row in candidate_rows if float(row[0]) > 0.0]
+    candidate_rows.sort(key=lambda pair: float(pair[0]), reverse=True)
+    candidate_budget = max(1, int(optional_limit))
+    candidate_payloads = []
+    for candidate_score, item in candidate_rows[:candidate_budget]:
+        candidate_payloads.append(
+            {
+                "headline": str(item.get("headline") or ""),
+                "scope": str(item.get("relevance_scope") or "low_value_noise"),
+                "scope_label": str(item.get("relevance_scope_label") or _SCOPE_LABELS.get(str(item.get("relevance_scope") or "low_value_noise"), "Relevant")),
+                "theme_bucket": str(item.get("theme_bucket") or "broad_market"),
+                "candidate_score": float(round(candidate_score, 4)),
+                "relevance": _safe_float(item.get("relevance")) or _safe_float(item.get("relevance_score")),
+                "importance_score": _safe_float(item.get("importance_score")),
+                "impact_score": _safe_float(item.get("impact_score")),
+                "direction_score": _safe_float(item.get("direction_score")),
+                "signal_direction": str(item.get("signal_direction") or ""),
+            }
+        )
+
+    optional_rows = []
+    scorer_names = list_optional_news_scorers()
+    layer_b_status = "disabled"
+    if include_optional and scorer_names and candidate_rows:
+        layer_b_status = "ready"
+        candidates = [dict(item) for _, item in candidate_rows[:candidate_budget]]
+        for scorer_name in scorer_names:
+            scorer = _OPTIONAL_NEWS_SCORERS.get(scorer_name)
+            if scorer is None:
+                continue
+            try:
+                payload = scorer(sym, candidates, dict(meta or {}))
+            except Exception as exc:
+                optional_rows.append({"scorer": scorer_name, "status": "error", "detail": str(exc)})
+                continue
+            optional_rows.append(
+                {
+                    "scorer": scorer_name,
+                    "status": "ok",
+                    "items": payload if isinstance(payload, (dict, list)) else [],
+                }
+            )
+
+    return {
+        "symbol": sym,
+        "profile": {
+            "instrument_kind": str(meta.get("instrument_kind") or meta.get("type") or "equity"),
+            "sector": str(meta.get("sector") or "Broad Market"),
+            "industry": str(meta.get("industry") or meta.get("sector") or "-"),
+            "macro_sensitivity": _safe_float(meta.get("macro_sensitivity")),
+            "regulatory_sensitivity": _safe_float(meta.get("regulatory_sensitivity")),
+            "broad_market_sensitivity": _safe_float(meta.get("broad_market_sensitivity")),
+            "news_theme_weights": dict(meta.get("news_theme_weights") or {}),
+            "context_daily_symbols": dict(meta.get("context_daily_symbols") or {}),
+            "profile_exposures": profile_exposures,
+        },
+        "health": health,
+        "layer_a": {
+            "status": "ok" if items else str(health.get("headline_state") or "missing"),
+            "scope_counts": scope_counts,
+            "theme_counts": theme_counts,
+            "scope_leaderboard": scope_leaderboard,
+            "top_scope": top_scope,
+            "top_scope_label": _SCOPE_LABELS.get(top_scope, top_scope.replace("_", " ").title()),
+            "top_item": top_item,
+            "high_impact_count": int(high_impact),
+            "summary": layer_a_summary,
+            "items": items,
+        },
+        "layer_b": {
+            "status": layer_b_status,
+            "available_scorers": scorer_names,
+            "candidate_budget": int(candidate_budget),
+            "candidate_count": int(len(candidate_payloads)),
+            "candidates": candidate_payloads,
+            "scored_count": int(len(optional_rows)),
+            "results": optional_rows,
+        },
+        "summary": layer_a_summary,
+    }

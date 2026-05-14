@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from datetime import datetime
 
+from instrument_profile import build_instrument_meta
+
 # ---------------------------
 # Basic paths & instrument defaults
 # ---------------------------
@@ -138,6 +140,7 @@ LIVE_BIAS_MAX_ABS_MULT = float(os.environ.get("LIVE_BIAS_MAX_ABS_MULT", "0.6"))
 LOG_PREDICTIONS = os.environ.get("LOG_PREDICTIONS", "false").lower() in ("1", "true", "yes")
 LIVE_CALIBRATION = os.environ.get("LIVE_CALIBRATION", "true").lower() in ("1", "true", "yes")
 CALIBRATION_MAX_AGE_DAYS = int(os.environ.get("CALIBRATION_MAX_AGE_DAYS", "30"))
+CALIBRATION_EVIDENCE_MAX_AGE_DAYS = float(os.environ.get("CALIBRATION_EVIDENCE_MAX_AGE_DAYS", "7"))
 CALIBRATION_HALF_LIFE_DAYS = float(os.environ.get("CALIBRATION_HALF_LIFE_DAYS", "7"))
 DRIFT_ACC_THRESHOLD = float(os.environ.get("DRIFT_ACC_THRESHOLD", "0.48"))
 DRIFT_MIN_SAMPLES = int(os.environ.get("DRIFT_MIN_SAMPLES", "60"))
@@ -238,6 +241,27 @@ BROKER_MODE_DEFAULT = os.environ.get("BROKER_MODE_DEFAULT", "paper").strip().low
 LIVE_BROKER_PROVIDER = os.environ.get("LIVE_BROKER_PROVIDER", "alpaca").strip().lower()
 PAPER_TRADING_ENABLED = os.environ.get("PAPER_TRADING_ENABLED", "true").lower() in ("1", "true", "yes")
 PAPER_STARTING_CASH = float(os.environ.get("PAPER_STARTING_CASH", "100000"))
+AUTONOMY_SUPPORTED_SYMBOLS = [s.strip().upper() for s in os.environ.get("AUTONOMY_SUPPORTED_SYMBOLS", "QQQ").split(",") if s.strip()]
+AUTONOMY_MODE_DEFAULT = os.environ.get("AUTONOMY_MODE_DEFAULT", "OFF").strip().upper()
+AUTONOMY_DECISION_STYLE_DEFAULT = os.environ.get("AUTONOMY_DECISION_STYLE_DEFAULT", "full_autonomy").strip().lower()
+AUTONOMY_STRATEGY_DEFAULT = os.environ.get("AUTONOMY_STRATEGY_DEFAULT", "trend_following").strip().lower()
+AUTONOMY_OPEN_DELAY_MIN = int(os.environ.get("AUTONOMY_OPEN_DELAY_MIN", "12"))
+AUTONOMY_FLAT_BEFORE_CLOSE_MIN = int(os.environ.get("AUTONOMY_FLAT_BEFORE_CLOSE_MIN", "15"))
+AUTONOMY_MAX_HOLD_MIN = int(os.environ.get("AUTONOMY_MAX_HOLD_MIN", "90"))
+AUTONOMY_MAX_TRADES_PER_DAY = int(os.environ.get("AUTONOMY_MAX_TRADES_PER_DAY", "6"))
+AUTONOMY_ENTRY_COOLDOWN_MIN = int(os.environ.get("AUTONOMY_ENTRY_COOLDOWN_MIN", "15"))
+AUTONOMY_LOSS_COOLDOWN_MIN = int(os.environ.get("AUTONOMY_LOSS_COOLDOWN_MIN", "30"))
+AUTONOMY_MAX_DAILY_LOSS_PCT = float(os.environ.get("AUTONOMY_MAX_DAILY_LOSS_PCT", "0.0125"))
+AUTONOMY_MIN_QUALITY_SCORE = float(os.environ.get("AUTONOMY_MIN_QUALITY_SCORE", "0.66"))
+AUTONOMY_MIN_POSITION_SIZE = float(os.environ.get("AUTONOMY_MIN_POSITION_SIZE", "0.30"))
+AUTONOMY_MIN_CONFIDENCE = float(os.environ.get("AUTONOMY_MIN_CONFIDENCE", "58.0"))
+AUTONOMY_MIN_EDGE_BPS = float(os.environ.get("AUTONOMY_MIN_EDGE_BPS", "3.0"))
+AUTONOMY_MAX_SPREAD_BPS = float(os.environ.get("AUTONOMY_MAX_SPREAD_BPS", "8.0"))
+AUTONOMY_STALE_MARKET_MAX_SEC = int(os.environ.get("AUTONOMY_STALE_MARKET_MAX_SEC", "480"))
+AUTONOMY_STALE_BROKER_MAX_SEC = int(os.environ.get("AUTONOMY_STALE_BROKER_MAX_SEC", "150"))
+AUTONOMY_NEWS_CONFLICT_IMPACT = float(os.environ.get("AUTONOMY_NEWS_CONFLICT_IMPACT", "0.45"))
+AUTONOMY_CONTROLLER_STOP_LOSS_DOLLARS = float(os.environ.get("AUTONOMY_CONTROLLER_STOP_LOSS_DOLLARS", "0"))
+AUTONOMY_CONTROLLER_STOP_LOSS_PCT = float(os.environ.get("AUTONOMY_CONTROLLER_STOP_LOSS_PCT", str(AUTONOMY_MAX_DAILY_LOSS_PCT)))
 ALERT_EVENT_COOLDOWN_SEC = int(os.environ.get("ALERT_EVENT_COOLDOWN_SEC", "900"))
 OPPORTUNITY_SCAN_MAX_SYMBOLS = int(os.environ.get("OPPORTUNITY_SCAN_MAX_SYMBOLS", "8"))
 OPPORTUNITY_SCAN_CACHE_TTL_SEC = int(os.environ.get("OPPORTUNITY_SCAN_CACHE_TTL_SEC", "180"))
@@ -267,47 +291,11 @@ Path(NEW_INSTRUMENTS_PROCESSED_DIR).mkdir(parents=True, exist_ok=True)
 Path(NEW_INSTRUMENTS_FAILED_DIR).mkdir(parents=True, exist_ok=True)
 
 def _default_context_daily_symbols(symbol: str) -> dict:
-    sym = str(symbol or "").upper()
-    base = {
-        "market": "SPY",
-        "vol": "^VIX",
-        "lead_fut": "ES=F",
-        "rates": "TLT",
-    }
-    if sym == "QQQ":
-        base.update(
-            {
-                "sector": "XLK",
-                "vol": "^VXN",
-                "lead_fut": "NQ=F",
-            }
-        )
-    return {str(k): str(v) for k, v in base.items() if v}
+    return dict(build_instrument_meta(symbol).get("context_daily_symbols") or {})
 
 
 def _default_equity_meta(symbol: str) -> dict:
-    sym = str(symbol or "").upper()
-    aliases = [sym]
-    if sym == "QQQ":
-        aliases.extend(["Invesco QQQ", "Nasdaq 100", "Nasdaq-100"])
-    return {
-        "type": "equity",
-        "alpaca": sym,
-        "yahoo": sym,
-        "display_name": sym,
-        "news_enabled": True,
-        "news_aliases": aliases,
-        "tz": "America/New_York",
-        "session_open_minute": 9 * 60 + 30,
-        "session_close_minute": 16 * 60,
-        "tick_size": 0.01,
-        "vol_floor": 0.00025,
-        "max_abs_ret_mult": 6.0,
-        "stale_multiplier": 3.5,
-        "closed_max_stale_hours": 80.0,
-        "target_vol": 0.004,
-        "context_daily_symbols": _default_context_daily_symbols(sym),
-    }
+    return build_instrument_meta(symbol)
 
 def _load_external_instruments(path: str) -> dict:
     if not path or not os.path.exists(path):
@@ -324,8 +312,7 @@ def _load_external_instruments(path: str) -> dict:
             k = str(key).strip().upper()
             if not k:
                 continue
-            base = _default_equity_meta(k)
-            base.update(meta)
+            base = build_instrument_meta(k, overrides=meta)
             out[k] = base
         return out
     except Exception:

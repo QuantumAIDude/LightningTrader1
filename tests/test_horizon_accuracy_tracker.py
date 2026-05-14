@@ -10,6 +10,79 @@ import horizon_accuracy_tracker as hat
 
 
 class HorizonAccuracyTrackerTests(unittest.TestCase):
+    def test_append_history_rows_repairs_schema_growth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "horizon_accuracy_resolved_QQQ.csv")
+            with open(path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "abs_error",
+                        "actual_price",
+                        "horizon",
+                        "instrument",
+                        "model",
+                        "pct_error",
+                        "pred_price",
+                        "resolved_ts",
+                        "signed_error",
+                        "target_key",
+                    ]
+                )
+                writer.writerow(
+                    [
+                        "1.0",
+                        "100.0",
+                        "daily_high",
+                        "QQQ",
+                        "base",
+                        "0.01",
+                        "101.0",
+                        "2026-03-10T20:00:00+00:00",
+                        "1.0",
+                        "2026-03-10",
+                    ]
+                )
+                writer.writerow(
+                    [
+                        "2.0",
+                        "100.0",
+                        "daily_high",
+                        "QQQ",
+                        "base",
+                        "0.02",
+                        "102.0",
+                        "2026-03-11T20:00:00+00:00",
+                        "2.0",
+                        "logged_prediction",
+                        "2026-03-11",
+                    ]
+                )
+
+            hat._append_history_rows(
+                path,
+                [
+                    {
+                        "abs_error": 3.0,
+                        "actual_price": 100.0,
+                        "horizon": "daily_low",
+                        "instrument": "QQQ",
+                        "model": "forest",
+                        "pct_error": 0.03,
+                        "pred_price": 97.0,
+                        "resolved_ts": "2026-03-12T20:00:00+00:00",
+                        "signed_error": -3.0,
+                        "target_key": "2026-03-12",
+                        "source": "logged_prediction",
+                    }
+                ],
+            )
+
+            df = hat._load_history(path)
+            self.assertEqual(len(df), 3)
+            self.assertIn("source", df.columns)
+            self.assertEqual(str(df.loc[df["target_key"] == "2026-03-11", "source"].iloc[0]), "logged_prediction")
+
     def test_resolves_daily_and_weekend_predictions(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_data_dir = hat.DATA_DIR

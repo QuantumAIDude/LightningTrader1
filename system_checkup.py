@@ -15,6 +15,7 @@ from config import (
     DEFAULT_INSTRUMENT,
     DATA_DIR,
     CALIBRATION_MAX_AGE_DAYS,
+    CALIBRATION_EVIDENCE_MAX_AGE_DAYS,
     NEWS_PIPELINE_ENABLED,
     NEWS_PIPELINE_SYMBOL,
 )
@@ -119,14 +120,26 @@ def _load_horizon_accuracy(instr: str):
 def _load_news_health(instr: str) -> dict:
     out = {
         "enabled": bool(NEWS_PIPELINE_ENABLED),
-        "symbol": str(NEWS_PIPELINE_SYMBOL).upper(),
+        "symbol": str(instr or "").upper(),
+        "configured_symbol": str(NEWS_PIPELINE_SYMBOL).upper(),
         "status": "not_applicable",
     }
     if not NEWS_PIPELINE_ENABLED:
         out["status"] = "disabled"
         return out
-    if str(instr).upper() != str(NEWS_PIPELINE_SYMBOL).upper():
-        return out
+    try:
+        from news_pipeline import get_news_health
+        health = get_news_health(str(instr or "").upper())
+        if isinstance(health, dict):
+            out.update(health)
+            if "symbol" not in out:
+                out["symbol"] = str(instr or "").upper()
+            raw_status = str(out.get("status") or "").strip().lower()
+            if raw_status in {"stale", "failed", "error"}:
+                out["status_detail"] = raw_status
+                out["status"] = "degraded"
+    except Exception:
+        pass
     path = os.path.join(DATA_DIR, f"news_{str(instr).upper()}.csv")
     if not os.path.exists(path):
         out.update({"status": "missing", "rows": 0})
@@ -134,17 +147,12 @@ def _load_news_health(instr: str) -> dict:
     try:
         df = pd.read_csv(path)
     except Exception:
-        out.update({"status": "error", "rows": 0})
+        out.update({"status": "degraded", "rows": 0})
         return out
     if df is None or df.empty:
         out.update({"status": "missing", "rows": 0})
         return out
     rows = int(len(df))
-    try:
-        from news_pipeline import _normalize_news_frame
-        df = _normalize_news_frame(df, default_symbol=str(instr).upper())
-    except Exception:
-        pass
     df["published_at"] = pd.to_datetime(df.get("published_at"), utc=True, errors="coerce")
     df = df.dropna(subset=["published_at"]).copy()
     if df.empty:
@@ -158,13 +166,7 @@ def _load_news_health(instr: str) -> dict:
     sent = pd.to_numeric(df.get("sentiment_score"), errors="coerce").fillna(0.0)
     sent_std = float(sent.std()) if len(sent) else 0.0
     sent_nonzero_frac = float((sent.abs() > 1e-12).mean()) if len(sent) else 0.0
-    if "relevance_score" in df.columns:
-        rel = pd.to_numeric(df.get("relevance_score"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
-        relevance_mean = float(rel.mean()) if len(rel) else 0.0
-    else:
-        relevance_mean = None
-    # Signal-ready means the stream is fresh and has non-trivial variation.
-    signal_ready = bool(
+    legacy_signal_ready = bool(
         (age_hours is not None and age_hours <= freshness_limit)
         and day_count >= 5
         and sent_nonzero_frac > 0.02
@@ -172,18 +174,20 @@ def _load_news_health(instr: str) -> dict:
     )
     out.update(
         {
-            "rows": rows,
+            "rows": max(int(out.get("rows") or 0), rows),
             "valid_rows": int(len(df)),
-            "last_published_at": last_ts.isoformat() if pd.notna(last_ts) else None,
-            "age_hours": round(age_hours, 2) if age_hours is not None else None,
-            "unique_days": day_count,
+            "last_published_at": out.get("last_published_at") or (last_ts.isoformat() if pd.notna(last_ts) else None),
+            "age_hours": out.get("age_hours") if out.get("age_hours") is not None else (round(age_hours, 2) if age_hours is not None else None),
+            "unique_days": max(int(out.get("unique_days") or 0), day_count),
             "sentiment_nonzero_frac": round(sent_nonzero_frac, 4),
             "sentiment_std": round(sent_std, 6),
-            "relevance_mean": round(relevance_mean, 4) if relevance_mean is not None else None,
-            "signal_ready": signal_ready,
-            "status": "ok" if signal_ready else "degraded",
+            "signal_ready": bool(out.get("signal_ready") or legacy_signal_ready),
         }
     )
+    if bool(out.get("signal_ready")):
+        out["status"] = "ok"
+    elif str(out.get("status") or "").strip().lower() not in {"missing", "disabled", "not_applicable"}:
+        out["status"] = "degraded"
     return out
 
 
@@ -276,22 +280,64 @@ def _check_instrument(instr: str, quick: bool = False, online: bool = False) -> 
         except Exception:
             last_update = None
         try:
+            last_check = pd.to_datetime(cal_state.get("last_check"), utc=True, errors="coerce")
+        except Exception:
+            last_check = None
+        try:
+            last_processed = pd.to_datetime(cal_state.get("last_processed"), utc=True, errors="coerce")
+        except Exception:
+            last_processed = None
+        try:
+            last_resolved_target = pd.to_datetime(cal_state.get("last_resolved_target_ts"), utc=True, errors="coerce")
+        except Exception:
+            last_resolved_target = None
+        try:
             age_days = (datetime.now(timezone.utc) - last_update).total_seconds() / 86400.0 if last_update else None
         except Exception:
             age_days = None
+        try:
+            evidence_anchor = last_resolved_target if last_resolved_target is not None and pd.notna(last_resolved_target) else last_processed
+            evidence_age_days = (datetime.now(timezone.utc) - evidence_anchor).total_seconds() / 86400.0 if evidence_anchor is not None and pd.notna(evidence_anchor) else None
+        except Exception:
+            evidence_age_days = None
         cal_stale = False
         try:
             if age_days is None or age_days > float(CALIBRATION_MAX_AGE_DAYS):
                 cal_stale = True
         except Exception:
             cal_stale = True
+        evidence_stale = bool(
+            cal_state.get(
+                "evidence_stale",
+                evidence_age_days is None or evidence_age_days > float(CALIBRATION_EVIDENCE_MAX_AGE_DAYS),
+            )
+        )
         report["calibration"] = {
             "last_update": last_update.isoformat() if last_update is not None and pd.notna(last_update) else None,
+            "last_check": last_check.isoformat() if last_check is not None and pd.notna(last_check) else None,
+            "last_processed": last_processed.isoformat() if last_processed is not None and pd.notna(last_processed) else None,
+            "last_resolved_target_ts": last_resolved_target.isoformat() if last_resolved_target is not None and pd.notna(last_resolved_target) else None,
             "age_days": round(float(age_days), 2) if age_days is not None else None,
+            "evidence_age_days": round(float(evidence_age_days), 2) if evidence_age_days is not None else None,
+            "evidence_stale": bool(evidence_stale),
             "drift_flag": bool(cal_state.get("drift_flag", False)),
-            "stale": bool(cal_stale)
+            "recent_drift_flag": bool(cal_state.get("recent_drift_flag", False)),
+            "recent_price_drift_flag": bool(cal_state.get("recent_price_drift_flag", False)),
+            "drift_score": _safe_float(cal_state.get("drift_score")),
+            "recent_acc": _safe_float(cal_state.get("recent_acc")),
+            "recent_total": int(cal_state.get("recent_total", 0) or 0),
+            "recent_price_window_hit_rate": _safe_float(cal_state.get("recent_price_window_hit_rate")),
+            "recent_price_window_total": int(cal_state.get("recent_price_window_total", 0) or 0),
+            "recent_recovery_streak": int(cal_state.get("recent_recovery_streak", 0) or 0),
+            "recent_price_recovery_streak": int(cal_state.get("recent_price_recovery_streak", 0) or 0),
+            "pending_unresolved_rows": int(cal_state.get("pending_unresolved_rows", 0) or 0),
+            "pending_unresolved_newest_prediction_ts": cal_state.get("pending_unresolved_newest_prediction_ts"),
+            "drift_components": cal_state.get("drift_components", {}),
+            "stale": bool(cal_stale),
         }
         if cal_stale and report["status"] == "ok":
+            report["status"] = "warn"
+        if evidence_stale and report["status"] == "ok":
             report["status"] = "warn"
 
     horizon_acc = _load_horizon_accuracy(instr)
@@ -312,8 +358,8 @@ def _check_instrument(instr: str, quick: bool = False, online: bool = False) -> 
 
     news_health = _load_news_health(instr)
     report["news_pipeline"] = news_health
-    if str(instr).upper() == str(NEWS_PIPELINE_SYMBOL).upper():
-        if news_health.get("status") in ("missing", "degraded", "error") and report["status"] == "ok":
+    if bool(news_health.get("enabled", NEWS_PIPELINE_ENABLED)):
+        if news_health.get("status") in ("missing", "degraded", "error", "failed", "stale") and report["status"] == "ok":
             report["status"] = "warn"
 
     # Model load

@@ -223,7 +223,7 @@ def fit_intraday_activity_gate(reference_prices, actual_prices, proxy_values, in
     proxy = _to_float_array(proxy_values)
     n = min(ref.size, actual.size, proxy.size)
     if n <= 0:
-        return {"scale": None, "quantile": None, "selected": "disabled"}
+        return {"scale": None, "quantile": None, "selected": "disabled", "role": "quiet_bar_filter"}
     ref = ref[:n]
     actual = actual[:n]
     proxy = np.maximum(np.abs(proxy[:n]), 1e-9)
@@ -232,7 +232,7 @@ def fit_intraday_activity_gate(reference_prices, actual_prices, proxy_values, in
     actual = actual[mask]
     proxy = proxy[mask]
     if ref.size < 40:
-        return {"scale": None, "quantile": None, "selected": "insufficient_samples"}
+        return {"scale": None, "quantile": None, "selected": "insufficient_samples", "role": "quiet_bar_filter"}
     abs_move = np.abs(actual - ref)
     base = np.maximum(np.abs(ref) * proxy, 1e-6)
     ratio = abs_move / base
@@ -262,9 +262,10 @@ def fit_intraday_activity_gate(reference_prices, actual_prices, proxy_values, in
                 "scale": float(scale),
                 "quantile": float(q),
                 "selected": "quantile",
+                "role": "quiet_bar_filter",
                 "objective_score": float(score),
                 "active_fraction_train": float(active_frac),
                 "window_ratio_mean": metrics.get("window_ratio_mean"),
                 "window_hit_rate": metrics.get("window_hit_rate"),
             }
-    return best or {"scale": None, "quantile": None, "selected": "disabled"}
+    return best or {"scale": None, "quantile": None, "selected": "disabled", "role": "quiet_bar_filter"}

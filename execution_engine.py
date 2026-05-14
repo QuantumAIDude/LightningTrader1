@@ -68,12 +68,25 @@ def _classify_broker_exception(exc: Exception) -> tuple[str, str]:
 
 
 def _call_with_optional_settings(func, *args, settings_override: dict | None = None, **kwargs):
-    try:
-        return func(*args, settings_override=settings_override, **kwargs)
-    except TypeError as exc:
-        if "settings_override" not in str(exc):
-            raise
-        return func(*args, **kwargs)
+    attempts = [
+        {"settings_override": settings_override, **dict(kwargs)},
+        dict(kwargs),
+    ]
+    trimmed = dict(kwargs)
+    for key in ("force", "client_order_id"):
+        trimmed.pop(key, None)
+    attempts.append({"settings_override": settings_override, **trimmed})
+    attempts.append(trimmed)
+    last_exc = None
+    for call_kwargs in attempts:
+        try:
+            return func(*args, **call_kwargs)
+        except TypeError as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    return func(*args, **kwargs)
 
 
 def _state_path() -> str:
@@ -423,6 +436,40 @@ def _plan_meta(advisory: dict | None) -> dict:
     return dict(advisory.get("plan_meta") or {})
 
 
+def _signed_live_qty(position_obj) -> float:
+    qty = _safe_float(getattr(position_obj, "qty", None)) or 0.0
+    side = str(getattr(position_obj, "side", "") or "").strip().lower()
+    if side in {"short", "sell"}:
+        return -abs(float(qty))
+    return abs(float(qty))
+
+
+def _state_from_live_snapshot(snapshot: dict | None) -> dict:
+    snapshot = dict(snapshot or {})
+    account = dict(snapshot.get("account") or {})
+    cash = _safe_float(account.get("cash"))
+    equity = _safe_float(account.get("equity"))
+    state = new_paper_state(starting_cash=equity or cash or PAPER_STARTING_CASH, broker_mode="live_snapshot")
+    if cash is not None:
+        state["cash"] = float(cash)
+    positions = {}
+    for pos in list(snapshot.get("positions") or []):
+        symbol = str(getattr(pos, "symbol", "") or "").upper()
+        if not symbol:
+            continue
+        qty = _signed_live_qty(pos)
+        if qty == 0.0:
+            continue
+        positions[symbol] = {
+            "qty": float(qty),
+            "avg_price": float(_safe_float(getattr(pos, "avg_entry_price", None)) or 0.0),
+            "opened_at": None,
+        }
+    state["positions"] = positions
+    state["updated_at"] = _utc_now()
+    return state
+
+
 def recommend_order_for_state(
     state: dict | None,
     symbol: str,
@@ -539,6 +586,31 @@ def recommend_paper_order(
     )
 
 
+def recommend_live_order(
+    symbol: str,
+    current_price: float | None,
+    advisory: dict | None = None,
+    profile_name: str | None = None,
+    side: str | None = None,
+    live_snapshot: dict | None = None,
+    settings_override: dict | None = None,
+) -> dict:
+    snapshot = dict(live_snapshot or {})
+    if not snapshot:
+        snapshot = _call_with_optional_settings(get_live_broker_snapshot, symbol, settings_override=settings_override)
+    state = _state_from_live_snapshot(snapshot)
+    rec = recommend_order_for_state(
+        state,
+        symbol,
+        current_price=current_price,
+        advisory=advisory,
+        profile_name=profile_name,
+        side=side,
+    )
+    rec["live_snapshot"] = snapshot
+    return rec
+
+
 def stage_paper_order(
     symbol: str,
     side: str,
@@ -547,6 +619,7 @@ def stage_paper_order(
     advisory: dict | None = None,
     profile_name: str | None = None,
     order_type: str = "market",
+    client_order_id: str | None = None,
 ) -> dict:
     state = _load_state()
     profile = get_trader_profile(profile_name)
@@ -561,6 +634,7 @@ def stage_paper_order(
         "order_type": str(order_type).lower(),
         "status": "staged",
         "created_at": _utc_now(),
+        "client_order_id": str(client_order_id or ""),
         "entry_price_hint": rec.get("entry_price"),
         "stop_price": rec.get("stop_price"),
         "take_profit": rec.get("target_price"),
@@ -726,14 +800,27 @@ def place_paper_order(
     advisory: dict | None = None,
     profile_name: str | None = None,
     qty: int | None = None,
+    client_order_id: str | None = None,
+    force: bool = False,
 ) -> dict:
     if not PAPER_TRADING_ENABLED:
         return {"status": "disabled", "reason": "paper trading disabled"}
     rec = recommend_paper_order(symbol, current_price=current_price, advisory=advisory, profile_name=profile_name, side=side)
+    requested_qty = int(qty) if qty is not None else None
+    if requested_qty is not None and requested_qty > 0 and not bool(force) and not bool(rec.get("allowed")):
+        return {"status": "blocked", "reason": rec.get("reason"), "recommendation": rec}
     qty_final = int(qty if qty is not None else rec.get("qty") or 0)
     if qty_final <= 0:
         return {"status": "blocked", "reason": rec.get("reason"), "recommendation": rec}
-    order = stage_paper_order(symbol, side, qty_final, current_price=current_price, advisory=advisory, profile_name=profile_name)
+    order = stage_paper_order(
+        symbol,
+        side,
+        qty_final,
+        current_price=current_price,
+        advisory=advisory,
+        profile_name=profile_name,
+        client_order_id=client_order_id,
+    )
     submit = submit_paper_order(order.get("order_id"), current_price=current_price)
     submit["recommendation"] = rec
     return submit
@@ -994,6 +1081,7 @@ def get_live_broker_snapshot(symbol: str | None = None, settings_override: dict 
         "provider": status.get("provider"),
         "status": status.get("status"),
         "mode": status.get("mode"),
+        "fetched_at": _utc_now(),
         "connected": False,
         "rows": [
             ("Live Adapter", str(status.get("status") or "-").replace("_", " ").title(), str(status.get("detail") or "-")),
@@ -1069,11 +1157,24 @@ def place_live_order(
     advisory: dict | None = None,
     profile_name: str | None = None,
     settings_override: dict | None = None,
+    client_order_id: str | None = None,
+    force: bool = False,
 ) -> dict:
     snapshot = _call_with_optional_settings(get_live_broker_snapshot, symbol, settings_override=settings_override)
     if not snapshot.get("connected"):
         return {"status": "blocked", "reason": snapshot.get("detail") or snapshot.get("status"), "live_snapshot": snapshot}
-    rec = recommend_paper_order(symbol, current_price=current_price, advisory=advisory, profile_name=profile_name, side=side)
+    rec = recommend_live_order(
+        symbol,
+        current_price=current_price,
+        advisory=advisory,
+        profile_name=profile_name,
+        side=side,
+        live_snapshot=snapshot,
+        settings_override=settings_override,
+    )
+    requested_qty = int(qty) if qty is not None else None
+    if requested_qty is not None and requested_qty > 0 and not bool(force) and not bool(rec.get("allowed")):
+        return {"status": "blocked", "reason": rec.get("reason"), "recommendation": rec, "live_snapshot": snapshot}
     qty_final = int(qty if qty is not None else rec.get("qty") or 0)
     if qty_final <= 0:
         return {"status": "blocked", "reason": rec.get("reason"), "recommendation": rec, "live_snapshot": snapshot}
@@ -1088,6 +1189,8 @@ def place_live_order(
             "side": order_side,
             "time_in_force": TimeInForce.DAY,
         }
+        if client_order_id:
+            kwargs["client_order_id"] = str(client_order_id)[:48]
         stop_price = _safe_float(rec.get("stop_price"))
         target_price = _safe_float(rec.get("target_price"))
         if stop_price is not None and StopLossRequest is not None:
@@ -1103,6 +1206,7 @@ def place_live_order(
             "symbol": getattr(order, "symbol", str(symbol).upper()),
             "qty": getattr(order, "qty", qty_final),
             "side": side,
+            "client_order_id": getattr(order, "client_order_id", client_order_id),
             "broker_order_status": str(getattr(order, "status", "") or "").lower() or None,
             "filled_qty": _safe_float(getattr(order, "filled_qty", None)),
             "filled_avg_price": _safe_float(getattr(order, "filled_avg_price", None)),
@@ -1135,6 +1239,8 @@ def place_routed_order(
     advisory: dict | None = None,
     profile_name: str | None = None,
     settings_override: dict | None = None,
+    client_order_id: str | None = None,
+    force: bool = False,
 ) -> dict:
     runtime = _call_with_optional_settings(get_broker_runtime_status, symbol, settings_override=settings_override)
     route_mode = runtime.get("routing_mode")
@@ -1146,6 +1252,8 @@ def place_routed_order(
             advisory=advisory,
             profile_name=profile_name,
             qty=qty,
+            client_order_id=client_order_id,
+            force=force,
         )
         result["routing_mode"] = "local_paper"
         result["routing_label"] = runtime.get("route_label")
@@ -1161,6 +1269,8 @@ def place_routed_order(
             advisory=advisory,
             profile_name=profile_name,
             settings_override=settings_override,
+            client_order_id=client_order_id,
+            force=force,
         )
         result["routing_mode"] = route_mode
         result["routing_label"] = runtime.get("route_label")
@@ -1208,8 +1318,74 @@ def cancel_routed_order(order_id: str | None = None, symbol: str | None = None, 
             "routing_mode": route_mode,
             "runtime_status": runtime,
         }
-        result = _call_with_optional_settings(cancel_live_order, str(chosen), settings_override=settings_override)
+    result = _call_with_optional_settings(cancel_live_order, str(chosen), settings_override=settings_override)
     result["routing_mode"] = route_mode
+    result["routing_label"] = runtime.get("route_label")
+    result["runtime_status"] = runtime
+    return result
+
+
+def flatten_live_position(
+    symbol: str,
+    current_price: float | None = None,
+    profile_name: str | None = None,
+    settings_override: dict | None = None,
+    client_order_id: str | None = None,
+    force: bool = True,
+) -> dict:
+    symbol = str(symbol or "").upper()
+    snapshot = _call_with_optional_settings(get_live_broker_snapshot, symbol, settings_override=settings_override)
+    if not snapshot.get("connected"):
+        return {"status": "blocked", "reason": snapshot.get("detail") or snapshot.get("status"), "live_snapshot": snapshot}
+    pos = next((p for p in list(snapshot.get("positions") or []) if str(getattr(p, "symbol", "")).upper() == symbol), None)
+    qty = int(abs(_signed_live_qty(pos))) if pos is not None else 0
+    if qty <= 0:
+        return {"status": "blocked", "reason": "no open live position", "live_snapshot": snapshot}
+    side = "sell" if _signed_live_qty(pos) > 0 else "buy"
+    result = _call_with_optional_settings(
+        place_live_order,
+        symbol,
+        side,
+        qty=qty,
+        current_price=current_price,
+        advisory=None,
+        profile_name=profile_name,
+        settings_override=settings_override,
+        client_order_id=client_order_id,
+        force=force,
+    )
+    result["live_snapshot"] = snapshot
+    return result
+
+
+def flatten_routed_position(
+    symbol: str,
+    current_price: float | None = None,
+    profile_name: str | None = None,
+    settings_override: dict | None = None,
+    client_order_id: str | None = None,
+    force: bool = True,
+) -> dict:
+    runtime = _call_with_optional_settings(get_broker_runtime_status, symbol, settings_override=settings_override)
+    route_mode = runtime.get("routing_mode")
+    if route_mode == "local_paper":
+        result = flatten_paper_position(symbol, current_price=current_price, profile_name=profile_name)
+    elif route_mode in {"alpaca_paper", "alpaca_live"}:
+        result = flatten_live_position(
+            symbol,
+            current_price=current_price,
+            profile_name=profile_name,
+            settings_override=settings_override,
+            client_order_id=client_order_id,
+            force=force,
+        )
+    else:
+        result = {
+            "status": "blocked",
+            "reason": runtime.get("detail") or runtime.get("status") or "routing unavailable",
+        }
+    result["routing_mode"] = route_mode
+    result["routing_label"] = runtime.get("route_label")
     result["runtime_status"] = runtime
     return result
 
@@ -1275,6 +1451,7 @@ def run_broker_verification(
         advisory=advisory,
         profile_name=profile_name,
         settings_override=settings_override,
+        force=True,
     )
     after_submit = _call_with_optional_settings(get_live_broker_snapshot, symbol, settings_override=settings_override)
     submitted = str(submit.get("status") or "") == "submitted"
@@ -1301,6 +1478,7 @@ def run_broker_verification(
                 advisory=None,
                 profile_name=profile_name,
                 settings_override=settings_override,
+                force=True,
             )
     elif submitted and submit_order_id:
         cleanup = _call_with_optional_settings(cancel_live_order, str(submit_order_id), settings_override=settings_override)
@@ -1351,9 +1529,18 @@ def get_execution_dashboard_snapshot(
     prices = _current_prices(symbol, current_price)
     portfolio = _portfolio_snapshot(state, prices)
     pos = next((p for p in portfolio.get("positions", []) if p.get("symbol") == symbol), None)
-    rec = recommend_paper_order(symbol, current_price=current_price, advisory=advisory, profile_name=profile_name)
     runtime = get_broker_runtime_status(symbol)
     live_snapshot = runtime.get("live_snapshot") or get_live_broker_snapshot(symbol)
+    if runtime.get("routing_mode") in {"alpaca_paper", "alpaca_live"} and live_snapshot.get("connected"):
+        rec = recommend_live_order(
+            symbol,
+            current_price=current_price,
+            advisory=advisory,
+            profile_name=profile_name,
+            live_snapshot=live_snapshot,
+        )
+    else:
+        rec = recommend_paper_order(symbol, current_price=current_price, advisory=advisory, profile_name=profile_name)
     diagnostics = get_broker_diagnostics_snapshot(symbol)
     verification = get_broker_verification_snapshot(symbol)
     staged = [o for o in state.get("orders", []) if str(o.get("status")) == "staged"]
@@ -1440,6 +1627,7 @@ def get_execution_dashboard_snapshot(
         "route_label": runtime.get("route_label"),
         "route_buy_label": f"Buy ({runtime.get('route_label')})",
         "route_sell_label": f"Sell ({runtime.get('route_label')})",
+        "route_flat_label": f"Flat ({runtime.get('route_label')})",
         "route_cancel_label": "Cancel Routed",
         "route_refresh_label": "Refresh Broker",
         "route_verify_label": "Verify Alpaca Paper",

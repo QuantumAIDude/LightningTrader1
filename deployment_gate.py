@@ -26,7 +26,7 @@ from config import (
 )
 from calibration_tracker import update_live_calibration
 from horizon_accuracy_tracker import update_horizon_accuracy
-from readiness_tracker import update_readiness_state
+from readiness_tracker import update_readiness_state, summarize_deployment_readiness
 from system_checkup import _check_instrument
 from data_fetch import update_price_data
 
@@ -295,6 +295,25 @@ def main():
         if isinstance(readiness_state, dict):
             readiness_eval = readiness_state.get("evaluation", {}) if isinstance(readiness_state.get("evaluation"), dict) else {}
             rep["readiness_state"] = readiness_state
+            rep["deployment_readiness"] = summarize_deployment_readiness(instr, state=readiness_state)
+            rep["deployment_evidence"] = {
+                "next_stage_key": readiness_state.get("next_stage_key"),
+                "next_stage_label": readiness_state.get("next_stage_label"),
+                "artifact_summary": readiness_state.get("artifact_summary"),
+                "calibration_summary": readiness_state.get("calibration_summary"),
+                "freshness_summary": readiness_state.get("freshness_summary"),
+                "history_summary": readiness_state.get("history_summary"),
+                "stage_history_summary": readiness_state.get("stage_history_summary"),
+                "observation_summary": readiness_state.get("observation_summary"),
+                "validation_evidence": readiness_state.get("validation_evidence"),
+                "validation_status": readiness_state.get("validation_status"),
+                "validation_method": readiness_state.get("validation_method"),
+                "validation_blockers": readiness_state.get("validation_blockers"),
+                "blocker_groups": readiness_state.get("blocker_groups"),
+                "missing_evidence": readiness_state.get("missing_evidence"),
+                "next_requirements": readiness_state.get("next_requirements"),
+                "checklist": readiness_state.get("checklist"),
+            }
         if readiness_eval.get("error"):
             gate_failures.append(f"Readiness evaluation error: {readiness_eval.get('error')}")
 

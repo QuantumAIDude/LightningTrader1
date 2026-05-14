@@ -182,12 +182,40 @@ def _normalize_news_meta_record(record: dict) -> dict | None:
     detail_bits = []
     if record.get("source"):
         detail_bits.append(str(record.get("source")))
+    event_label = str(record.get("event_label") or record.get("event_type") or "headline").strip()
+    if event_label:
+        detail_bits.append(event_label)
     pol = record.get("political_relevance")
     try:
         if pol is not None:
             detail_bits.append(f"pol {float(pol):.2f}")
     except Exception:
         pass
+    importance = 0.0
+    impact = 0.0
+    try:
+        importance = float(record.get("importance_score") or 0.0)
+    except Exception:
+        importance = 0.0
+    try:
+        impact = float(record.get("impact_score") or 0.0)
+    except Exception:
+        impact = 0.0
+    try:
+        novelty = float(record.get("novelty_score") or 1.0)
+    except Exception:
+        novelty = 1.0
+    sev_score = max(0.14, min(0.82, (0.18 + (0.72 * max(importance, 0.65 * impact))) * (0.85 + 0.15 * novelty)))
+    if sev_score >= 0.55:
+        severity_label = "High"
+    elif sev_score >= 0.30:
+        severity_label = "Medium"
+    else:
+        severity_label = "Low"
+    ambiguity = "low" if sev_score >= 0.50 else "medium" if sev_score >= 0.28 else "high"
+    risk_kind = f"{event_label.lower()} headline" if event_label else "headline risk"
+    if record.get("signal_note"):
+        detail_bits.append(str(record.get("signal_note"))[:46])
     return {
         "type": "news_meta",
         "title": headline[:72],
@@ -195,10 +223,10 @@ def _normalize_news_meta_record(record: dict) -> dict | None:
         "sentiment": record.get("label"),
         "detail": " | ".join(detail_bits),
         "source": "news_store",
-        "severity_score": 0.20 if (record.get("political_relevance") or 0.0) < 0.5 else 0.28,
-        "severity_label": "Low" if (record.get("political_relevance") or 0.0) < 0.5 else "Medium",
-        "risk_kind": "headline risk",
-        "ambiguity": "medium",
+        "severity_score": sev_score,
+        "severity_label": severity_label,
+        "risk_kind": risk_kind,
+        "ambiguity": ambiguity,
     }
 
 

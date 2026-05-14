@@ -2,7 +2,12 @@ import unittest
 
 import numpy as np
 
-from forecast_calibration import apply_return_calibration, fit_return_calibration, score_return_forecast
+from forecast_calibration import (
+    apply_return_calibration,
+    fit_intraday_activity_gate,
+    fit_return_calibration,
+    score_return_forecast,
+)
 
 
 class ForecastCalibrationTests(unittest.TestCase):
@@ -28,6 +33,13 @@ class ForecastCalibrationTests(unittest.TestCase):
         )
         self.assertEqual(calib["selected"], "anchor_only")
         self.assertAlmostEqual(float(calib["scale"]), 0.0, places=6)
+
+    def test_fit_intraday_activity_gate_marks_quiet_bar_role(self):
+        ref = np.full(80, 100.0)
+        actual = ref + np.linspace(-0.3, 0.3, 80)
+        proxy = np.linspace(0.001, 0.004, 80)
+        gate = fit_intraday_activity_gate(ref, actual, proxy, instrument_key="QQQ")
+        self.assertEqual(gate.get("role"), "quiet_bar_filter")
 
 
 if __name__ == "__main__":

@@ -299,6 +299,70 @@ class ExecutionEngineTests(unittest.TestCase):
                 ee.place_live_order = old_place
                 ee.cancel_live_order = old_cancel
 
+    def test_cancel_routed_order_cancels_first_open_matching_order(self):
+        class _Order:
+            def __init__(self, order_id, symbol):
+                self.id = order_id
+                self.symbol = symbol
+
+        old_runtime = ee.get_broker_runtime_status
+        old_cancel = ee.cancel_live_order
+        try:
+            ee.get_broker_runtime_status = lambda symbol=None, settings_override=None: {
+                "routing_mode": "alpaca_paper",
+                "route_label": "Alpaca Paper",
+                "live_snapshot": {"orders": [_Order("ord-123", "QQQ"), _Order("ord-456", "SPY")]},
+            }
+            ee.cancel_live_order = lambda order_id, settings_override=None: {"status": "canceled", "order_id": order_id}
+            result = ee.cancel_routed_order(symbol="QQQ")
+            self.assertEqual(result["status"], "canceled")
+            self.assertEqual(result["order_id"], "ord-123")
+            self.assertEqual(result["routing_mode"], "alpaca_paper")
+        finally:
+            ee.get_broker_runtime_status = old_runtime
+            ee.cancel_live_order = old_cancel
+
+    def test_place_paper_order_blocks_explicit_qty_when_advisory_rejects_trade(self):
+        advisory = {
+            "quality_meta": {"score": 0.52, "no_trade": True},
+            "plan_meta": {"bias": "Bullish", "entry": 100.0, "stop": 99.0},
+            "liquidity_meta": {"tradability_score": 0.82},
+            "pred_state": {"intraday": {"position_size": 0.70}},
+        }
+        result = ee.place_paper_order("QQQ", "buy", current_price=100.0, advisory=advisory, profile_name="balanced", qty=5)
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("no-trade", str(result.get("reason") or ""))
+
+    def test_recommend_live_order_uses_live_account_equity_not_local_paper_cash(self):
+        old_state_path = ee._state_path
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                ee._state_path = lambda: os.path.join(tmp, "paper_state.json")
+                ee.reset_paper_state(100000)
+                advisory = {
+                    "quality_meta": {"score": 0.74, "no_trade": False, "regime_label": "Bullish"},
+                    "plan_meta": {"bias": "Bullish", "action": "Long setup", "entry": 100.0, "stop": 99.0, "target1": 102.0},
+                    "liquidity_meta": {"tradability_score": 0.82},
+                    "pred_state": {"intraday": {"position_size": 0.65, "p_up": 0.64}},
+                }
+                paper_rec = ee.recommend_paper_order("QQQ", 100.0, advisory=advisory, profile_name="balanced", side="buy")
+                live_rec = ee.recommend_live_order(
+                    "QQQ",
+                    100.0,
+                    advisory=advisory,
+                    profile_name="balanced",
+                    side="buy",
+                    live_snapshot={
+                        "connected": True,
+                        "account": {"equity": 10000.0, "cash": 10000.0},
+                        "positions": [],
+                    },
+                )
+                self.assertTrue(paper_rec["qty"] > live_rec["qty"])
+                self.assertTrue(live_rec["qty"] > 0)
+            finally:
+                ee._state_path = old_state_path
+
 
 if __name__ == "__main__":
     unittest.main()

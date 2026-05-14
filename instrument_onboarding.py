@@ -36,6 +36,8 @@ from config import (
     NEW_INSTRUMENTS_PROCESSED_DIR,
     NEW_INSTRUMENTS_FAILED_DIR,
 )
+from instrument_profile import build_instrument_meta
+from symbol_pipeline import assess_symbol_history, ensure_daily_long_history
 
 logger = logging.getLogger(__name__)
 
@@ -46,47 +48,11 @@ _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9\.\-]{0,19}$")
 
 
 def _default_context_daily_symbols(symbol: str) -> dict:
-    sym = str(symbol or "").upper()
-    base = {
-        "market": "SPY",
-        "vol": "^VIX",
-        "lead_fut": "ES=F",
-        "rates": "TLT",
-    }
-    if sym == "QQQ":
-        base.update(
-            {
-                "sector": "XLK",
-                "vol": "^VXN",
-                "lead_fut": "NQ=F",
-            }
-        )
-    return {str(k): str(v) for k, v in base.items() if v}
+    return dict(build_instrument_meta(symbol).get("context_daily_symbols") or {})
 
 
 def _default_equity_meta(symbol: str) -> dict:
-    sym = str(symbol or "").upper()
-    aliases = [sym]
-    if sym == "QQQ":
-        aliases.extend(["Invesco QQQ", "Nasdaq 100", "Nasdaq-100"])
-    return {
-        "type": "equity",
-        "alpaca": sym,
-        "yahoo": sym,
-        "display_name": sym,
-        "news_enabled": True,
-        "news_aliases": aliases,
-        "tz": "America/New_York",
-        "session_open_minute": 9 * 60 + 30,
-        "session_close_minute": 16 * 60,
-        "tick_size": 0.01,
-        "vol_floor": 0.00025,
-        "max_abs_ret_mult": 6.0,
-        "stale_multiplier": 3.5,
-        "closed_max_stale_hours": 80.0,
-        "target_vol": 0.004,
-        "context_daily_symbols": _default_context_daily_symbols(sym),
-    }
+    return build_instrument_meta(symbol)
 
 
 def _canonical_price_path(symbol: str) -> str:
@@ -119,9 +85,7 @@ def register_instrument(symbol: str, meta: dict | None = None, persist: bool = T
     sym = str(symbol or "").strip().upper()
     if not sym:
         return False
-    entry = _default_equity_meta(sym)
-    if isinstance(meta, dict):
-        entry.update(meta)
+    entry = build_instrument_meta(sym, overrides=meta or {})
     aliases = entry.get("news_aliases")
     if isinstance(aliases, (list, tuple, set)):
         clean_aliases = []
@@ -440,13 +404,21 @@ def process_staged_instrument_files(
                 out["quarantined"].append({"path": quarantine_path, "symbol": symbol, "reason": "no_rows_after_merge"})
             continue
         df_all.to_csv(data_path, date_format="%Y-%m-%dT%H:%M:%SZ")
+        daily_long_df, daily_long_summary = ensure_daily_long_history(
+            symbol,
+            recent_df=df_all,
+            extra_frames=[df_new],
+            persist=True,
+        )
         meta = _load_staged_meta(symbol)
         added = register_instrument(symbol, meta=meta, persist=True)
         imported_news = None
+        extra_news_count = 0
         try:
             from news_pipeline import import_local_historical_news
 
             extra_news = _staged_news_files(symbol)
+            extra_news_count = int(len(extra_news))
             if extra_news:
                 imported_news = import_local_historical_news(symbol, extra_paths=extra_news)
                 for news_path in extra_news:
@@ -476,15 +448,27 @@ def process_staged_instrument_files(
                 trained = True
             except Exception:
                 logger.exception("Auto-train failed for %s", symbol)
+        history = assess_symbol_history(df_all, instrument_key=symbol, daily_long_history=daily_long_df)
         _archive_staged_file(path, symbol)
         out["processed"].append(
             {
                 "symbol": symbol,
                 "rows": int(len(df_all)),
+                "new_rows": int(len(df_new)),
                 "registered": bool(added),
+                "profile_resolved": True,
                 "trained": bool(trained),
                 "path": data_path,
+                "daily_long_rows": int(daily_long_summary.get("rows") or 0),
+                "daily_long_updated": bool(daily_long_summary.get("updated")),
+                "daily_long_sources": list(daily_long_summary.get("sources_used") or []),
                 "news_import": imported_news,
+                "news_files_staged": int(extra_news_count),
+                "history_status": str(history.get("status_label") or ""),
+                "feature_ready_modes": list(history.get("feature_ready_modes") or []),
+                "eligible_modes": list(history.get("eligible_modes") or []),
+                "primary_next_requirement": str(history.get("primary_next_requirement") or ""),
+                "status": "processed",
             }
         )
     return out
